@@ -940,6 +940,32 @@ class CliContractTests(_HomeCase):
         )
         self.assertEqual(unsupported.returncode, DR.EXIT_UNSUPPORTED)
 
+    def test_exit_ladder_matches_the_family_vocabulary(self) -> None:
+        """No dcg exit code may squat on the family's reserved argparse slot.
+
+        ``main()`` builds an argparse parser, so 2 is argparse's. "needs
+        operator action" is exactly the published meaning of the family's
+        EXIT_NEEDS_INPUT (3), and "unsupported host" has no family slot at all,
+        so it lives above the reserved range instead of colliding with 3.
+        """
+        from runtime_manager._shared import errors
+
+        self.assertEqual(DR.EXIT_OK, errors.EXIT_OK)
+        self.assertEqual(DR.EXIT_FAILED, errors.EXIT_ERROR)
+        self.assertEqual(DR.EXIT_NEEDS_OPERATOR, errors.EXIT_NEEDS_INPUT)
+        self.assertGreater(DR.EXIT_UNSUPPORTED, errors.EXIT_DRIFT)
+
+        declared = [DR.EXIT_OK, DR.EXIT_FAILED, DR.EXIT_NEEDS_OPERATOR, DR.EXIT_UNSUPPORTED]
+        self.assertNotIn(errors.EXIT_USAGE, declared)
+        self.assertEqual(len(set(declared)), len(declared))
+
+    def test_argparse_usage_error_keeps_exit_two_to_itself(self) -> None:
+        """The freed slot is real: a bad flag exits 2 and nothing else claims it."""
+        result = self._run("apply", "--home", "/nonexistent", "--no-such-flag")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertNotEqual(result.returncode, DR.EXIT_NEEDS_OPERATOR)
+
     def test_home_is_never_inferred_from_the_environment(self) -> None:
         result = self._run("apply", "--format", "json")
         self.assertNotEqual(result.returncode, 0)

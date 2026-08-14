@@ -68,6 +68,14 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 from lib.redaction import redact_text as redact_diagnostic_text  # noqa: E402
 
+# manage.py drift exit code, mirrored rather than imported so the server keeps
+# its cold start free of the runtime_manager import chain. Source of truth:
+# .env-manager/runtime_manager/_shared/errors.py (EXIT_DRIFT); tests pin this
+# copy to it. "Drift" means the command RAN and found a difference, so it is a
+# successful tool call with a non-clean verdict — unlike exit 2, which is an
+# argparse usage error and must NOT be reported as ok.
+MANAGE_EXIT_DRIFT = 4
+
 LOG_LEVELS = (
     "debug",
     "info",
@@ -1697,7 +1705,7 @@ def _finalize_manage_result(
     if raw_stderr.strip():
         stderr_text = redact_diagnostic_text(raw_stderr.strip())
         emit_log_message(
-            "warning" if returncode in (0, 2) else "error",
+            "warning" if returncode in (0, MANAGE_EXIT_DRIFT) else "error",
             _compact_log_context(log_context, exit_code=returncode, stderr=stderr_text),
             logger="skillbox.manage.stderr",
         )
@@ -1707,7 +1715,7 @@ def _finalize_manage_result(
     if stdout:
         try:
             data = json.loads(stdout)
-            ok = returncode in (0, 2)
+            ok = returncode in (0, MANAGE_EXIT_DRIFT)
             if not ok:
                 emit_log_message(
                     "error",

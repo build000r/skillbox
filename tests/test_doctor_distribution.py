@@ -471,7 +471,8 @@ class DistributionDoctorChecksTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {DIST_KEY_ENV: "token"}, clear=False):
                 result = self.helpers._run(repo, "doctor", "--format", "json")
 
-            self.assertEqual(result.returncode, 2, result.stderr)
+            # EXIT_DRIFT (4), not 2: exit 2 is reserved for argparse usage errors.
+            self.assertEqual(result.returncode, HELPERS.MANAGE_MODULE.EXIT_DRIFT, result.stderr)
             payload = json.loads(result.stdout)
             failures = [
                 item for item in payload["checks"]

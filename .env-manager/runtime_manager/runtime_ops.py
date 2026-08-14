@@ -1858,7 +1858,48 @@ def validate_port_registry(model: dict[str, Any]) -> list[CheckResult]:
     return results
 
 
+#: Doctor finding code -> the exact command that clears it.
+#:
+#: Pass-2 finding F-doc-06: the inner doctor named the problem and never the
+#: remedy, so an agent had to guess. The map lives here (one place, next to the
+#: producer) rather than in each validator, because the remedy for a finding is
+#: a property of the *family's* command surface, not of the checker that
+#: noticed it. Codes with no entry keep ``fix_command=None`` — an honest blank
+#: beats a plausible wrong command.
+DOCTOR_FIX_COMMANDS: dict[str, str] = {
+    "required-runtime-paths": "python3 .env-manager/manage.py sync",
+    "syncable-repo-paths": "python3 .env-manager/manage.py sync",
+    "required-runtime-artifacts": "python3 .env-manager/manage.py sync",
+    "syncable-artifact-paths": "python3 .env-manager/manage.py sync",
+    "required-runtime-env-files": "python3 .env-manager/manage.py sync",
+    "syncable-env-files": "python3 .env-manager/manage.py sync",
+    "runtime-log-paths": "python3 .env-manager/manage.py sync",
+    "skill-repo-lock": "python3 .env-manager/manage.py sync",
+    "skill-repo-install": "python3 .env-manager/manage.py sync",
+    "skill-lock-state": "python3 .env-manager/manage.py sync",
+    "skill-install-state": "python3 .env-manager/manage.py sync",
+    "skill-bundle-state": "python3 .env-manager/manage.py sync",
+    "SKILL_FORGE_HOOK_MISSING": "python3 .env-manager/manage.py forge init",
+    "runtime-manifest": "python3 scripts/04-reconcile.py render --format json",
+    "connector-contract": "python3 scripts/04-reconcile.py render --format json",
+    "storage-posture": "python3 scripts/04-reconcile.py render --format json",
+    "parity-ledger": "python3 .env-manager/manage.py parity-report --format json",
+}
+
+
+def annotate_doctor_fix_commands(results: list[CheckResult]) -> list[CheckResult]:
+    """Stamp the family ``fix_command`` onto findings that have a known remedy."""
+    for result in results:
+        if not result.fix_command:
+            result.fix_command = DOCTOR_FIX_COMMANDS.get(result.code)
+    return results
+
+
 def doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
+    return annotate_doctor_fix_commands(_doctor_results(model, root_dir))
+
+
+def _doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
     results = check_manifest(model)
     if any(result.status == "fail" for result in results):
         return results

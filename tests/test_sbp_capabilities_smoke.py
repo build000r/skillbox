@@ -28,9 +28,7 @@ REMOTE_COMMANDS = {"cass", "oracle", "conference1", "hire"}
 
 # Known-broken safe_first_try entries, each pinned to the bead tracking the
 # repair. Remove the row when the bead closes; the smoke test then guards it.
-KNOWN_BROKEN = {
-    "repo": "skillbox-sbp-repo-atlas-repair-2gbo",
-}
+KNOWN_BROKEN: dict[str, str] = {}
 
 TIMEOUT_SECONDS = 90
 
@@ -78,8 +76,13 @@ class SbpSafeFirstTrySmokeTests(unittest.TestCase):
                     continue  # tracked debt — see KNOWN_BROKEN bead id
                 result = _run(command)
                 executed += 1
+                # 0 = clean, 1 = ran and reported a problem, 4 = EXIT_DRIFT
+                # (a doctor RAN fine and found a difference — a healthy outcome
+                # on a drifting box, not a crash). 2 is the usage class and 3
+                # means the command wanted operator input it never should for a
+                # `safe_first_try`; both are still failures here.
                 self.assertIn(
-                    result.returncode, (0, 1),
+                    result.returncode, (0, 1, 4),
                     f"{command!r} exited {result.returncode} (usage/crash class).\n"
                     f"stderr: {result.stderr[:800]}",
                 )

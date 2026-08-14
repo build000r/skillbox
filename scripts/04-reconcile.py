@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,24 @@ except ModuleNotFoundError:
     yaml = None
 
 from lib.runtime_model import build_runtime_model
+from lib import doctor_fix
+from lib.doctor_contract import (
+    DOCTOR_SCHEMA_VERSION,
+    EXIT_DRIFT as DOCTOR_EXIT_DRIFT,
+    EXIT_ERROR as DOCTOR_EXIT_ERROR,
+    EXIT_NEEDS_INPUT as DOCTOR_EXIT_NEEDS_INPUT,
+    EXIT_OK as DOCTOR_EXIT_OK,
+    EXIT_USAGE as DOCTOR_EXIT_USAGE,
+    Finding,
+    coverage_block,
+    display_status,
+    doctor_envelope,
+    finding_from_obj,
+    fix_contract,
+    routing_line,
+    summarize,
+    summary_line,
+)
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -113,6 +132,25 @@ BEADS_SYNC_STATUS_COMMAND = "br sync --status --json"
 SKILL_SYNC_FIX_COMMAND = "make runtime-sync"
 SKILL_SYNC_DRY_RUN_COMMAND = "python3 .env-manager/manage.py sync --dry-run --format json"
 RUNTIME_DOCTOR_COMMAND = "python3 .env-manager/manage.py doctor --format json"
+
+# Inner-doctor exit vocabulary. Source of truth:
+# .env-manager/runtime_manager/_shared/errors.py. Exit 4 means "the doctor RAN
+# and found failing checks" (drift); any other nonzero means the doctor could
+# not produce a verdict. tests/test_reconcile.py pins this mirror against the
+# real constant so the two cannot drift apart.
+RUNTIME_MANAGER_EXIT_DRIFT = 4
+
+# This doctor's name in the doctor-family routing table (lib/doctor_contract.py
+# FAMILY). It is the command an agent would actually type, not the script path.
+DOCTOR_TOOL_NAME = "make doctor"
+
+# The state_mutation.py MANIFEST id whose lease `doctor --fix --yes` takes.
+# The state-mutation inventory row that authorises `doctor --fix` to write.
+# NOT "make.doctor": the Makefile target never passes --fix, so it stays a READ
+# boundary. The mutating surface is this script's own subcommand.
+DOCTOR_FIX_BOUNDARY_ID = "reconcile.doctor"
+
+DOCTOR_UNDO_COMMAND_TEMPLATE = "python3 scripts/04-reconcile.py doctor --undo {artifact}"
 
 # Operator secret files that must never sit directly under a bind-mounted host dir
 # (e.g. the `.:/workspace` mount), where in-container agents could read them. The
@@ -1485,12 +1523,19 @@ def check_runtime_manager_model(model: dict[str, Any]) -> CheckResult:
 
 def check_runtime_manager_doctor() -> CheckResult:
     result = run_command(["python3", ".env-manager/manage.py", "doctor", "--format", "json"])
-    if result.returncode != 0:
+    # Exit 4 (EXIT_DRIFT) means the inner doctor RAN and found failing checks --
+    # its JSON payload is valid and names them. Reporting that as "the doctor
+    # failed to run" (with an opaque stdout dump) is what the old
+    # `returncode != 0` branch did while drift shared exit 2 with argparse
+    # usage. Now that drift has its own code we can name the failing checks and
+    # reserve the opaque branch for a doctor that produced no verdict.
+    if result.returncode not in (0, RUNTIME_MANAGER_EXIT_DRIFT):
         return CheckResult(
             status="fail",
             code="runtime-manager-doctor",
             message="internal runtime manager doctor failed",
             details={
+                "exit_code": result.returncode,
                 "stdout": result.stdout.strip(),
                 "stderr": result.stderr.strip(),
             },
@@ -1519,9 +1564,24 @@ def check_runtime_manager_doctor() -> CheckResult:
         )
 
     warnings = sum(1 for item in items if item.get("status") == "warn")
-    details = {"warnings": warnings}
+    details: dict[str, Any] = {"warnings": warnings}
     if warnings:
         details["warning_codes"] = [item.get("code") for item in items if item.get("status") == "warn"]
+
+    failing = [item.get("code") for item in items if item.get("status") == "fail"]
+    if failing or result.returncode == RUNTIME_MANAGER_EXIT_DRIFT:
+        details["failures"] = len(failing)
+        details["failure_codes"] = failing
+        return CheckResult(
+            status="fail",
+            code="runtime-manager-doctor",
+            message=(
+                "internal runtime manager doctor reported "
+                f"{len(failing)} failing check(s): {', '.join(str(code) for code in failing) or 'unknown'}"
+            ),
+            details=details,
+            fix_command=RUNTIME_DOCTOR_COMMAND,
+        )
 
     return CheckResult(
         status="pass",
@@ -1669,18 +1729,15 @@ def detail_lines(details: dict[str, Any]) -> list[str]:
 
 def print_doctor_text(results: list[CheckResult]) -> None:
     for result in results:
-        print(f"{result.status.upper():4} {result.code}: {result.message}")
+        # display_status() is the human spelling of the ONE machine vocabulary
+        # (pass|warn|inco|fail): JSON stays lowercase, text stays shouty.
+        print(f"{display_status(result.status):4} {result.code}: {result.message}")
         if result.details:
             for line in detail_lines(result.details):
                 print(f"     {line}")
         if result.fix_command:
             print(f"     fix: {result.fix_command}")
 
-    counts = {
-        "pass": sum(1 for item in results if item.status == "pass"),
-        "warn": sum(1 for item in results if item.status == "warn"),
-        "fail": sum(1 for item in results if item.status == "fail"),
-    }
     print()
     # Doctor-family routing: this doctor covers manifest/compose/skill-sync
     # drift only. The superset front door (structural gates + this doctor via
@@ -1688,13 +1745,8 @@ def print_doctor_text(results: list[CheckResult]) -> None:
     # sibling-doctor routing table in a `coverage` field. Printed BEFORE the
     # summary so the summary stays the last meaningful line — sbp doctor's
     # runtime_doctor gate reports exactly that line.
-    print("structural gates not checked here — front door: sbp doctor --format json")
-    print(
-        "summary: "
-        f"{counts['pass']} passed, "
-        f"{counts['warn']} warnings, "
-        f"{counts['fail']} failed"
-    )
+    print(routing_line(DOCTOR_TOOL_NAME))
+    print(summary_line(summarize(finding_from_obj(result) for result in results)))
 
 
 def doctor_results(skip_compose: bool, skip_skill_sync: bool) -> list[CheckResult]:
@@ -1754,6 +1806,122 @@ def doctor_results(skip_compose: bool, skip_skill_sync: bool) -> list[CheckResul
     return results
 
 
+# --------------------------------------------------------------------------- #
+# The family envelope + the --fix contract
+# --------------------------------------------------------------------------- #
+
+
+DOCTOR_COVERS = (
+    "required files and expected directories",
+    "manifest/runtime-model alignment and reference drift",
+    "docker compose wiring and workspace secret exposure",
+    "skill-repo lock state and sync dry-run",
+    "beads db/jsonl state",
+    "the inner runtime doctor, via its own exit code",
+)
+
+
+def doctor_fix_registry(results: Iterable[CheckResult]) -> dict[str, doctor_fix.FixSpec]:
+    """Build THIS run's auto-fix registry from THIS run's findings.
+
+    ``--fix`` never shell-executes a finding's ``fix_command`` string: it runs a
+    declared argv built here from the live details, so a dynamic remediation
+    (``mkdir -p <the dirs that are actually missing>``) becomes a concrete,
+    reviewable command list instead of a string handed to a shell.
+
+    Only mechanically safe, idempotent, locally-reversible remediations get a
+    spec. Everything else stays a printed ``fix_command`` for a human — an
+    honest "no autofix, here is the command" beats a fixer nobody trusts.
+    """
+    specs: list[doctor_fix.FixSpec] = []
+    for result in results:
+        if result.status != "fail":
+            continue
+        if result.code == "expected-directories":
+            missing = list((result.details or {}).get("missing") or [])
+            if not missing:
+                continue
+            specs.append(
+                doctor_fix.FixSpec(
+                    code="expected-directories",
+                    command=("mkdir", "-p", *missing),
+                    description="create the workspace directories the manifest expects",
+                    # Recorded as existed=false, so undo removes them again.
+                    backup_paths=tuple(missing),
+                )
+            )
+    return doctor_fix.build_registry(specs)
+
+
+def doctor_fix_block(results: Iterable[CheckResult]) -> dict[str, Any]:
+    registry = doctor_fix_registry(results)
+    return fix_contract(
+        supported=True,
+        artifact_dir=str(doctor_fix.runs_dir(ROOT_DIR, DOCTOR_TOOL_NAME)),
+        fixable_codes=registry.keys(),
+    )
+
+
+def doctor_payload(results: list[CheckResult]) -> dict[str, Any]:
+    findings = [finding_from_obj(result) for result in results]
+    registry = doctor_fix_registry(results)
+    findings = doctor_fix.annotate_fixable(findings, registry)
+    return doctor_envelope(
+        tool=DOCTOR_TOOL_NAME,
+        findings=findings,
+        next_actions=[
+            "python3 scripts/04-reconcile.py doctor --format json --fix",
+            "sbp doctor --format json",
+            "python3 .env-manager/manage.py doctor --format json",
+        ],
+        coverage=coverage_block(tool=DOCTOR_TOOL_NAME, includes=DOCTOR_COVERS),
+        fix=doctor_fix_block(results),
+    )
+
+
+def doctor_fix_command(
+    results: list[CheckResult],
+    *,
+    confirmed: bool,
+    fmt: str,
+    argv: Sequence[str] | None = None,
+) -> int:
+    findings = [finding_from_obj(result) for result in results]
+    run = doctor_fix.run_fix(
+        tool=DOCTOR_TOOL_NAME,
+        root_dir=ROOT_DIR,
+        findings=findings,
+        registry=doctor_fix_registry(results),
+        confirmed=confirmed,
+        boundary_id=DOCTOR_FIX_BOUNDARY_ID,
+        undo_command_template=DOCTOR_UNDO_COMMAND_TEMPLATE,
+        argv=list(argv or []),
+    )
+    if fmt == "json":
+        emit_json(run.artifact)
+    else:
+        for line in run.lines:
+            print(line)
+    return run.exit_code
+
+
+def doctor_undo(artifact_path: str, *, fmt: str, confirmed: bool = False) -> int:
+    """`--undo` plans; `--undo --yes` acts.
+
+    Deleting what a fix created is not a smaller decision than creating it, so
+    undo carries the same confirmation gate as `--fix`. The artifact itself is
+    untrusted input: `doctor_fix.undo_run` authenticates it and refuses any path
+    outside the write scope the fix recorded.
+    """
+    run = doctor_fix.undo_run(Path(artifact_path), root_dir=ROOT_DIR, confirmed=confirmed)
+    if fmt == "json":
+        emit_json(run.artifact)
+    else:
+        for line in run.lines:
+            print(line)
+    return run.exit_code
+
+
 def _agent_command(name: str) -> dict[str, Any]:
     safe_first_try = {
         "capabilities": "python3 scripts/04-reconcile.py capabilities --json",
@@ -1790,22 +1958,39 @@ def capabilities_payload() -> dict[str, Any]:
         "doctor_remediation": {
             "json_field": "fix_command",
             "text_prefix": "fix:",
+            "schema_version": DOCTOR_SCHEMA_VERSION,
+            # The doctor emits the family envelope, so findings live under
+            # `.checks[]` — not at the top level. Pass-2 shipped this recipe
+            # against the old bare list; it is pinned by tests now.
             "extract_commands": (
                 "python3 scripts/04-reconcile.py doctor --format json "
                 "| python3 -c 'import json,sys; "
-                "print(\"\\n\".join(item[\"fix_command\"] for item in json.load(sys.stdin) "
+                "print(\"\\n\".join(item[\"fix_command\"] for item in json.load(sys.stdin)[\"checks\"] "
                 "if item.get(\"status\") != \"pass\" and item.get(\"fix_command\")))'"
             ),
+            "auto_fix": {
+                "preview": "python3 scripts/04-reconcile.py doctor --format json --fix",
+                "apply": "python3 scripts/04-reconcile.py doctor --format json --fix --yes",
+                "undo_preview": "python3 scripts/04-reconcile.py doctor --undo <run-artifact.json>",
+                "undo_apply": "python3 scripts/04-reconcile.py doctor --undo <run-artifact.json> --yes",
+            },
         },
         "safe_previews": [
             "python3 scripts/04-reconcile.py render --format json",
             "python3 scripts/04-reconcile.py doctor --format json --skip-compose --skip-skill-sync",
             "python3 .env-manager/manage.py sync --dry-run --format json",
         ],
+        # The doctor-family exit ladder. Source of truth:
+        # .env-manager/runtime_manager/_shared/errors.py; mirrored literally in
+        # scripts/lib/doctor_contract.py because this script cannot import
+        # runtime_manager. 4 is a VERDICT, not a crash: the doctor ran fine and
+        # found a difference.
         "exit_codes": {
-            "0": "success",
-            "1": "validation failure or runtime/environment error",
-            "2": "argparse usage error",
+            "0": "success — no failing check",
+            "1": "the command itself could not produce a verdict (runtime/environment error)",
+            "2": "argparse usage error (reserved family-wide)",
+            "3": "operator input required — `doctor --fix` planned changes and is waiting for --yes",
+            "4": "drift — the doctor ran and at least one check failed",
         },
         "next_actions": [
             "python3 scripts/04-reconcile.py render --format json",
@@ -1832,6 +2017,23 @@ Structured output:
   Agent-friendly aliases are accepted: --json, --jason, --jsno, --jsson.
   Diagnostics and typo-alias notices are printed to stderr, not stdout.
   Doctor findings include fix_command when a check has a copy-pasteable next command.
+
+Doctor envelope (shared by every doctor in the family):
+  {ok, exit_code, schema_version, tool, checks[], summary, next_actions, coverage, fix}
+  Each check is {code, status, message, details, fix_command, fixable}.
+  status is one of pass | warn | inco | fail (lowercase in JSON, shouty in text).
+  Exit: 0 clean, 4 drift (ran fine, found a difference), 3 confirmation required,
+  1 the doctor could not produce a verdict, 2 argparse usage error.
+
+Auto-fix (dry-run by default):
+  python3 scripts/04-reconcile.py doctor --fix            # plan only, exits 3
+  python3 scripts/04-reconcile.py doctor --fix --yes      # backs up, applies, records
+  python3 scripts/04-reconcile.py doctor --undo <artifact>        # plan only, exits 3
+  python3 scripts/04-reconcile.py doctor --undo <artifact> --yes  # restores/removes
+  Undo deletes only what the fix created, only while it still matches the
+  post-fix manifest recorded in the artifact; anything else is refused loudly.
+  Every --fix run writes a machine-readable artifact under
+  ${SKILLBOX_STATE_ROOT:-<repo>/.skillbox-state}/doctor-runs/.
 
 Safe validation pattern:
   Use doctor --format json --skip-compose --skip-skill-sync for a fast read-side
@@ -1983,6 +2185,31 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip the manage.py sync --dry-run check for the default skill-repo-set.",
     )
+    doctor_parser.add_argument(
+        "--fix",
+        action="store_true",
+        help=(
+            "Plan the auto-fixes for the failing findings. Without --yes this changes "
+            f"NOTHING and exits {DOCTOR_EXIT_NEEDS_INPUT} (confirmation required)."
+        ),
+    )
+    doctor_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help=(
+            "Confirm --fix or --undo: take backups, act, and write a run artifact. "
+            "Without it both are plans."
+        ),
+    )
+    doctor_parser.add_argument(
+        "--undo",
+        metavar="RUN_ARTIFACT",
+        help=(
+            "Plan the restore of a previous `doctor --fix --yes` run artifact. Undo DELETES "
+            "the paths that fix created, so it is confirmation-gated too: without --yes it "
+            f"changes nothing and exits {DOCTOR_EXIT_NEEDS_INPUT}."
+        ),
+    )
     return parser
 
 
@@ -2018,15 +2245,26 @@ def main(argv: list[str] | None = None) -> int:
                 print_render_text(payload)
             return 0
 
+        if args.undo:
+            return doctor_undo(args.undo, fmt=args.format, confirmed=args.yes)
+
         results = doctor_results(skip_compose=args.skip_compose, skip_skill_sync=args.skip_skill_sync)
+        if args.fix:
+            return doctor_fix_command(
+                results,
+                confirmed=args.yes,
+                fmt=args.format,
+                argv=normalized_argv,
+            )
+        payload = doctor_payload(results)
         if args.format == "json":
-            emit_json([asdict(result) for result in results])
+            emit_json(payload)
         else:
             print_doctor_text(results)
-        return 1 if any(result.status == "fail" for result in results) else 0
+        return int(payload["exit_code"])
     except RuntimeError as exc:
         print(f"04-reconcile.py: {exc}", file=sys.stderr)
-        return 1
+        return DOCTOR_EXIT_ERROR
 
 
 if __name__ == "__main__":

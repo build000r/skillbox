@@ -187,7 +187,9 @@ class ReconcileTests(unittest.TestCase):
         # A plain `.env` at another repo's mount root is app-owned runtime config
         # (policy skillbox-i704): warn, don't fail, and don't demand relocation.
         with tempfile.TemporaryDirectory() as tmp:
-            host_dir = Path(tmp)
+            # resolve() to match production, which resolves bind sources
+            # (macOS tempdirs live behind the /var -> /private/var symlink).
+            host_dir = Path(tmp).resolve()
             (host_dir / ".env").write_text("APP_SETTING=1\n", encoding="utf-8")
             config = {
                 "services": {
@@ -591,7 +593,9 @@ class ReconcileTests(unittest.TestCase):
             mock.patch.object(RECONCILE, "print_render_text") as print_render_text, \
             mock.patch.object(RECONCILE, "print_doctor_text") as print_doctor_text, \
             mock.patch("sys.argv", ["04-reconcile.py", "doctor", "--format", "text"]):
-            self.assertEqual(RECONCILE.main(), 1)
+            # A failing check is EXIT_DRIFT (4), not 1: the doctor ran fine and
+            # found a difference. 1 stays reserved for "no verdict produced".
+            self.assertEqual(RECONCILE.main(), RECONCILE.DOCTOR_EXIT_DRIFT)
         print_doctor_text.assert_called_once_with(doctor_results)
         emit_json.assert_not_called()
         print_render_text.assert_not_called()
@@ -630,8 +634,13 @@ class ReconcileTests(unittest.TestCase):
         with mock.patch.object(RECONCILE, "doctor_results", return_value=doctor_results):
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 self.assertEqual(RECONCILE.main(["doctor", "--jsno"]), 0)
-        self.assertEqual(json.loads(stdout.getvalue())[0]["code"], "ok")
-        self.assertIsNone(json.loads(stdout.getvalue())[0]["fix_command"])
+        # The doctor emits the family envelope, so findings live under
+        # `.checks[]` — the bare top-level list is retired.
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["checks"][0]["code"], "ok")
+        self.assertIsNone(payload["checks"][0]["fix_command"])
+        self.assertEqual(payload["schema_version"], RECONCILE.DOCTOR_SCHEMA_VERSION)
+        self.assertEqual(payload["tool"], RECONCILE.DOCTOR_TOOL_NAME)
         self.assertIn("Interpreting --jsno as --format json", stderr.getvalue())
 
         stdout = io.StringIO()
@@ -905,6 +914,57 @@ class RuntimeIdRejectionCliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, result.stderr or result.stdout)
             payload = json.loads(result.stdout)
             self.assertIn("Invalid client id", payload["error"]["message"])
+
+
+class RuntimeDoctorExitVocabularyTests(unittest.TestCase):
+    """The outer doctor's mirror of the inner doctor's drift exit code.
+
+    04-reconcile.py cannot import runtime_manager, so it keeps a literal copy of
+    EXIT_DRIFT. This pins the copy to the real constant, and pins the behavior
+    the copy buys: an inner doctor that RAN and found failures is reported with
+    its failing check codes, not as an opaque "doctor failed" stdout dump.
+    """
+
+    def _errors_module(self):
+        env_manager = ROOT_DIR / ".env-manager"
+        if str(env_manager) not in sys.path:
+            sys.path.insert(0, str(env_manager))
+        from runtime_manager._shared import errors
+
+        return errors
+
+    def test_mirrored_drift_code_matches_runtime_constant(self) -> None:
+        errors = self._errors_module()
+
+        self.assertEqual(RECONCILE.RUNTIME_MANAGER_EXIT_DRIFT, errors.EXIT_DRIFT)
+        self.assertNotEqual(RECONCILE.RUNTIME_MANAGER_EXIT_DRIFT, errors.EXIT_USAGE)
+
+    def test_drift_exit_reports_failing_check_codes(self) -> None:
+        payload = json.dumps({"checks": [
+            {"code": "forge-hooks", "status": "fail", "message": "missing"},
+            {"code": "ports", "status": "warn", "message": "advisory"},
+        ]})
+        completed = mock.Mock(
+            returncode=RECONCILE.RUNTIME_MANAGER_EXIT_DRIFT, stdout=payload, stderr=""
+        )
+
+        with mock.patch.object(RECONCILE, "run_command", return_value=completed):
+            result = RECONCILE.check_runtime_manager_doctor()
+
+        self.assertEqual(result.status, "fail")
+        self.assertIn("forge-hooks", result.message)
+        self.assertEqual(result.details["failure_codes"], ["forge-hooks"])
+        self.assertEqual(result.details["warnings"], 1)
+
+    def test_non_drift_nonzero_exit_stays_an_opaque_run_failure(self) -> None:
+        completed = mock.Mock(returncode=1, stdout="", stderr="boom")
+
+        with mock.patch.object(RECONCILE, "run_command", return_value=completed):
+            result = RECONCILE.check_runtime_manager_doctor()
+
+        self.assertEqual(result.status, "fail")
+        self.assertIn("doctor failed", result.message)
+        self.assertEqual(result.details["exit_code"], 1)
 
 
 if __name__ == "__main__":

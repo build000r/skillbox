@@ -39,7 +39,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -64,15 +66,55 @@ from .git_scan_cache import (
     format_age as _format_scan_age,
     load_scan_cache,
 )
+from lib import doctor_fix
+from lib.doctor_contract import (
+    EXIT_DRIFT as _EXIT_DRIFT,
+    EXIT_ERROR as _EXIT_ERROR,
+    EXIT_NEEDS_INPUT as _EXIT_NEEDS_INPUT,
+    EXIT_OK as _EXIT_OK,
+    STATUS_FAIL as _STATUS_FAIL,
+    STATUS_INCO as _STATUS_INCO,
+    STATUS_PASS as _STATUS_PASS,
+    Finding,
+    coverage_block,
+    display_status,
+    doctor_envelope,
+    fix_contract,
+)
 
 # Gate kinds and statuses are part of the JSON contract; keep them as constants
 # so the CLI renderer and tests share one source of truth.
 KIND_STRUCTURE = "structure"
 KIND_RUNTIME = "runtime"
 
-STATUS_PASS = "PASS"
-STATUS_FAIL = "FAIL"
-STATUS_INCO = "INCO"
+# The ONE doctor-family status vocabulary, lowercase in JSON and shouty in text
+# (``display_status``). It lives in scripts/lib/doctor_contract.py because
+# scripts/04-reconcile.py provably cannot import runtime_manager — see
+# tests/test_reconcile.py RuntimeDoctorExitVocabularyTests — and a second copy
+# of the vocabulary is exactly the drift this contract retires. Re-exported here
+# under the historical names so every existing `STATUS_FAIL` comparison in this
+# module keeps working against the new values.
+STATUS_PASS = _STATUS_PASS
+STATUS_FAIL = _STATUS_FAIL
+STATUS_INCO = _STATUS_INCO
+
+#: This doctor's name in the family routing table (lib/doctor_contract.FAMILY).
+DOCTOR_TOOL_NAME = "sbp doctor"
+
+# The family exit ladder. Source of truth: _shared/errors.py, mirrored in
+# lib/doctor_contract.py for the half of the family that cannot import
+# runtime_manager. 4 is a VERDICT ("ran fine, found a difference"), 1 is "could
+# not produce a verdict" — this doctor emits 4 and READS 4 at its runtime gate.
+EXIT_OK = _EXIT_OK
+EXIT_ERROR = _EXIT_ERROR
+EXIT_DRIFT = _EXIT_DRIFT
+RUNTIME_DOCTOR_EXIT_ERROR = _EXIT_ERROR
+RUNTIME_DOCTOR_EXIT_DRIFT = _EXIT_DRIFT
+
+#: The state_mutation.py MANIFEST id whose lease `sbp doctor --fix --yes` takes.
+STRUCTURE_DOCTOR_FIX_BOUNDARY_ID = "manage.structure-doctor"
+
+STRUCTURE_DOCTOR_UNDO_TEMPLATE = "python3 .env-manager/manage.py structure-doctor --undo {artifact}"
 
 # Total wall-clock budget the STRUCTURE gates must fit inside. Per-gate caps are
 # derived/declared below so the sum stays under this; a structure gate exceeding
@@ -481,45 +523,39 @@ def _repo_atlas_engine_path() -> Path:
     return base / "skills-private" / "reconcile" / "scripts" / "repo_atlas_cli.py"
 
 
-# The probe is a single-repo read; the wrapper's own capability preflight is
-# capped at 10s, so 15s covers preflight + one local status collection.
+# Each probe is one read; the wrapper's own capability preflight is capped at
+# 10s, so 15s covers preflight + one collection. `list` collects the whole
+# estate rather than one repo, so it gets its own, longer allowance.
 REPO_ATLAS_PROBE_TIMEOUT_S = 15.0
+REPO_ATLAS_LIST_PROBE_TIMEOUT_S = 45.0
+
+# Both probes are read-only. `status .` exercises single-repo resolution;
+# `list` exercises estate-wide enumeration, whose payload grows with the
+# number of declared components. They fail independently — see the gate
+# docstring — so the gate runs both rather than treating one as a proxy.
+REPO_ATLAS_PROBES: tuple[tuple[str, tuple[str, ...], float], ...] = (
+    ("status .", ("repo", "status", ".", "--json"), REPO_ATLAS_PROBE_TIMEOUT_S),
+    ("list", ("repo", "list", "--json"), REPO_ATLAS_LIST_PROBE_TIMEOUT_S),
+)
 
 
-def _run_repo_atlas_front_door(ctx: DoctorContext) -> tuple[str, str]:
-    """STRUCTURE gate: the `sbp repo` (Repo Atlas) front door must not fail silently.
-
-    The atlas engine once shipped with no production dependency wiring, so every
-    real command exited 2 with an EMPTY usage-or-config envelope while ``--help``
-    and ``capabilities`` kept working — invisible until a human ran it (bead
-    skillbox-sbp-repo-atlas-repair-2gbo). This gate probes the real front door
-    with a well-formed read-only invocation, for which usage-or-config is never
-    a legitimate answer.
-
-    INCO when the wrapper or the engine checkout is absent on this box (verdict
-    unknowable); FAIL on exit 2 or non-JSON ``--json`` output; PASS on exit
-    0/1/3 with a JSON envelope — drift and reachability verdicts are live
-    front-door answers, not front-door failures.
-    """
-    wrapper = ctx.runtime_root / "scripts" / "sbp"
-    if not wrapper.is_file():
-        return STATUS_INCO, f"no sbp wrapper at {wrapper}"
-    engine = _repo_atlas_engine_path()
-    if not engine.is_file():
-        return STATUS_INCO, "Repo Atlas engine not present on this box (skills-private checkout absent)"
+def _probe_repo_atlas(
+    wrapper: Path, ctx: DoctorContext, argv: tuple[str, ...], timeout_s: float
+) -> tuple[str, str]:
+    """Run one front-door probe. FAIL only on a front-door defect."""
     try:
         proc = subprocess.run(
-            [str(wrapper), "repo", "status", ".", "--json"],
+            [str(wrapper), *argv],
             cwd=str(ctx.runtime_root),
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=REPO_ATLAS_PROBE_TIMEOUT_S,
+            timeout=timeout_s,
         )
     except FileNotFoundError:
         return STATUS_INCO, "unable to execute the sbp wrapper"
     except subprocess.TimeoutExpired:
-        return STATUS_INCO, f"repo atlas probe exceeded {REPO_ATLAS_PROBE_TIMEOUT_S:.0f}s"
+        return STATUS_INCO, f"probe exceeded {timeout_s:.0f}s"
     if proc.returncode == 2:
         tail = _last_meaningful_line((proc.stderr or "") + "\n" + (proc.stdout or ""))
         return STATUS_FAIL, f"usage-or-config for a well-formed probe: {tail or 'empty output'}"
@@ -531,32 +567,109 @@ def _run_repo_atlas_front_door(ctx: DoctorContext) -> tuple[str, str]:
             f"non-JSON --json output (exit={proc.returncode}): "
             f"{_last_meaningful_line(proc.stdout) or 'empty stdout'}",
         )
-    return STATUS_PASS, f"front door live (exit={proc.returncode})"
+    return STATUS_PASS, f"exit={proc.returncode}"
+
+
+def _run_repo_atlas_front_door(ctx: DoctorContext) -> tuple[str, str]:
+    """STRUCTURE gate: the `sbp repo` (Repo Atlas) front door must not fail silently.
+
+    The atlas engine collapses several unrelated defects into one indistinct
+    exit-2 ``{"kind": "malformed"}`` envelope while ``--help`` and
+    ``capabilities`` keep working, so a broken front door looks healthy from
+    every angle except actually running it (bead
+    skillbox-sbp-repo-atlas-repair-2gbo). This gate probes the real front door
+    with well-formed read-only invocations, for which usage-or-config is never
+    a legitimate answer.
+
+    It probes BOTH ``status .`` and ``list``, because the two fail for
+    different reasons and neither proxies the other. ``status .`` resolves one
+    repository, so it catches identity/wiring breakage. ``list`` enumerates
+    every declared component, so its payload grows with the estate and it is
+    the probe that catches an output budget the estate has outgrown — the
+    original repair shipped with ``status .`` healthy and ``list`` still
+    exit-2, which a status-only gate reported as PASS.
+
+    INCO when the wrapper or the engine checkout is absent on this box (verdict
+    unknowable); FAIL on exit 2 or non-JSON ``--json`` output from any probe;
+    PASS on exit 0/1/3 with a JSON envelope — drift and reachability verdicts
+    are live front-door answers, not front-door failures.
+    """
+    wrapper = ctx.runtime_root / "scripts" / "sbp"
+    if not wrapper.is_file():
+        return STATUS_INCO, f"no sbp wrapper at {wrapper}"
+    engine = _repo_atlas_engine_path()
+    if not engine.is_file():
+        return STATUS_INCO, "Repo Atlas engine not present on this box (skills-private checkout absent)"
+    results = [
+        (label, *_probe_repo_atlas(wrapper, ctx, argv, timeout_s))
+        for label, argv, timeout_s in REPO_ATLAS_PROBES
+    ]
+    failures = [f"{label}: {detail}" for label, status, detail in results if status == STATUS_FAIL]
+    if failures:
+        return STATUS_FAIL, "; ".join(failures)
+    inconclusive = [f"{label}: {detail}" for label, status, detail in results if status == STATUS_INCO]
+    if inconclusive:
+        return STATUS_INCO, "; ".join(inconclusive)
+    return STATUS_PASS, "front door live (" + ", ".join(
+        f"{label} {detail}" for label, _status, detail in results
+    ) + ")"
 
 
 def _run_runtime_doctor(ctx: DoctorContext) -> tuple[str, str]:
-    """RUNTIME gate: invoke the existing runtime `make doctor`, don't duplicate it.
+    """RUNTIME gate: invoke the outer doctor directly, don't duplicate it.
 
-    Runs ``make doctor`` from the skillbox repo. If make / the target is
-    unreachable on this box, that is INCO (we don't know the runtime verdict),
-    never FAIL. A run that completes and exits nonzero IS a real runtime FAIL.
+    Runs the SCRIPT, not ``make doctor``, for one decisive reason: **make
+    destroys the exit ladder**. A recipe that exits 4 makes ``make`` print
+    ``*** [doctor] Error 4`` and then exit **2** itself, so the EXIT_DRIFT
+    signal this whole family is built on never reaches the caller — the gate
+    would read "unexpected exit 2" and go INCO on every real failure, silently
+    downgrading FAIL to "could not tell". ``make doctor`` is a one-line
+    forwarder to this exact argv (see the Makefile), so calling it directly
+    loses nothing and keeps the verdict.
+
+    The exit code is read against the family ladder rather than treating every
+    nonzero the same:
+
+    * 0 -> PASS.
+    * 4 (EXIT_DRIFT) -> FAIL. The outer doctor ran fine and found a difference;
+      that IS a real runtime failure at this gate.
+    * 1 (EXIT_ERROR) -> INCO. The outer doctor could not produce a verdict, so
+      neither can this gate — reporting FAIL would claim knowledge we lack.
+    * anything else (including 2, a usage error in OUR invocation) -> INCO.
+
+    If the script is unreachable on this box, that is INCO too.
     """
-    makefile = ctx.runtime_root / "Makefile"
-    if not makefile.is_file():
-        return STATUS_INCO, f"no Makefile at {ctx.runtime_root}"
+    script = ctx.runtime_root / "scripts" / "04-reconcile.py"
+    if not script.is_file():
+        return STATUS_INCO, f"no scripts/04-reconcile.py at {ctx.runtime_root}"
     try:
         proc = subprocess.run(
-            ["make", "doctor"],
+            [sys.executable, str(script), "doctor"],
             cwd=str(ctx.runtime_root),
             capture_output=True,
             text=True,
         )
-    except FileNotFoundError:
-        return STATUS_INCO, "make is not available on this box"
+    except OSError as exc:
+        return STATUS_INCO, f"could not run the outer doctor: {type(exc).__name__}: {exc}"
     out = (proc.stdout or "") + (proc.stderr or "")
+    detail = _last_doctor_summary_line(out)
     if proc.returncode == 0:
-        return STATUS_PASS, _last_meaningful_line(out)
-    return STATUS_FAIL, _last_meaningful_line(out)
+        return STATUS_PASS, detail
+    if proc.returncode == RUNTIME_DOCTOR_EXIT_DRIFT:
+        return STATUS_FAIL, detail
+    if proc.returncode == RUNTIME_DOCTOR_EXIT_ERROR:
+        return STATUS_INCO, f"outer doctor could not produce a verdict (exit 1): {detail}"
+    return STATUS_INCO, f"unexpected outer doctor exit {proc.returncode}: {detail}"
+
+
+def _last_doctor_summary_line(text: str, limit: int = 240) -> str:
+    """The outer doctor's own last meaningful line, skipping make's wrapper noise."""
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("make"):
+            continue
+        return stripped[:limit]
+    return _last_meaningful_line(text, limit)
 
 
 def _last_meaningful_line(text: str, limit: int = 240) -> str:
@@ -690,7 +803,14 @@ def _gate_specs() -> tuple[_GateSpec, ...]:
             name="runtime_doctor",
             kind=KIND_RUNTIME,
             cap_s=CAP_RUNTIME_DOCTOR,
-            fix_command="make doctor  # from ~/repos/opensource/skillbox; read the failing check",
+            # The script, not `make doctor`: make collapses any recipe failure
+            # into its own exit 2, so an agent branching on the exit ladder
+            # (4 = drift) must call the script. `make doctor` prints the same
+            # report; only its exit code lies.
+            fix_command=(
+                "python3 scripts/04-reconcile.py doctor --format json"
+                "  # from ~/repos/opensource/skillbox; read the failing check"
+            ),
             runner=_run_runtime_doctor,
         ),
     )
@@ -778,69 +898,178 @@ def _with_cap(spec: _GateSpec, ctx: DoctorContext) -> tuple[str, str]:
 # Public entrypoint
 # --------------------------------------------------------------------------- #
 
+def gate_findings(gates: Sequence[GateResult]) -> list[Finding]:
+    """The gates, in the uniform family finding shape.
+
+    ``code`` is the gate name (the stable id an agent alerts on), ``message``
+    the gate's own detail line, and ``details`` keeps the two fields that are
+    specific to this doctor so nothing is lost in the translation.
+    """
+    return [
+        Finding(
+            code=gate.name,
+            status=gate.status,
+            message=gate.detail,
+            details={"kind": gate.kind, "duration_s": gate.duration_s},
+            fix_command=gate.fix_command or None,
+        )
+        for gate in gates
+    ]
+
+
+def structure_doctor_fix_registry(
+    gates: Sequence[GateResult],
+    cwd: Path | None = None,
+) -> dict[str, doctor_fix.FixSpec]:
+    """THIS run's auto-fix registry, built from THIS run's failing gates.
+
+    Only ``mcp_parity`` qualifies today: its remedy is a single declarative
+    re-render of files this repo owns, and every file it rewrites is captured as
+    a backup first, so ``--undo`` is exact. The other gates fail for reasons a
+    command cannot settle (a policy decision, a dirty worktree, a missing
+    checkout); they keep their printed ``fix_command`` and are reported as
+    skipped with a machine-readable reason rather than guessed at.
+    """
+    failing = {gate.name for gate in gates if gate.status == STATUS_FAIL}
+    specs: list[doctor_fix.FixSpec] = []
+    if "mcp_parity" in failing:
+        specs.append(
+            doctor_fix.FixSpec(
+                code="mcp_parity",
+                command=("python3", ".env-manager/manage.py", "mcp", "sync", "--apply"),
+                description="re-render the single-source MCP config into every client surface",
+                backup_paths=_mcp_surface_paths(cwd),
+                timeout_s=180.0,
+            )
+        )
+    return doctor_fix.build_registry(specs)
+
+
+def _mcp_surface_paths(cwd: Path | None = None) -> tuple[str, ...]:
+    """The files `mcp sync --apply` can rewrite, for the pre-change backup.
+
+    Built from the SAME relative-path constants the audit reads
+    (``mcp_visibility.CLAUDE_MCP_REL`` / ``CODEX_MCP_REL``), rooted at both the
+    evaluated cwd and $HOME, so the backup covers whichever surface the render
+    actually touches. Paths that do not exist are still declared: the backup
+    records them as ``existed: false`` and undo removes them again, which is the
+    only correct undo for "the fix created this file".
+    """
+    from .mcp_visibility import CLAUDE_MCP_REL, CODEX_MCP_REL  # noqa: PLC0415
+
+    roots = [Path(cwd) if cwd else Path.cwd(), Path.home()]
+    paths: list[str] = []
+    for root in roots:
+        for rel in (CLAUDE_MCP_REL, CODEX_MCP_REL):
+            candidate = str(root / rel)
+            if candidate not in paths:
+                paths.append(candidate)
+    return tuple(paths)
+
+
+def next_actions_for_structure_doctor(gates: Sequence[GateResult]) -> list[str]:
+    """Ranked next commands: the failing gates' own fixes, then the routing."""
+    actions = [
+        gate.fix_command
+        for gate in gates
+        if gate.status == STATUS_FAIL and gate.fix_command
+    ]
+    inconclusive = [gate.name for gate in gates if gate.status == STATUS_INCO]
+    if inconclusive:
+        actions.append(
+            "sbp doctor --format json  # re-run: "
+            + ", ".join(inconclusive)
+            + " were inconclusive, not failures"
+        )
+    if any(gate.status == STATUS_FAIL for gate in gates):
+        actions.append("python3 .env-manager/manage.py structure-doctor --fix  # plan the auto-fixes")
+    actions.append("python3 scripts/04-reconcile.py doctor --format json")
+    # De-duplicate while preserving rank.
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for action in actions:
+        if action not in seen:
+            seen.add(action)
+            ordered.append(action)
+    return ordered
+
+
 def run_structure_doctor(
     runtime_root: Path | None = None,
     cwd: Path | None = None,
 ) -> dict[str, Any]:
     """Run every gate and return the front-door payload.
 
-    Returns ``{ok, gates, summary, exit_code}`` where ``exit_code`` is nonzero
-    iff at least one gate is FAIL (INCO and PASS exit 0), and
-    ``summary.structure_duration_s`` is the wall-clock spent on STRUCTURE gates
-    (the budget the <60s guarantee covers; the RUNTIME gate is excluded).
+    Returns the family envelope — ``{ok, exit_code, schema_version, tool,
+    checks, summary, next_actions, coverage, fix}`` plus this doctor's own
+    ``gates`` (per-gate ``kind``/``duration_s``), ``config_root``,
+    ``runtime_root`` and ``cwd``.
+
+    ``exit_code`` is ``EXIT_DRIFT`` (4) iff at least one gate is FAIL — "ran
+    fine, found a difference", never confused with 1 ("could not produce a
+    verdict"). INCO and PASS exit 0. ``summary.structure_duration_s`` is the
+    wall-clock spent on STRUCTURE gates (the budget the <60s guarantee covers;
+    the RUNTIME gate is excluded).
     """
     ctx = build_context(runtime_root=runtime_root, cwd=cwd)
     gates: list[GateResult] = []
     for spec in _gate_specs():
         gates.append(_run_one_gate(spec, ctx))
 
-    fails = [g for g in gates if g.status == STATUS_FAIL]
-    incos = [g for g in gates if g.status == STATUS_INCO]
-    passes = [g for g in gates if g.status == STATUS_PASS]
     structure_duration = round(
         sum(g.duration_s for g in gates if g.kind == KIND_STRUCTURE), 3
     )
     runtime_duration = round(
         sum(g.duration_s for g in gates if g.kind == KIND_RUNTIME), 3
     )
-    exit_code = 1 if fails else 0
-    return {
-        "ok": not fails,
-        "config_root": str(ctx.config_root) if ctx.config_root else None,
-        "runtime_root": str(ctx.runtime_root),
-        "cwd": str(ctx.cwd),
-        "gates": [g.to_payload() for g in gates],
-        "summary": {
-            "total": len(gates),
-            "pass": len(passes),
-            "fail": len(fails),
-            "inco": len(incos),
-            "structure_duration_s": structure_duration,
-            "runtime_duration_s": runtime_duration,
-            "structure_budget_s": STRUCTURE_BUDGET_S,
-            "structure_within_budget": structure_duration < STRUCTURE_BUDGET_S,
-        },
-        "exit_code": exit_code,
+    findings = gate_findings(gates)
+    registry = structure_doctor_fix_registry(gates, ctx.cwd)
+    findings = doctor_fix.annotate_fixable(findings, registry)
+    # ONE family envelope. `gates` stays alongside `checks` because a gate
+    # carries two fields no other doctor has (kind and duration_s) and the
+    # human table is built from them; `checks` is the same information in the
+    # uniform per-finding shape every doctor in the family emits.
+    return doctor_envelope(
+        tool=DOCTOR_TOOL_NAME,
+        findings=findings,
+        next_actions=next_actions_for_structure_doctor(gates),
         # Doctor-family routing: what this run covered and which sibling
         # doctors were NOT run, so an agent with a symptom can route without
         # out-of-band knowledge. sbp doctor is the front door — its
         # runtime_doctor gate embeds `make doctor` (which embeds
         # `manage.py doctor`); the siblings listed here are the satellites.
-        "coverage": {
-            "front_door": "sbp doctor",
-            "includes": [
+        coverage=coverage_block(
+            tool=DOCTOR_TOOL_NAME,
+            includes=[
                 "structural gates (this run)",
                 "make doctor via runtime_doctor gate (manifest/compose/skill-sync, embeds manage.py doctor)",
             ],
-            "siblings_not_run": [
-                {"doctor": "sbp registry doctor", "symptom": "repos.yaml vs on-disk git estate drift"},
-                {"doctor": "sbp cass doctor", "symptom": "remote Cass index health"},
-                {"doctor": "sbp send-later doctor", "symptom": "scheduler tick/queue health"},
-                {"doctor": "sbp beads status", "symptom": "beads db/jsonl health"},
-                {"doctor": "make self-test", "symptom": "canonical CI gate on an exact SHA"},
+            siblings_not_run=[
+                "sbp registry doctor",
+                "sbp cass doctor",
+                "sbp send-later doctor",
+                "sbp beads status",
+                "make self-test",
             ],
+        ),
+        fix=fix_contract(
+            supported=True,
+            artifact_dir=str(doctor_fix.runs_dir(ctx.runtime_root, DOCTOR_TOOL_NAME)),
+            fixable_codes=registry.keys(),
+        ),
+        summary_extra={
+            "structure_duration_s": structure_duration,
+            "runtime_duration_s": runtime_duration,
+            "structure_budget_s": STRUCTURE_BUDGET_S,
+            "structure_within_budget": structure_duration < STRUCTURE_BUDGET_S,
         },
-    }
+        extra={
+            "config_root": str(ctx.config_root) if ctx.config_root else None,
+            "runtime_root": str(ctx.runtime_root),
+            "cwd": str(ctx.cwd),
+            "gates": [g.to_payload() for g in gates],
+        },
+    )
 
 
 def structure_doctor_text_lines(payload: dict[str, Any]) -> list[str]:
@@ -857,7 +1086,8 @@ def structure_doctor_text_lines(payload: dict[str, Any]) -> list[str]:
     lines.append(header)
     lines.append("  " + "-" * (len(header) - 2))
     for gate in gates:
-        status = str(gate.get("status", ""))
+        # display_status(): JSON is lowercase, the human table stays shouty.
+        status = display_status(str(gate.get("status", "")))
         kind = str(gate.get("kind", ""))
         name = str(gate.get("name", ""))
         duration = float(gate.get("duration_s", 0.0))
@@ -865,7 +1095,7 @@ def structure_doctor_text_lines(payload: dict[str, Any]) -> list[str]:
         lines.append(
             f"  {status:6s}  {kind:{kind_w}s}  {name:{name_w}s}  {duration:7.3f}s  {detail}"
         )
-        if status == STATUS_FAIL:
+        if str(gate.get("status", "")) == STATUS_FAIL:
             lines.append(f"  {'':6s}  {'':{kind_w}s}  {'':{name_w}s}  {'':>8s}  fix: {gate.get('fix_command', '')}")
 
     structure_s = summary.get("structure_duration_s", 0.0)
@@ -887,7 +1117,14 @@ def structure_doctor_text_lines(payload: dict[str, Any]) -> list[str]:
             "not regressions — re-run or check the dependency."
         )
     if summary.get("fail", 0):
-        lines.append("  FAIL gates carry an exact fix command above; exit code is nonzero.")
+        lines.append(
+            f"  FAIL gates carry an exact fix command above; exit code is {EXIT_DRIFT} "
+            "(EXIT_DRIFT — ran fine, found a difference; 1 would mean the doctor itself failed)."
+        )
+        lines.append(
+            f"  Auto-fix: `{DOCTOR_TOOL_NAME} --fix` previews (writes nothing, exits "
+            f"{_EXIT_NEEDS_INPUT}); add --yes to apply with a backup and an undo command."
+        )
     return lines
 
 
@@ -898,9 +1135,15 @@ __all__ = [
     "STATUS_FAIL",
     "STATUS_INCO",
     "STRUCTURE_BUDGET_S",
+    "DOCTOR_TOOL_NAME",
+    "STRUCTURE_DOCTOR_FIX_BOUNDARY_ID",
+    "STRUCTURE_DOCTOR_UNDO_TEMPLATE",
     "GateResult",
     "DoctorContext",
     "build_context",
+    "gate_findings",
+    "next_actions_for_structure_doctor",
     "run_structure_doctor",
+    "structure_doctor_fix_registry",
     "structure_doctor_text_lines",
 ]

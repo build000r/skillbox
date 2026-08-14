@@ -1012,7 +1012,7 @@ class BoxTests(unittest.TestCase):
         docs = self._run("robot-docs", "guide")
         self.assertEqual(docs.returncode, 0, docs.stderr)
         self.assertIn("Skillbox box agent guide", docs.stdout)
-        self.assertIn("operator_box_exec", docs.stdout)
+        self.assertIn("exec <box-id> --dry-run --format json -- <command>", docs.stdout)
 
         triage = self._run("--robot-triage")
         self.assertEqual(triage.returncode, 0, triage.stderr)

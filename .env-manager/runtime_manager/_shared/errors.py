@@ -77,20 +77,40 @@ from lib.redaction import is_secret_key as is_secret_key  # noqa: E402
 from lib.redaction import redact_text as redact_text  # noqa: E402
 from lib.redaction import redact_value as redact_value  # noqa: E402
 
+# Family exit-code ladder for the manage.py surface. Exit 2 is RESERVED for
+# argparse usage errors (see cli.py ``_EXIT_USAGE``) because argparse exits 2 on
+# paths we do not route through our own ``error()`` override, so we cannot move
+# usage off 2 reliably. Drift therefore gets its own dedicated code rather than
+# sharing 2 (which made "ran fine, found drift" indistinguishable from "your
+# invocation was wrong") and rather than reusing 3 (already published as
+# "operator input required"). Keep this ladder in sync with the ``exit_codes``
+# dictionary in ``manage.py capabilities``.
 EXIT_OK = 0
 
 EXIT_ERROR = 1
 
-EXIT_DRIFT = 2
+EXIT_USAGE = 2
 
 EXIT_NEEDS_INPUT = 3
 
+EXIT_DRIFT = 4
+
 @dataclass
 class CheckResult:
+    """One doctor finding.
+
+    ``fix_command`` is the copy-pasteable remediation for this exact finding.
+    It is the family-wide field name (the outer reconcile doctor and the
+    structure doctor carry the same one) — pass-2 finding F-doc-06 was that the
+    inner doctor told an agent what was wrong and never what to type.
+    ``status`` is the family vocabulary: pass | warn | inco | fail.
+    """
+
     status: str
     code: str
     message: str
     details: dict[str, Any] | None = None
+    fix_command: str | None = None
 
 def structured_error(
     message: str,

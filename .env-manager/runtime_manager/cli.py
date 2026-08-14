@@ -10,11 +10,13 @@ import shlex
 import subprocess
 import sys
 import traceback
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
+from . import runtime_ops
 from . import validation as VALIDATION
 from .errors import (
     OVERRIDE_REFUSED_FLOOR,
@@ -30,6 +32,14 @@ from lib.runtime_model import (  # noqa: E402
     LOCAL_RUNTIME_MODE_UNSUPPORTED,
     LOCAL_RUNTIME_START_BLOCKED,
     LOCAL_RUNTIME_START_MODES,
+)
+from lib import doctor_fix  # noqa: E402
+from lib.doctor_contract import (  # noqa: E402
+    Finding,
+    coverage_block,
+    doctor_envelope,
+    finding_from_obj,
+    fix_contract,
 )
 from .validation import *
 from .publish import *
@@ -61,7 +71,16 @@ from .state_backup import (
 from .evidence import *
 from .forge import *
 from .swimmers_launch import launch_swimmers_batch, swimmers_launch_text_lines
-from .structure_doctor import run_structure_doctor, structure_doctor_text_lines
+from .structure_doctor import (
+    DOCTOR_TOOL_NAME as STRUCTURE_DOCTOR_TOOL_NAME,
+    STRUCTURE_DOCTOR_FIX_BOUNDARY_ID,
+    STRUCTURE_DOCTOR_UNDO_TEMPLATE,
+    GateResult,
+    gate_findings,
+    run_structure_doctor,
+    structure_doctor_fix_registry,
+    structure_doctor_text_lines,
+)
 from .git_estate import (
     build_report as git_estate_report,
     compute_scan_delta as git_estate_compute_scan_delta,
@@ -192,7 +211,9 @@ def _argv_requests_json(argv: list[str] | None = None) -> bool:
 
 
 # argparse usage errors are exit code 2 per the documented exit_code dictionary.
-_EXIT_USAGE = 2
+# Aliased to the shared ladder (``_shared/errors.py``) so usage and drift can
+# never silently converge on the same number again.
+_EXIT_USAGE = EXIT_USAGE
 
 
 class SkillboxArgumentParser(argparse.ArgumentParser):
@@ -348,6 +369,41 @@ def _add_client_arg(command_parser: argparse.ArgumentParser) -> None:
         action="append",
         default=[],
         help="Activate a runtime client overlay. Can be repeated.",
+    )
+
+
+def _add_doctor_fix_args(command_parser: argparse.ArgumentParser) -> None:
+    """The family-wide ``--fix`` triple. Identical on every doctor by design.
+
+    ``--fix`` alone is a PLAN: it changes nothing, writes a run artifact, and
+    exits ``EXIT_NEEDS_INPUT`` (3) — the published meaning of "operator input
+    required". ``--yes`` is the only thing that authorizes a write.
+    """
+    command_parser.add_argument(
+        "--fix",
+        action="store_true",
+        help=(
+            "Plan the auto-fixes for the failing findings. Without --yes this changes "
+            f"NOTHING and exits {EXIT_NEEDS_INPUT} (confirmation required)."
+        ),
+    )
+    command_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help=(
+            "Confirm --fix or --undo: take backups, act, and write a run artifact. "
+            "Without it both are plans."
+        ),
+    )
+    command_parser.add_argument(
+        "--undo",
+        metavar="RUN_ARTIFACT",
+        default=None,
+        help=(
+            "Plan the restore of a previous `--fix --yes` run artifact. Undo DELETES the "
+            f"paths that fix created, so it is confirmation-gated too: without --yes it "
+            f"changes nothing and exits {EXIT_NEEDS_INPUT}."
+        ),
     )
 
 
@@ -523,6 +579,7 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor_parser.add_argument("--format", choices=("text", "json"), default="text")
     _add_profile_arg(doctor_parser)
     _add_client_arg(doctor_parser)
+    _add_doctor_fix_args(doctor_parser)
 
     structure_doctor_parser = subparsers.add_parser(
         "structure-doctor",
@@ -542,6 +599,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Directory to evaluate cwd-scoped gates (skill/MCP drift) against. Defaults to $PWD.",
     )
+    _add_doctor_fix_args(structure_doctor_parser)
 
     git_status_parser = subparsers.add_parser(
         "git-status",
@@ -3479,7 +3537,10 @@ def _capabilities_payload(root_dir: Path, *, compact: bool = False) -> dict[str,
     payload = {
         "ok": True,
         "tool": "skillbox-manage",
-        "contract_version": "2026-05-09",
+        # Bumped 2026-08-14: drift moved off exit 2 (now 4) so usage errors and
+        # drift are distinguishable. Consumers pinning the old version must
+        # re-read exit_codes.
+        "contract_version": "2026-08-14",
         "root_dir": str(root_dir),
         "entrypoints": [
             "python3 .env-manager/manage.py",
@@ -3517,8 +3578,11 @@ def _capabilities_payload(root_dir: Path, *, compact: bool = False) -> dict[str,
         "exit_codes": {
             "0": "success",
             "1": "user input, runtime, or environment error",
-            "2": "drift detected or argparse usage error, depending on command surface",
+            "2": "argparse usage error (the invocation was wrong)",
             "3": "operator input required",
+            "4": "drift detected: the command ran fine and found a difference "
+                 "(doctor fail, mcp-sync dry-run changes, unresolved relink root, "
+                 "blocked skill-lifecycle action)",
         },
         "env": {
             "SKILLBOX_STATE_ROOT": "Persistent runtime state root.",
@@ -3960,18 +4024,59 @@ def _handle_operator_booking(
 def _handle_structure_doctor(args: argparse.Namespace, root_dir: Path) -> int:
     """`sbp doctor` — the structural verification front door.
 
-    Read-only: every gate is a lint/audit/subprocess that does not mutate state,
-    so this runs as an early-dispatch handler (no runtime-model prefilter). Exits
-    nonzero ONLY when a gate is FAIL; INCO and PASS both exit 0.
+    Diagnosis is read-only: every gate is a lint/audit/subprocess that does not
+    mutate state, so this runs as an early-dispatch handler (no runtime-model
+    prefilter). Exit 4 (EXIT_DRIFT) when a gate is FAIL; INCO and PASS exit 0.
+
+    ``--fix`` is the ONE conditional write on this surface, and it is gated
+    three ways: a fix only runs for a gate with a registered spec, only with
+    ``--yes``, and only inside a state-root mutation lease with a pre-change
+    backup. ``--fix`` without ``--yes`` writes nothing and exits 3.
     """
     cwd = Path(getattr(args, "cwd", None) or os.getcwd())
+    if getattr(args, "undo", None):
+        return _handle_doctor_undo(
+            args.undo,
+            root_dir=root_dir,
+            fmt=args.format,
+            confirmed=bool(getattr(args, "yes", False)),
+        )
+
     payload = run_structure_doctor(runtime_root=root_dir, cwd=cwd)
+    if getattr(args, "fix", False):
+        gates = [
+            structure_doctor_gate_result(gate) for gate in payload.get("gates") or []
+        ]
+        run = doctor_fix.run_fix(
+            tool=STRUCTURE_DOCTOR_TOOL_NAME,
+            root_dir=root_dir,
+            findings=gate_findings(gates),
+            registry=structure_doctor_fix_registry(gates, cwd),
+            confirmed=bool(getattr(args, "yes", False)),
+            boundary_id=STRUCTURE_DOCTOR_FIX_BOUNDARY_ID,
+            undo_command_template=STRUCTURE_DOCTOR_UNDO_TEMPLATE,
+            argv=sys.argv[1:],
+        )
+        return _emit_fix_run(run, fmt=args.format)
+
     if args.format == "json":
         emit_json(payload)
     else:
         for line in structure_doctor_text_lines(payload):
             print(line)
     return int(payload.get("exit_code", 0))
+
+
+def structure_doctor_gate_result(gate: dict[str, Any]) -> GateResult:
+    """Rehydrate a gate payload into the dataclass the fix registry reads."""
+    return GateResult(
+        name=str(gate.get("name", "")),
+        kind=str(gate.get("kind", "")),
+        status=str(gate.get("status", "")),
+        duration_s=float(gate.get("duration_s", 0.0) or 0.0),
+        fix_command=str(gate.get("fix_command", "") or ""),
+        detail=str(gate.get("detail", "") or ""),
+    )
 
 
 def _handle_git_status(args: argparse.Namespace, root_dir: Path) -> int:
@@ -4282,19 +4387,139 @@ def _handle_ports(args: argparse.Namespace, root_dir: Path, model: dict[str, Any
     return EXIT_OK
 
 
+#: What the inner doctor covers, for the family `coverage` block.
+RUNTIME_DOCTOR_COVERS = (
+    "runtime manifest and connector-contract consistency",
+    "required/syncable repo, artifact, env-file and log paths",
+    "skill repo config, lock, bundle and install integrity",
+    "storage posture, bridges, ingress, service exposure, MCP healthchecks",
+    "port registry and port contracts",
+    "the parity ledger",
+)
+
+#: The state_mutation.py MANIFEST id whose lease `doctor --fix --yes` takes.
+RUNTIME_DOCTOR_FIX_BOUNDARY_ID = "manage.doctor"
+
+RUNTIME_DOCTOR_UNDO_TEMPLATE = "python3 .env-manager/manage.py doctor --undo {artifact}"
+
+
+def runtime_doctor_fix_registry(results: Sequence[Any]) -> dict[str, doctor_fix.FixSpec]:
+    """THIS run's auto-fix registry, built from THIS run's findings.
+
+    ``--fix`` never shell-executes a finding's ``fix_command`` string; it runs a
+    declared argv. Only remediations that are idempotent, in-repo, and covered
+    by a backup get a spec — a warn-level finding is never auto-fixed at all
+    (see ``doctor_fix.annotate_fixable``), so `sync` is registered against the
+    codes that FAIL when the runtime tree is genuinely out of date.
+    """
+    manage_py = "/".join((".env-manager", "manage.py"))
+    sync_command = f"python3 {manage_py} sync"
+    # Derived, never hand-listed: the codes `sync` clears are exactly the codes
+    # whose published fix_command IS `sync`. A hand-copy of this list drifted
+    # once already (it missed `skill-repo-install`), so the map is the source.
+    sync_codes = tuple(
+        code
+        for code, command in runtime_ops.DOCTOR_FIX_COMMANDS.items()
+        if command == sync_command
+    )
+    live = {result.code for result in results if result.status == "fail"}
+    specs: list[doctor_fix.FixSpec] = []
+    if live & set(sync_codes):
+        # One sync clears the whole class; registering it per-code would run it
+        # N times. It is declared against the first live code so the artifact
+        # names something real, and the description says what it covers.
+        first = next(code for code in sync_codes if code in live)
+        specs.append(
+            doctor_fix.FixSpec(
+                code=first,
+                command=("python3", manage_py, "sync"),
+                description=(
+                    "materialize the declared runtime tree (repos, artifacts, env files, "
+                    "log dirs, skill bundles/locks/installs)"
+                ),
+                backup_paths=("skills.lock", ".env-manager/skills.lock"),
+                timeout_s=900.0,
+            )
+        )
+    return doctor_fix.build_registry(specs)
+
+
+def _runtime_doctor_findings(results: Sequence[Any]) -> list[Finding]:
+    registry = runtime_doctor_fix_registry(results)
+    return doctor_fix.annotate_fixable(
+        [finding_from_obj(result) for result in results], registry
+    )
+
+
+def runtime_doctor_payload(results: Sequence[Any], root_dir: Path) -> dict[str, Any]:
+    findings = _runtime_doctor_findings(results)
+    registry = runtime_doctor_fix_registry(results)
+    return doctor_envelope(
+        tool=DOCTOR_TOOL_NAME,
+        findings=findings,
+        next_actions=next_actions_for_doctor(results),
+        coverage=coverage_block(tool=DOCTOR_TOOL_NAME, includes=RUNTIME_DOCTOR_COVERS),
+        fix=fix_contract(
+            supported=True,
+            artifact_dir=str(doctor_fix.runs_dir(root_dir, DOCTOR_TOOL_NAME)),
+            fixable_codes=registry.keys(),
+        ),
+    )
+
+
 def _handle_doctor(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
+    if getattr(args, "undo", None):
+        return _handle_doctor_undo(
+            args.undo,
+            root_dir=root_dir,
+            fmt=args.format,
+            confirmed=bool(getattr(args, "yes", False)),
+        )
+
     results = doctor_results(model, root_dir)
-    has_fail = any(result.status == "fail" for result in results)
+    if getattr(args, "fix", False):
+        run = doctor_fix.run_fix(
+            tool=DOCTOR_TOOL_NAME,
+            root_dir=root_dir,
+            findings=[finding_from_obj(result) for result in results],
+            registry=runtime_doctor_fix_registry(results),
+            confirmed=bool(getattr(args, "yes", False)),
+            boundary_id=RUNTIME_DOCTOR_FIX_BOUNDARY_ID,
+            undo_command_template=RUNTIME_DOCTOR_UNDO_TEMPLATE,
+            argv=sys.argv[1:],
+        )
+        return _emit_fix_run(run, fmt=args.format)
+
+    payload = runtime_doctor_payload(results, root_dir)
     if args.format == "json":
-        emit_json(_stamp_runtime_envelope({
-            "checks": [asdict(result) for result in results],
-            "next_actions": next_actions_for_doctor(results),
-        }, ok=not has_fail))
+        emit_json(payload)
     else:
         print_doctor_text(results)
-    if has_fail:
-        return EXIT_DRIFT
-    return EXIT_OK
+    return int(payload["exit_code"])
+
+
+def _emit_fix_run(run: doctor_fix.FixRun, *, fmt: str) -> int:
+    if fmt == "json":
+        emit_json(run.artifact)
+    else:
+        for line in run.lines:
+            print(line)
+    return run.exit_code
+
+
+def _handle_doctor_undo(
+    artifact: str, *, root_dir: Path, fmt: str, confirmed: bool = False
+) -> int:
+    """`--undo` plans; `--undo --yes` acts.
+
+    Undo removes paths, which is not a smaller decision than creating them, so
+    it carries the SAME confirmation contract as `--fix` rather than a weaker
+    one. `doctor_fix.undo_run` also treats the artifact as untrusted input: it
+    must live in this state root, name this repo, and verify.
+    """
+    return _emit_fix_run(
+        doctor_fix.undo_run(Path(artifact), root_dir=root_dir, confirmed=confirmed), fmt=fmt
+    )
 
 
 def _handle_status(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:

@@ -157,10 +157,25 @@ RESULT_REMOVED = "removed"
 RESULT_ROLLED_BACK = "rolled-back"
 RESULT_FAILED = "failed"
 
+# Family exit-code ladder. Source of truth:
+# ``runtime_manager._shared.errors`` (EXIT_OK/EXIT_ERROR/EXIT_USAGE/
+# EXIT_NEEDS_INPUT/EXIT_DRIFT). ``main()`` builds an ``argparse`` parser, so 2
+# is RESERVED for argparse usage errors on every path we do not route through
+# our own error handling — "needs operator action" therefore CANNOT live on 2
+# (a caller gating on ``$? -eq 2`` could not tell "your invocation was wrong"
+# from "I need you to do something"). It moves to 3 = EXIT_NEEDS_INPUT, whose
+# published meaning is exactly "operator input required".
+#
+# ``unsupported`` has no family slot (it is neither an error, nor drift, nor a
+# request for input: this host simply cannot run the reconcile), so it moves
+# ABOVE the reserved family range rather than squatting on 3. Codes >= 5 are
+# tool-local by construction.
+# tests/test_dcg_reconcile.py pins these against the real family constants.
 EXIT_OK = 0
 EXIT_FAILED = 1
-EXIT_NEEDS_OPERATOR = 2
-EXIT_UNSUPPORTED = 3
+# 2 is reserved family-wide for argparse usage errors — deliberately unused here.
+EXIT_NEEDS_OPERATOR = 3
+EXIT_UNSUPPORTED = 5
 
 DCG_RECONCILE_MALFORMED_CONFIG = "DCG_RECONCILE_MALFORMED_CONFIG"
 DCG_RECONCILE_WRITE_FAILED = "DCG_RECONCILE_WRITE_FAILED"

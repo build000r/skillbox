@@ -10,7 +10,9 @@ import os
 import re
 import json
 import fcntl
+import hashlib
 import random
+import shlex
 import subprocess
 import tempfile
 import time
@@ -247,6 +249,294 @@ def resolve_inventory_path(
     )
 
 
+# ---------------------------------------------------------------------------
+# Remote-exec command policy (shared by the operator MCP and box.py exec)
+#
+# BOTH surfaces run ARBITRARY shell over Tailscale SSH on an inventory box, so
+# the classifier and the marker key must agree byte-for-byte: a preview taken
+# through either surface has to authorize the other, and a marker minted for
+# command A must never authorize command B. These helpers are PURE (no I/O, no
+# process state) — the gates themselves stay in their own modules.
+#
+# Policy, in two tiers:
+#   1. READ-ONLY ALLOWLIST — a SHORT, BORING set of inspection commands that
+#      cannot mutate state. These pass unconditionally (no dry-run friction).
+#      We match on the LEADING command token(s) and disqualify any command that
+#      contains shell metacharacters which could chain a second command — an
+#      allowlisted prefix must NOT be a smuggling vector for an arbitrary tail.
+#   2. EVERYTHING ELSE — mutating verbs, unknown commands, or anything with
+#      chaining metacharacters — requires a fresh dry-run preview that stamps a
+#      marker keyed by box_id + a hash of the NORMALIZED command.
+# ---------------------------------------------------------------------------
+
+# Shell metacharacters that can chain/redirect a second command. Their presence
+# disqualifies the read-only fast path: even `cat foo` becomes mutating-capable
+# as `cat foo > /etc/passwd` or `cat foo; rm -rf /`. A command with any of these
+# must go through the dry-run marker path regardless of its leading token.
+_SHELL_CHAIN_RE = re.compile(r"[;&|><`\n\r]|\$\(|\$\{|\\\n")
+
+# Read-only allowlist. Keyed by the leading token; the value is either:
+#   - None: any args allowed (e.g. `df`, `uptime`).
+#   - a set of allowed SECOND tokens (e.g. `docker` -> {"ps", "logs", ...},
+#     `git` -> {"status", "log", ...}, `systemctl` -> {"status", ...}).
+# Conservative on purpose: subcommands like `docker exec`, `git push`,
+# `systemctl restart` are NOT here and fall through to the dry-run gate.
+_READONLY_ALLOWLIST: dict[str, set[str] | None] = {
+    # Plain inspection commands (any args).
+    "cat": None,
+    "df": None,
+    "du": None,
+    "free": None,
+    "head": None,
+    "hostname": None,
+    "id": None,
+    "journalctl": None,
+    "ls": None,
+    "nproc": None,
+    "ps": None,
+    "pwd": None,
+    "stat": None,
+    "tail": None,
+    "uname": None,
+    "uptime": None,
+    "wc": None,
+    "whoami": None,
+    # Subcommand-scoped: only the read-only verbs below are allowlisted.
+    "docker": {"ps", "logs", "images", "inspect", "stats", "version", "top"},
+    "git": {"status", "log", "diff", "show", "branch", "remote", "rev-parse"},
+    "systemctl": {"status", "is-active", "is-enabled", "list-units", "show"},
+}
+
+# Paths whose `cat`/`head`/`tail` would leak secrets. If the read-only command
+# touches one of these, it does NOT get the fast path — it must dry-run first so
+# the preview (and audit) records exactly what would be read.
+_SECRET_PATH_RE = re.compile(
+    r"(?:^|[\s=])"
+    r"(?:[^\s]*/)?"
+    r"(?:\.env(?:\.[\w.-]+)?|\.netrc|id_rsa|id_ed25519|"
+    r"[^\s]*secret[^\s]*|[^\s]*credential[^\s]*|authkey|\.ssh/[^\s]*)",
+    re.IGNORECASE,
+)
+
+
+def normalize_command(command: str) -> str:
+    """Collapse insignificant whitespace so trivially-different spellings of
+    the SAME command hash to the same marker key.
+
+    Collapses runs of any whitespace (spaces, tabs, newlines) to a single
+    space and strips leading/trailing whitespace. This makes
+    ``"ls   -la"`` == ``"ls -la"`` and tolerates a trailing newline, but does
+    NOT alter token order, quoting, or operators, so two semantically distinct
+    commands never collide.
+    """
+    return re.sub(r"\s+", " ", command).strip()
+
+
+def canonical_command(command: str) -> str:
+    """Canonical spelling of *command* for hashing — used by BOTH surfaces.
+
+    ``box.py exec`` receives argv after ``--`` and shlex-joins it; the MCP
+    ``operator_box_exec`` receives an already-joined string the caller typed.
+    The same command therefore arrives in two spellings that differ only in
+    quoting style (``sh -c "echo hi"`` vs ``sh -c 'echo hi'``). Hashing the raw
+    text made those hash differently, so a preview taken on one surface could
+    not authorize the real run on the other — the interop the marker store is
+    supposed to provide. Re-splitting and re-joining with :mod:`shlex` folds
+    quoting style into one form, so both surfaces produce the identical hash.
+
+    Never raises: text that is not shell-lexable (unbalanced quotes) or that
+    would not round-trip through ``shlex`` falls back to
+    :func:`normalize_command`, i.e. the previous raw-ish behaviour.
+
+    DELIBERATE consequence: spellings that differ ONLY in quoting collide, so a
+    preview of ``echo '*'`` also authorizes ``echo *``. The marker is a consent
+    stamp ("an operator previewed this command"), not the safety gate — the
+    destructive-command guard is evaluated authoritatively against the ACTUAL
+    command string immediately before execution on both surfaces, so a
+    quoting-level collision cannot smuggle a destructive command past the guard.
+    """
+    normalized = normalize_command(command)
+    if not normalized:
+        return normalized
+    try:
+        words = shlex.split(normalized)
+    except ValueError:
+        return normalized
+    if not words:
+        return normalized
+    canonical = shlex.join(words)
+    try:
+        if shlex.split(canonical) != words:
+            return normalized
+    except ValueError:
+        return normalized
+    return canonical
+
+
+def command_hash(command: str) -> str:
+    """Stable short hash of the canonical command, used in the marker key.
+
+    Binds a dry-run marker to the EXACT command previewed: a marker for
+    command A cannot authorize command B because their hashes differ.
+    Canonicalization (see :func:`canonical_command`) means only the quoting
+    STYLE is ignored, never the tokens, their order, or shell operators.
+    """
+    return hashlib.sha256(canonical_command(command).encode("utf-8")).hexdigest()[:16]
+
+
+# --- dry-run marker payload contract (shared by box.py and the operator MCP) ---
+#
+# Both surfaces write markers into the SAME store, so the payload shape is a
+# contract, not an implementation detail. ``session`` used to be written by the
+# MCP and silently absent from CLI markers, and the MCP's validator inferred
+# "no session field => don't session-check" — a rule that existed only as an
+# accident of falsy-string handling. It is now explicit:
+#
+#   session_scope="session"  the marker belongs to ONE MCP session (``session``
+#                            names it); another session must take its own
+#                            preview. A long-lived MCP server has a stable
+#                            session id, so this costs nothing and stops one
+#                            agent's preview from authorizing another's run.
+#   session_scope="any"      the marker is session-agnostic; any reader inside
+#                            the TTL may consume it. CLI markers are minted
+#                            this way ON PURPOSE: each `python3 scripts/box.py`
+#                            invocation is a fresh process under whatever shell
+#                            the agent spawned, so a CLI "session" id would
+#                            differ between the dry-run and the real run and
+#                            refuse every marker it just minted.
+#
+# Readers MUST consult :func:`marker_session_scope` rather than testing for the
+# presence of ``session``; legacy markers (no scope field) map to the same
+# behaviour they had before.
+MARKER_SESSION_SCOPE_SESSION = "session"
+MARKER_SESSION_SCOPE_ANY = "any"
+MARKER_SOURCE_BOX_CLI = "box-cli"
+MARKER_SOURCE_OPERATOR_MCP = "operator-mcp"
+
+
+def dryrun_marker_payload(
+    tool_name: str,
+    key: str,
+    *,
+    source: str,
+    created_at: str,
+    session: str | None = None,
+) -> dict[str, Any]:
+    """Build the on-disk dry-run marker payload for EITHER surface.
+
+    One builder so the two writers cannot drift apart field-by-field. Passing a
+    non-empty *session* makes the marker session-scoped; omitting it makes it
+    session-agnostic (see the contract note above).
+    """
+    session_id = str(session or "").strip()
+    return {
+        "tool": tool_name,
+        "key": key,
+        "source": source,
+        "session": session_id or None,
+        "session_scope": (
+            MARKER_SESSION_SCOPE_SESSION if session_id else MARKER_SESSION_SCOPE_ANY
+        ),
+        "created_at": created_at,
+        "note": f"dry-run completed for {tool_name} key={key}",
+    }
+
+
+def marker_session_scope(payload: dict[str, Any] | None) -> str:
+    """Session scope of a marker payload, defaulting legacy markers honestly.
+
+    An explicit ``session_scope`` wins. Without one, a marker that carries a
+    ``session`` is session-scoped (what the MCP has always written) and a marker
+    without one is session-agnostic (what box.py has always written) — so old
+    markers on disk keep their existing meaning.
+    """
+    if not isinstance(payload, dict):
+        return MARKER_SESSION_SCOPE_ANY
+    declared = str(payload.get("session_scope") or "").strip().lower()
+    if declared in (MARKER_SESSION_SCOPE_SESSION, MARKER_SESSION_SCOPE_ANY):
+        return declared
+    return (
+        MARKER_SESSION_SCOPE_SESSION
+        if str(payload.get("session") or "").strip()
+        else MARKER_SESSION_SCOPE_ANY
+    )
+
+
+def box_exec_marker_key(box_id: str, command: str) -> str:
+    """Marker subject for a remote exec, binding box_id + command hash.
+
+    The marker store keys on a single slug; we combine the (already validated)
+    box_id with the normalized-command hash so a marker minted for command A on
+    box X cannot authorize command B (different hash) or command A on box Y
+    (different box_id). To stay within the 64-char identifier limit for any
+    box_id length, the box_id is folded into a short hash and joined with the
+    command hash: ``{box_hash}.{command_hash}`` (only ``[a-z0-9.]``). Distinct
+    box_ids and distinct (normalized) commands therefore land on distinct
+    markers; identical ones collide intentionally.
+    """
+    box_hash = hashlib.sha256(box_id.encode("utf-8")).hexdigest()[:16]
+    return f"{box_hash}.{command_hash(command)}"
+
+
+def _leading_tokens(command: str) -> list[str]:
+    """Best-effort split of the normalized command into its leading tokens.
+
+    We only need the first two tokens to consult the allowlist. ``shlex`` would
+    raise on unbalanced quotes; for classification a simple whitespace split of
+    the normalized command is sufficient and never raises.
+    """
+    return normalize_command(command).split(" ")
+
+
+def classify_box_exec_command(command: str) -> dict[str, Any]:
+    """Classify *command* as 'read-only' (allowlisted) or 'mutating'.
+
+    Returns a dict: {"verdict": "read-only"|"mutating", "reason": str}.
+    'read-only' means it passes unconditionally; 'mutating' means a matching
+    dry-run marker is required. The classifier is conservative: anything it is
+    not SURE is read-only is treated as mutating.
+    """
+    normalized = normalize_command(command)
+    if not normalized:
+        return {"verdict": "mutating", "reason": "empty command"}
+
+    if _SHELL_CHAIN_RE.search(command):
+        return {
+            "verdict": "mutating",
+            "reason": "contains shell chaining/redirection metacharacters",
+        }
+
+    tokens = _leading_tokens(command)
+    head = tokens[0]
+
+    # Reject an env-var prefix (FOO=bar cmd ...) or absolute/relative path
+    # invocation on the fast path — we only allowlist bare, known tokens.
+    if "=" in head or "/" in head:
+        return {"verdict": "mutating", "reason": f"non-allowlisted invocation: {head!r}"}
+
+    if head not in _READONLY_ALLOWLIST:
+        return {"verdict": "mutating", "reason": f"command {head!r} not in read-only allowlist"}
+
+    allowed_sub = _READONLY_ALLOWLIST[head]
+    if allowed_sub is not None:
+        sub = tokens[1] if len(tokens) > 1 else ""
+        if sub not in allowed_sub:
+            return {
+                "verdict": "mutating",
+                "reason": f"{head} subcommand {sub or '<none>'!r} not in read-only allowlist",
+            }
+
+    # `cat`/`head`/`tail`/`stat`/`ls` of a secret-looking path is NOT free:
+    # it could exfiltrate secrets, so route it through the dry-run preview.
+    if head in {"cat", "head", "tail", "stat", "ls", "wc"} and _SECRET_PATH_RE.search(command):
+        return {
+            "verdict": "mutating",
+            "reason": "reads a secret-looking path; preview required",
+        }
+
+    return {"verdict": "read-only", "reason": f"allowlisted: {head}"}
+
+
 def classify_ssh_failure(result: dict[str, Any]) -> dict[str, Any]:
     """Classify an SSH subprocess result for retry and diagnostics.
 
@@ -435,13 +725,24 @@ def run_checked(
 __all__ = [
     "INVENTORY_LOCK_TIMEOUT",
     "INVENTORY_PATH_INVALID",
+    "MARKER_SESSION_SCOPE_ANY",
+    "MARKER_SESSION_SCOPE_SESSION",
+    "MARKER_SOURCE_BOX_CLI",
+    "MARKER_SOURCE_OPERATOR_MCP",
     "InventoryLockTimeout",
     "InventoryPathError",
     "RetryPolicy",
     "SSH_READ_RETRY_POLICY",
     "SSH_TRANSPORT_ERROR_PATTERNS",
     "atomic_write_json",
+    "box_exec_marker_key",
+    "canonical_command",
+    "classify_box_exec_command",
     "classify_ssh_failure",
+    "command_hash",
+    "dryrun_marker_payload",
+    "marker_session_scope",
+    "normalize_command",
     "locked_inventory_update",
     "resolve_inventory_path",
     "run_checked",

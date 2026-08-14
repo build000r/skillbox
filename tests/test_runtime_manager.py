@@ -1128,7 +1128,7 @@ class RuntimeManagerTests(unittest.TestCase):
 
             result = self._run(repo, "doctor", "--client", "personal", "--profile", "connectors", "--format", "json")
 
-            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(result.returncode, MANAGE_MODULE.EXIT_DRIFT, result.stderr)
             payload = json.loads(result.stdout)
             connector_failures = [
                 item for item in payload["checks"] if item["status"] == "fail" and item["code"] == "connector-contract"
@@ -1571,7 +1571,7 @@ class RuntimeManagerTests(unittest.TestCase):
 
             result = self._run(repo, "doctor", "--client", "vibe-coding-client", "--format", "json")
 
-            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.returncode, MANAGE_MODULE.EXIT_DRIFT)
             payload = json.loads(result.stdout)
             checks = payload["checks"]
             failure_codes = {item["code"] for item in checks if item["status"] == "fail"}
@@ -1593,7 +1593,7 @@ class RuntimeManagerTests(unittest.TestCase):
 
             result = self._run(repo, "doctor", "--format", "json")
 
-            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.returncode, MANAGE_MODULE.EXIT_DRIFT)
             payload = json.loads(result.stdout)
             checks = payload["checks"]
             install_failures = [
@@ -1621,7 +1621,7 @@ class RuntimeManagerTests(unittest.TestCase):
 
             result = self._run(repo, "doctor", "--profile", "surfaces", "--format", "json")
 
-            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.returncode, MANAGE_MODULE.EXIT_DRIFT)
             payload = json.loads(result.stdout)
             checks = payload["checks"]
             issues = checks[0]["details"]["issues"]
@@ -1657,7 +1657,7 @@ class RuntimeManagerTests(unittest.TestCase):
 
             result = self._run(repo, "doctor", "--profile", "surfaces", "--format", "json")
 
-            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.returncode, MANAGE_MODULE.EXIT_DRIFT)
             payload = json.loads(result.stdout)
             checks = payload["checks"]
             issues = checks[0]["details"]["issues"]
@@ -2304,7 +2304,7 @@ class RuntimeManagerTests(unittest.TestCase):
             (repo / ".skillbox-state" / "monoserver" / "acme-studio").mkdir(parents=True, exist_ok=True)
 
             doctor = self._run(repo, "doctor", "--client", "acme-studio", "--format", "json")
-            self.assertEqual(doctor.returncode, 2)
+            self.assertEqual(doctor.returncode, MANAGE_MODULE.EXIT_DRIFT)
             checks = json.loads(doctor.stdout)["checks"]
             failures = [item for item in checks if item["status"] == "fail" and item["code"] == "required-runtime-env-files"]
             self.assertEqual(len(failures), 1, checks)
@@ -4166,6 +4166,8 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertIn("recoverable", error)
             self.assertTrue(error["recoverable"])
 
+    # EXIT_DRIFT is 4, NOT 2: exit 2 is reserved for argparse usage errors so a
+    # scripted caller can tell "ran fine, found drift" from "bad invocation".
     def test_doctor_returns_exit_drift_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -4173,7 +4175,8 @@ class RuntimeManagerTests(unittest.TestCase):
 
             result = self._run(repo, "doctor", "--client", "vibe-coding-client", "--format", "json")
 
-            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.returncode, MANAGE_MODULE.EXIT_DRIFT)
+            self.assertNotEqual(result.returncode, MANAGE_MODULE.EXIT_USAGE)
 
     def test_sync_json_includes_next_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -7857,7 +7860,7 @@ class RuntimeManagerTests(unittest.TestCase):
 
             result = self._run(repo, "doctor", "--format", "json")
 
-            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(result.returncode, MANAGE_MODULE.EXIT_DRIFT, result.stderr)
             payload = json.loads(result.stdout)
             issues = [
                 issue

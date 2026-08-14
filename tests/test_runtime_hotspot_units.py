@@ -2696,7 +2696,23 @@ class WorkflowOnboardAndFocusStateHotspotTests(unittest.TestCase):
         with mock.patch("runtime_manager.workflows.doctor_results", return_value=[passed]):
             self.assertEqual(
                 workflows_module._onboard_verify_detail({}, Path("/repo")),  # noqa: SLF001
-                ("ok", {"checks": [{"status": "pass", "code": "doctor", "message": "ok", "details": {}}]}, False),
+                # fix_command is part of the family CheckResult now: every
+                # finding carries the remediation field even when it is empty.
+                (
+                    "ok",
+                    {
+                        "checks": [
+                            {
+                                "status": "pass",
+                                "code": "doctor",
+                                "message": "ok",
+                                "details": {},
+                                "fix_command": None,
+                            }
+                        ]
+                    },
+                    False,
+                ),
             )
 
         with mock.patch("runtime_manager.workflows.doctor_results", return_value=[warn]):
@@ -3579,7 +3595,11 @@ class RuntimeTextRendererHotspotTests(unittest.TestCase):
         self.assertIn("     paths: /a, /b", output)
         self.assertIn("     count: 2", output)
         self.assertNotIn("empty:", output)
-        self.assertIn("summary: 1 passed, 1 warnings, 1 failed", output)
+        # One summary line, family-wide: pass/warn/inco/fail in that order.
+        self.assertIn("summary: 1 passed, 1 warnings, 0 inconclusive, 1 failed", output)
+        # Routing (F-doc-04) is printed BEFORE the summary so the summary stays
+        # the last meaningful line — sbp doctor's runtime gate reports it.
+        self.assertIn("front door: sbp doctor", output)
 
     def test_print_status_text_renders_all_runtime_sections(self) -> None:
         payload = {

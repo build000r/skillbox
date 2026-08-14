@@ -11,11 +11,8 @@ Protocol: JSON-RPC 2.0 over stdio (MCP 2024-11-05).
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
 import os
-import re
-import shutil
 
 # Not referenced directly in this module, but it IS part of the module's
 # patchable surface: tests/test_operator_mcp_server.py patches
@@ -71,6 +68,14 @@ _DRY_RUN_PROP: dict = {
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from lib.opslib import (  # noqa: E402
+    MARKER_SESSION_SCOPE_SESSION,
+    MARKER_SOURCE_OPERATOR_MCP,
+    box_exec_marker_key as _opslib_box_exec_marker_key,
+    classify_box_exec_command,
+    command_hash,
+    dryrun_marker_payload,
+    marker_session_scope,
+    normalize_command,
     resolve_inventory_path,
     run_checked,
     validate_host,
@@ -82,6 +87,13 @@ from lib.redaction import (  # noqa: E402
     redact_value as _redact_diagnostic_value,
 )
 
+# The DCG adapter itself is hoisted into lib.dcglib and shared byte-for-byte
+# with `python3 scripts/box.py exec`, so the two operator surfaces cannot give
+# different allow/deny answers for the same command. The names below stay in
+# THIS module's namespace because call sites — and tests that patch by module
+# namespace — reference them here.
+from lib import dcglib as _dcglib  # noqa: E402
+
 # The DCG version pin lives in ONE place: .env-manager/runtime_manager/
 # dcg_distribution.py. This server consumes it instead of re-declaring a
 # version string. The import is guarded so a missing/broken runtime_manager
@@ -89,21 +101,9 @@ from lib.redaction import (  # noqa: E402
 # fallback: with no pin we cannot prove the binary is compatible, so the DCG
 # adapter treats a failed import as "incompatible" and FAILS CLOSED.
 _ENV_MANAGER_DIR = REPO_ROOT / ".env-manager"
-if _ENV_MANAGER_DIR.is_dir() and str(_ENV_MANAGER_DIR) not in sys.path:
-    sys.path.insert(0, str(_ENV_MANAGER_DIR))
-try:  # pragma: no cover - exercised via DcgAdapterTests monkeypatching
-    from runtime_manager.dcg_distribution import (  # noqa: E402
-        DCG_VERSION as DCG_PINNED_VERSION,
-        normalize_version as _dcg_normalize_version,
-    )
-
-    DCG_PIN_IMPORT_ERROR = ""
-except Exception as _dcg_pin_exc:  # noqa: BLE001 - any import failure fails closed
-    DCG_PINNED_VERSION = ""
-    DCG_PIN_IMPORT_ERROR = f"{type(_dcg_pin_exc).__name__}: {_dcg_pin_exc}"
-
-    def _dcg_normalize_version(text: str) -> str:  # type: ignore[misc]
-        raise RuntimeError(DCG_PIN_IMPORT_ERROR)
+DCG_PINNED_VERSION, DCG_PIN_IMPORT_ERROR, _dcg_normalize_version = _dcglib.load_pinned_version(
+    _ENV_MANAGER_DIR
+)
 
 DRYRUN_MARKER_TTL_SECONDS = 600  # 10 minutes
 _DRYRUN_MARKER_STATUS_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -117,150 +117,12 @@ _DRYRUN_MARKER_STATUS_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
 # is the payload, so the gate lives here on the server (works for every MCP
 # client, like the provision dry-run gate) rather than only in the hook.
 #
-# Policy, in two tiers:
-#   1. READ-ONLY ALLOWLIST — a SHORT, BORING set of inspection commands that
-#      cannot mutate state. These pass unconditionally (no dry-run friction).
-#      We match on the LEADING command token(s) and refuse the command if it
-#      contains shell metacharacters that could chain a second command
-#      (`;`, `|`, `&`, `>`, backticks, `$(`, `&&`, `||`, newlines used as
-#      separators, etc.) — an allowlisted prefix must NOT be a smuggling
-#      vector for an arbitrary tail.
-#   2. EVERYTHING ELSE — mutating verbs, unknown commands, or anything with
-#      chaining metacharacters — requires a fresh dry_run=true preview that
-#      stamps a marker keyed by box_id + a hash of the NORMALIZED command, so
-#      a marker minted for command A cannot authorize command B.
+# The CLASSIFIER and the MARKER KEY are pure and now live in lib.opslib, shared
+# byte-for-byte with `python3 scripts/box.py exec` so a preview taken through
+# either surface authorizes the other. They are re-exported into this module's
+# namespace because call sites (and tests that patch by module namespace)
+# reference them here.
 # ---------------------------------------------------------------------------
-
-# Shell metacharacters that can chain/redirect a second command. Their presence
-# disqualifies the read-only fast path: even `cat foo` becomes mutating-capable
-# as `cat foo > /etc/passwd` or `cat foo; rm -rf /`. A command with any of these
-# must go through the dry-run marker path regardless of its leading token.
-_SHELL_CHAIN_RE = re.compile(r"[;&|><`\n\r]|\$\(|\$\{|\\\n")
-
-# Read-only allowlist. Keyed by the leading token; the value is either:
-#   - None: any args allowed (e.g. `df`, `uptime`).
-#   - a set of allowed SECOND tokens (e.g. `docker` -> {"ps", "logs", ...},
-#     `git` -> {"status", "log", ...}, `systemctl` -> {"status", ...}).
-# Conservative on purpose: subcommands like `docker exec`, `git push`,
-# `systemctl restart` are NOT here and fall through to the dry-run gate.
-_READONLY_ALLOWLIST: dict[str, set[str] | None] = {
-    # Plain inspection commands (any args).
-    "cat": None,
-    "df": None,
-    "du": None,
-    "free": None,
-    "head": None,
-    "hostname": None,
-    "id": None,
-    "journalctl": None,
-    "ls": None,
-    "nproc": None,
-    "ps": None,
-    "pwd": None,
-    "stat": None,
-    "tail": None,
-    "uname": None,
-    "uptime": None,
-    "wc": None,
-    "whoami": None,
-    # Subcommand-scoped: only the read-only verbs below are allowlisted.
-    "docker": {"ps", "logs", "images", "inspect", "stats", "version", "top"},
-    "git": {"status", "log", "diff", "show", "branch", "remote", "rev-parse"},
-    "systemctl": {"status", "is-active", "is-enabled", "list-units", "show"},
-}
-
-# Paths whose `cat`/`head`/`tail` would leak secrets. If the read-only command
-# touches one of these, it does NOT get the fast path — it must dry-run first so
-# the preview (and audit) records exactly what would be read.
-_SECRET_PATH_RE = re.compile(
-    r"(?:^|[\s=])"
-    r"(?:[^\s]*/)?"
-    r"(?:\.env(?:\.[\w.-]+)?|\.netrc|id_rsa|id_ed25519|"
-    r"[^\s]*secret[^\s]*|[^\s]*credential[^\s]*|authkey|\.ssh/[^\s]*)",
-    re.IGNORECASE,
-)
-
-
-def normalize_command(command: str) -> str:
-    """Collapse insignificant whitespace so trivially-different spellings of
-    the SAME command hash to the same marker key.
-
-    Collapses runs of any whitespace (spaces, tabs, newlines) to a single
-    space and strips leading/trailing whitespace. This makes
-    ``"ls   -la"`` == ``"ls -la"`` and tolerates a trailing newline, but does
-    NOT alter token order, quoting, or operators, so two semantically distinct
-    commands never collide.
-    """
-    return re.sub(r"\s+", " ", command).strip()
-
-
-def command_hash(command: str) -> str:
-    """Stable short hash of the normalized command, used in the marker key.
-
-    Binds a dry-run marker to the EXACT command previewed: a marker for
-    command A cannot authorize command B because their hashes differ.
-    """
-    return hashlib.sha256(normalize_command(command).encode("utf-8")).hexdigest()[:16]
-
-
-def _leading_tokens(command: str) -> list[str]:
-    """Best-effort split of the normalized command into its leading tokens.
-
-    We only need the first two tokens to consult the allowlist. ``shlex`` would
-    raise on unbalanced quotes; for classification a simple whitespace split of
-    the normalized command is sufficient and never raises.
-    """
-    return normalize_command(command).split(" ")
-
-
-def classify_box_exec_command(command: str) -> dict[str, Any]:
-    """Classify *command* as 'read-only' (allowlisted) or 'mutating'.
-
-    Returns a dict: {"verdict": "read-only"|"mutating", "reason": str}.
-    'read-only' means it passes unconditionally; 'mutating' means a matching
-    dry-run marker is required. The classifier is conservative: anything it is
-    not SURE is read-only is treated as mutating.
-    """
-    normalized = normalize_command(command)
-    if not normalized:
-        return {"verdict": "mutating", "reason": "empty command"}
-
-    if _SHELL_CHAIN_RE.search(command):
-        return {
-            "verdict": "mutating",
-            "reason": "contains shell chaining/redirection metacharacters",
-        }
-
-    tokens = _leading_tokens(command)
-    head = tokens[0]
-
-    # Reject an env-var prefix (FOO=bar cmd ...) or absolute/relative path
-    # invocation on the fast path — we only allowlist bare, known tokens.
-    if "=" in head or "/" in head:
-        return {"verdict": "mutating", "reason": f"non-allowlisted invocation: {head!r}"}
-
-    if head not in _READONLY_ALLOWLIST:
-        return {"verdict": "mutating", "reason": f"command {head!r} not in read-only allowlist"}
-
-    allowed_sub = _READONLY_ALLOWLIST[head]
-    if allowed_sub is not None:
-        sub = tokens[1] if len(tokens) > 1 else ""
-        if sub not in allowed_sub:
-            return {
-                "verdict": "mutating",
-                "reason": f"{head} subcommand {sub or '<none>'!r} not in read-only allowlist",
-            }
-
-    # `cat`/`head`/`tail`/`stat`/`ls` of a secret-looking path is NOT free:
-    # it could exfiltrate secrets, so route it through the dry-run preview.
-    if head in {"cat", "head", "tail", "stat", "ls", "wc"} and _SECRET_PATH_RE.search(command):
-        return {
-            "verdict": "mutating",
-            "reason": "reads a secret-looking path; preview required",
-        }
-
-    return {"verdict": "read-only", "reason": f"allowlisted: {head}"}
-
 
 # ---------------------------------------------------------------------------
 # DCG (destructive command guard) adapter — FAIL CLOSED
@@ -287,11 +149,11 @@ def classify_box_exec_command(command: str) -> dict[str, Any]:
 #     the preview authorizes is still gated authoritatively.
 # ---------------------------------------------------------------------------
 
-DCG_BINARY_NAME = "dcg"
-DCG_BINARY_ENV = "SKILLBOX_DCG_BIN"
-DCG_EVAL_TIMEOUT_SECONDS = 10
-DCG_ROBOT_SCHEMA_VERSION = 1
-DCG_INTERFACE = "dcg test --robot --format json"
+DCG_BINARY_NAME = _dcglib.DCG_BINARY_NAME
+DCG_BINARY_ENV = _dcglib.DCG_BINARY_ENV
+DCG_EVAL_TIMEOUT_SECONDS = _dcglib.DCG_EVAL_TIMEOUT_SECONDS
+DCG_ROBOT_SCHEMA_VERSION = _dcglib.DCG_ROBOT_SCHEMA_VERSION
+DCG_INTERFACE = _dcglib.DCG_INTERFACE
 
 # The ONLY call sites permitted to treat a DCG failure as non-blocking. Each is
 # named here and covered by a dedicated non-authoritative test.
@@ -299,8 +161,8 @@ DCG_ADVISORY_SITES = ("operator_box_exec:dry_run_preview",)
 
 # Decision strings understood by this adapter. Anything else is an
 # "unsupported_response" and fails closed.
-_DCG_ALLOW_DECISIONS = frozenset({"allow", "warn"})
-_DCG_DENY_DECISIONS = frozenset({"deny", "block"})
+_DCG_ALLOW_DECISIONS = _dcglib.DCG_ALLOW_DECISIONS
+_DCG_DENY_DECISIONS = _dcglib.DCG_DENY_DECISIONS
 
 
 def _dcg_binary_path() -> str:
@@ -310,14 +172,7 @@ def _dcg_binary_path() -> str:
     default install target ``~/.local/bin/dcg`` used by the distribution
     contract. Returning "" is a fail-closed signal, never a skip.
     """
-    override = str(os.environ.get(DCG_BINARY_ENV) or "").strip()
-    if override:
-        return override if Path(override).is_file() else ""
-    found = shutil.which(DCG_BINARY_NAME)
-    if found:
-        return found
-    default_target = Path.home() / ".local" / "bin" / DCG_BINARY_NAME
-    return str(default_target) if default_target.is_file() else ""
+    return _dcglib.resolve_dcg_binary()
 
 
 def _dcg_result(
@@ -332,17 +187,14 @@ def _dcg_result(
     never infer "no opinion" from this: :func:`dcg_blocks_execution` maps
     anything that is not ``allow`` to a block.
     """
-    record: dict[str, Any] = {
-        "verdict": verdict,
-        "reason_code": reason_code,
-        "reason": reason,
-        "available": verdict in {"allow", "deny"},
-        "fail_closed": verdict == "unavailable",
-        "interface": DCG_INTERFACE,
-        "expected_version": DCG_PINNED_VERSION or "<pin unavailable>",
-    }
-    record.update(extra)
-    return record
+    return _dcglib.dcg_result(
+        verdict,
+        reason_code,
+        reason,
+        expected_version=DCG_PINNED_VERSION,
+        interface=DCG_INTERFACE,
+        **extra,
+    )
 
 
 def dcg_blocks_execution(verdict: dict[str, Any] | None) -> bool:
@@ -352,9 +204,7 @@ def dcg_blocks_execution(verdict: dict[str, Any] | None) -> bool:
     predicate every authoritative call site uses, so "silently no verdict"
     is not expressible.
     """
-    if not isinstance(verdict, dict):
-        return True
-    return verdict.get("verdict") != "allow"
+    return _dcglib.dcg_blocks_execution(verdict)
 
 
 def evaluate_command_with_dcg(
@@ -371,149 +221,23 @@ def evaluate_command_with_dcg(
     spawn failure, timeout, non-JSON output, wrong schema, wrong version,
     unrecognized decision — returns ``verdict="unavailable"``, which
     :func:`dcg_blocks_execution` treats as a block.
+
+    The implementation lives in :mod:`lib.dcglib` and is shared with
+    ``scripts/box.py exec``. Its dependencies are resolved from THIS module's
+    namespace at call time, so patching ``MODULE.run_checked`` /
+    ``MODULE._dcg_binary_path`` / ``MODULE.DCG_PINNED_VERSION`` still drives it.
     """
-    if not DCG_PINNED_VERSION:
-        return _dcg_result(
-            "unavailable",
-            "pin_unavailable",
-            (
-                "the DCG version pin (.env-manager/runtime_manager/"
-                f"dcg_distribution.py) could not be loaded: {DCG_PIN_IMPORT_ERROR}"
-            ),
-        )
-
-    dcg_bin = _dcg_binary_path()
-    if not dcg_bin:
-        return _dcg_result(
-            "unavailable",
-            "binary_missing",
-            (
-                f"the pinned DCG {DCG_PINNED_VERSION} binary is not installed "
-                f"(looked at ${DCG_BINARY_ENV}, PATH, and ~/.local/bin/dcg)"
-            ),
-        )
-
-    argv = [
-        dcg_bin,
-        "test",
-        "--robot",
-        "--format",
-        "json",
-        "--no-color",
-        "--",
+    return _dcglib.evaluate_command(
         command,
-    ]
-    # redact=False so redaction cannot corrupt the JSON we are about to parse;
-    # every string we surface below is redacted explicitly instead.
-    result = run_checked(argv, timeout=timeout, redact=False)
-    error_code = str(result.get("error_code") or "")
-    if error_code == "TIMEOUT":
-        return _dcg_result(
-            "unavailable",
-            "timeout",
-            f"DCG did not answer within {timeout}s",
-            binary=dcg_bin,
-        )
-    if error_code:
-        return _dcg_result(
-            "unavailable",
-            "invocation_failed",
-            (
-                f"could not run the pinned DCG binary ({error_code}): "
-                + redact_diagnostic_text(str(result.get("stderr_redacted") or ""))[:200]
-            ),
-            binary=dcg_bin,
-        )
-
-    raw_stdout = str(result.get("stdout") or "").strip()
-    try:
-        report = json.loads(raw_stdout)
-    except (json.JSONDecodeError, ValueError):
-        return _dcg_result(
-            "unavailable",
-            "malformed_output",
-            (
-                "DCG did not return parseable JSON: "
-                + (redact_diagnostic_text(raw_stdout)[:200] or "<empty stdout>")
-            ),
-            binary=dcg_bin,
-            exit_code=result.get("rc"),
-        )
-    if not isinstance(report, dict):
-        return _dcg_result(
-            "unavailable",
-            "malformed_output",
-            f"DCG returned a JSON {type(report).__name__}, expected an object",
-            binary=dcg_bin,
-            exit_code=result.get("rc"),
-        )
-
-    schema_version = report.get("schema_version")
-    if schema_version != DCG_ROBOT_SCHEMA_VERSION:
-        return _dcg_result(
-            "unavailable",
-            "incompatible_version",
-            (
-                f"DCG robot schema_version {schema_version!r} is not the "
-                f"supported {DCG_ROBOT_SCHEMA_VERSION}"
-            ),
-            binary=dcg_bin,
-            exit_code=result.get("rc"),
-        )
-
-    reported_raw = str(report.get("dcg_version") or "")
-    try:
-        reported_version = _dcg_normalize_version(reported_raw)
-    except Exception as exc:  # noqa: BLE001 - unparseable version fails closed
-        return _dcg_result(
-            "unavailable",
-            "incompatible_version",
-            f"could not read a version out of DCG's response: {exc}",
-            binary=dcg_bin,
-            dcg_version=reported_raw,
-        )
-    if reported_version != DCG_PINNED_VERSION:
-        return _dcg_result(
-            "unavailable",
-            "incompatible_version",
-            (
-                f"DCG reports {reported_version}, but the repo pin is "
-                f"{DCG_PINNED_VERSION}"
-            ),
-            binary=dcg_bin,
-            dcg_version=reported_version,
-        )
-
-    decision = str(report.get("decision") or "").strip().lower()
-    common: dict[str, Any] = {
-        "binary": dcg_bin,
-        "dcg_version": reported_version,
-        "decision": decision,
-        "exit_code": result.get("rc"),
-    }
-    if decision in _DCG_DENY_DECISIONS:
-        return _dcg_result(
-            "deny",
-            "guard_denied",
-            redact_diagnostic_text(str(report.get("reason") or "DCG denied this command")),
-            rule_id=report.get("rule_id") or "",
-            pack_id=report.get("pack_id") or "",
-            severity=report.get("severity") or "",
-            **common,
-        )
-    if decision in _DCG_ALLOW_DECISIONS:
-        return _dcg_result(
-            "allow",
-            "guard_allowed",
-            f"DCG {reported_version} decision={decision}",
-            warned=decision == "warn",
-            **common,
-        )
-    return _dcg_result(
-        "unavailable",
-        "unsupported_response",
-        f"DCG returned an unrecognized decision {decision or '<missing>'!r}",
-        **common,
+        timeout=timeout,
+        pinned_version=DCG_PINNED_VERSION,
+        pin_import_error=DCG_PIN_IMPORT_ERROR,
+        resolve_binary=_dcg_binary_path,
+        run_command=run_checked,
+        redact=redact_diagnostic_text,
+        normalize_version=_dcg_normalize_version,
+        interface=DCG_INTERFACE,
+        schema_version=DCG_ROBOT_SCHEMA_VERSION,
     )
 
 
@@ -527,48 +251,31 @@ def dcg_advisory(command: str, *, site: str) -> dict[str, Any]:
     """
     if site not in DCG_ADVISORY_SITES:
         raise ValueError(f"{site!r} is not a declared non-authoritative DCG site")
-    verdict = evaluate_command_with_dcg(command)
-    verdict["authoritative"] = False
-    verdict["site"] = site
-    verdict["blocks_execution_here"] = False
-    verdict["blocks_real_run"] = dcg_blocks_execution(verdict)
-    return verdict
+    return _dcglib.annotate_advisory(evaluate_command_with_dcg(command), site=site)
+
+
+#: Name this surface answers to in a refusal. `box.py exec` passes its own.
+DCG_SURFACE_NAME = "operator_box_exec"
 
 
 def _dcg_denied_error(box_id: str, command: str, verdict: dict[str, Any]) -> dict[str, Any]:
-    """Structured MCP error for an authoritative DCG block. Nothing ran."""
-    fail_closed = bool(verdict.get("fail_closed"))
-    if fail_closed:
-        message = (
-            "operator_box_exec refused to run this command because the "
-            f"destructive command guard could not render a verdict: {verdict['reason']}. "
-            "The guard is authoritative on the execution path, so an unavailable "
-            "guard denies rather than allows."
-        )
-        next_actions = [
-            "python3 .env-manager/manage.py sync --profile core",
-            "python3 -m runtime_manager.dcg_distribution --binary ~/.local/bin/dcg",
-        ]
-    else:
-        message = (
-            "operator_box_exec refused to run this command: the destructive "
-            f"command guard denied it ({verdict.get('rule_id') or 'unknown rule'}). "
-            f"{verdict['reason']}"
-        )
-        next_actions = [
-            "Ask the user to run this command manually if it is genuinely required.",
-            "Re-issue operator_box_exec with a narrower, non-destructive command.",
-        ]
+    """Structured MCP error for an authoritative DCG block. Nothing ran.
+
+    The refusal text and remediation come from :func:`lib.dcglib.dcg_denial`,
+    which `box.py exec` also uses, so both surfaces refuse for the same stated
+    reason with the same next actions — only the envelope differs.
+    """
+    denial = _dcglib.dcg_denial(DCG_SURFACE_NAME, verdict)
     return {
         "error": {
-            "type": "dcg_unavailable" if fail_closed else "dcg_denied",
-            "message": message,
-            "recoverable": fail_closed,
+            "type": denial["error_type"],
+            "message": denial["message"],
+            "recoverable": denial["recoverable"],
             "subject": box_id,
             "command_hash": command_hash(command),
             "executed": False,
             "dcg": verdict,
-            "next_actions": next_actions,
+            "next_actions": denial["next_actions"],
         }
     }
 
@@ -822,7 +529,9 @@ TOOLS: list[dict] = [
                 "operator_box_exec(box_id='<id>', command='cd ~/skillbox && "
                 "python3 .env-manager/manage.py status --format json')"
             ),
-            exact_cli="make box-ssh BOX=<id>",
+            exact_cli=(
+                "python3 scripts/box.py exec <box-id> --dry-run --format json -- <command>"
+            ),
             next_tools=["operator_boxes", "operator_box_status"],
         ),
         "inputSchema": {
@@ -867,7 +576,7 @@ TOOLS: list[dict] = [
             read_only=False,
             side_effects="builds and starts local Docker containers",
             safe_first_call="operator_doctor",
-            exact_cli="make doctor",
+            exact_cli="python3 scripts/box.py compose-up --dry-run --format json",
             next_tools=["operator_doctor", "operator_render"],
         ),
         "inputSchema": {
@@ -900,7 +609,7 @@ TOOLS: list[dict] = [
             requires_user_confirmation=True,
             side_effects="stops local Docker containers",
             safe_first_call="operator_compose_down(dry_run=true)",
-            exact_cli="docker compose ps --format json",
+            exact_cli="python3 scripts/box.py compose-down --dry-run --format json",
             next_tools=["operator_doctor"],
         ),
         "inputSchema": {
@@ -951,6 +660,53 @@ TOOLS: list[dict] = [
         },
     },
 ]
+
+# ---------------------------------------------------------------------------
+# DEPRECATION — skillbox-mcp-deprecation-epic-vniq.4
+#
+# This server is superseded by the robot CLI. scripts/box.py now carries the
+# same gates IN-PROCESS, so dropping the MCP server weakens nothing:
+#
+#   * clean-tree refusal on every real mutation,
+#   * the dry-run marker store, byte-identical to this module's (a preview taken
+#     through either surface authorizes the other, and a marker minted for
+#     command A can never authorize command B),
+#   * the authoritative DCG guard on box.py exec — the same lib.dcglib adapter,
+#     at the same two authoritative call sites, failing closed the same way.
+#
+# The module is KEPT so existing registrations keep working. Every tool
+# description now names its CLI replacement, and x_skillbox_contract carries
+# deprecated/cli_replacement for machine consumers. New work should use the CLI
+# plus skills/box-fleet-operator.
+#
+# Tool parity is 10/10. doctor/render replace to scripts/04-reconcile.py rather
+# than box.py — an accepted boundary, not a gap: outer validation has always
+# lived in the reconcile script and this server only shelled out to it.
+# ---------------------------------------------------------------------------
+
+DEPRECATED = True
+DEPRECATION_REPLACEMENT_SKILL = "skills/box-fleet-operator"
+DEPRECATION_SUMMARY = (
+    "DEPRECATED: the skillbox-operator MCP server is superseded by the robot CLI "
+    "(scripts/box.py), which carries the same clean-tree, dry-run-marker and "
+    f"destructive-command-guard gates. See {DEPRECATION_REPLACEMENT_SKILL}."
+)
+
+
+def _deprecation_note(exact_cli: str) -> str:
+    return f" {DEPRECATION_SUMMARY} Prefer: `{exact_cli}`."
+
+
+def _apply_deprecation(tools: list[dict]) -> None:
+    """Stamp the CLI replacement onto every tool description and contract."""
+    for tool in tools:
+        contract = tool["x_skillbox_contract"]
+        contract["deprecated"] = True
+        contract["cli_replacement"] = contract["exact_cli"]
+        tool["description"] = tool["description"] + _deprecation_note(contract["exact_cli"])
+
+
+_apply_deprecation(TOOLS)
 
 # ---------------------------------------------------------------------------
 # Subprocess helpers
@@ -1410,7 +1166,10 @@ def handle_operator_provision(params: dict) -> dict:
     )
     if ok and dry_run_param:
         _stamp_dryrun_marker("operator_provision", box_id_param)
-    elif ok and not dry_run_param:
+    elif not dry_run_param:
+        # CONSUME-ON-DISPATCH: a provision that failed partway leaves a
+        # half-built droplet, so the retry needs a fresh preview. (box.py's own
+        # dispatch consumes the same marker; this keeps the two in agreement.)
         _clear_dryrun_marker("operator_provision", box_id_param)
     return _ok_content(data) if ok else _error_content(data)
 
@@ -1454,7 +1213,9 @@ def handle_operator_teardown(params: dict) -> dict:
     # Stamp dry-run marker so the PreToolUse hook allows the real run next.
     if ok and dry_run_param:
         _stamp_dryrun_marker("operator_teardown", box_id_param)
-    elif ok and not dry_run_param:
+    elif not dry_run_param:
+        # CONSUME-ON-DISPATCH: a teardown that failed partway has still
+        # destroyed state, so the retry must be previewed again.
         _clear_dryrun_marker("operator_teardown", box_id_param)
 
     return _ok_content(data) if ok else _error_content(data)
@@ -1670,9 +1431,12 @@ def handle_operator_box_exec(params: dict) -> dict:
         verdict="allow-marker",
         reason=f"matching dry-run marker for command hash {cmd_hash}",
     )
+    # CONSUME-ON-DISPATCH (same rule as `box.py exec`): the marker is spent the
+    # moment the real run is issued, not after it succeeds. A command that
+    # mutates the box and THEN fails must not leave a replayable marker — one
+    # preview authorizes one ATTEMPT, and the retry needs a fresh preview.
+    _clear_dryrun_marker("operator_box_exec", marker_key)
     ok, _code, data = run_ssh(validated_user, validated_host, command_param, timeout=timeout)
-    if ok:
-        _clear_dryrun_marker("operator_box_exec", marker_key)
     return _ok_content(data) if ok else _error_content(data)
 
 
@@ -1761,10 +1525,11 @@ def handle_operator_compose_down(params: dict) -> dict:
             marker_status=_dryrun_marker_rejection_status("operator_compose_down", "local"),
         )
 
+    # CONSUME-ON-DISPATCH: a `compose down` that fails partway has still stopped
+    # containers, so the retry is authorized by a fresh preview of the new state.
+    _clear_dryrun_marker("operator_compose_down", "local")
     ok, code, data = run_compose(["down"], timeout=120)
     emit_event("operator.compose_down", "local", {"ok": ok})
-    if ok:
-        _clear_dryrun_marker("operator_compose_down", "local")
     payload = {"ok": ok, "exit_code": code, "detail": data}
     return _ok_content(payload) if ok else _error_content(payload)
 
@@ -1864,8 +1629,7 @@ def _box_exec_marker_key(box_id: str, command: str) -> str:
     box_ids and distinct (normalized) commands therefore land on distinct
     markers; identical ones collide intentionally.
     """
-    box_hash = hashlib.sha256(box_id.encode("utf-8")).hexdigest()[:16]
-    return f"{box_hash}.{command_hash(command)}"
+    return _opslib_box_exec_marker_key(box_id, command)
 
 
 def _dryrun_marker_ttl_seconds() -> int:
@@ -1978,6 +1742,7 @@ def _dryrun_marker_status_from_path(
         "tool": tool_name,
         "key": box_id,
         "marker_session": None,
+        "session_scope": None,
         "current_session": current_session,
         "created_at": None,
         "warning": None,
@@ -1996,12 +1761,18 @@ def _dryrun_marker_status_from_path(
         marker_tool = str(payload.get("tool") or "")
         marker_key = str(payload.get("key") or "")
         marker_session = str(payload.get("session") or "").strip()
+        # The marker's OWN declaration of whether it is session-bound. Reading
+        # the declared scope (instead of inferring one from the presence of a
+        # `session` field) is what makes CLI markers session-agnostic BY
+        # CONTRACT rather than by accident — see lib.opslib's marker contract.
+        session_scope = marker_session_scope(payload)
         created_at = payload.get("created_at")
         status.update(
             {
                 "marker_tool": marker_tool,
                 "marker_key": marker_key,
                 "marker_session": marker_session or None,
+                "session_scope": session_scope,
                 "created_at": created_at,
             }
         )
@@ -2030,7 +1801,14 @@ def _dryrun_marker_status_from_path(
     ):
         status["reason"] = "payload-mismatch"
         return status
-    if payload is not None and check_session and marker_session and current_session and marker_session != current_session:
+    if (
+        payload is not None
+        and check_session
+        and session_scope == MARKER_SESSION_SCOPE_SESSION
+        and marker_session
+        and current_session
+        and marker_session != current_session
+    ):
         status["session_mismatch"] = True
         status["reason"] = "session-mismatch"
         return status
@@ -2065,17 +1843,23 @@ def _gc_expired_dryrun_markers(*, skip_path: Path | None = None) -> None:
 
 
 def _stamp_dryrun_marker(tool_name: str, box_id: str) -> None:
-    """Create a temp marker so the PreToolUse hook knows a dry-run was done."""
+    """Create a temp marker so the PreToolUse hook knows a dry-run was done.
+
+    Session-SCOPED (``session_scope="session"``): this server has a stable
+    session id, so its own previews stay bound to the session that took them.
+    `box.py` mints session-agnostic markers on purpose — see the marker contract
+    in ``lib.opslib``, which owns the payload shape for BOTH writers.
+    """
     _gc_expired_dryrun_markers()
     marker = _dryrun_marker_path(tool_name, box_id)
     marker.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "tool": tool_name,
-        "key": box_id,
-        "session": _dryrun_session_id(),
-        "created_at": _utc_timestamp(),
-        "note": f"dry-run completed for {tool_name} key={box_id}",
-    }
+    payload = dryrun_marker_payload(
+        tool_name,
+        box_id,
+        source=MARKER_SOURCE_OPERATOR_MCP,
+        created_at=_utc_timestamp(),
+        session=_dryrun_session_id(),
+    )
     marker.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 
 
@@ -2259,6 +2043,10 @@ def handle_initialize(_params: dict) -> dict:
         "capabilities": {"tools": {"listChanged": False}},
         "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
         "instructions": (
+            f"{DEPRECATION_SUMMARY} Every tool below names its exact CLI replacement; "
+            "run `python3 scripts/box.py capabilities --format json` (mcp_status) for the "
+            "live map. Use the CLI for new work — this server remains only so existing "
+            "registrations keep working. "
             "skillbox operator — fleet and container lifecycle from outside the box. "
             "1. Run operator_boxes to see the current fleet. "
             "2. Run operator_profiles to see available box sizes. "

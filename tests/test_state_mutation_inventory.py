@@ -86,6 +86,7 @@ class CoverageTests(unittest.TestCase):
         self.assertIn("inventory-rebuild", live[SM.SURFACE_BOX])
         self.assertIn("operator_teardown", live[SM.SURFACE_OPERATOR_MCP])
         self.assertIn("box-down", live[SM.SURFACE_MAKE])
+        self.assertIn("doctor", live[SM.SURFACE_RECONCILE])
 
 
 class BoundaryShapeTests(unittest.TestCase):
@@ -550,7 +551,12 @@ class KnownRiskAssertionTests(unittest.TestCase):
         self.assertEqual(entry.classification, SM.UNCONDITIONAL_MUTATION)
         self.assertIn("no dry_run parameter", entry.dry_run_predicate)
 
-    def test_self_test_is_the_only_real_cross_process_lease(self) -> None:
+    def test_self_test_holds_the_only_shell_level_state_root_flock(self) -> None:
+        """`self-test.sh` still owns the only flock taken by a shell script.
+
+        It used to be the only real cross-process lease in the repo, full stop —
+        see the companion test below for the second family that now takes one.
+        """
         leased = [
             entry.boundary_id
             for entry in SM.mutations()
@@ -560,6 +566,35 @@ class KnownRiskAssertionTests(unittest.TestCase):
             sorted(leased),
             ["make.self-test", "make.self-test-refresh", "make.self-test-worktree"],
         )
+
+    def test_doctor_fix_surfaces_take_the_python_state_root_lease(self) -> None:
+        """Every `doctor --fix` surface is leased, and each one is a two-flag
+        conditional — never an unconditional mutation."""
+        leased = [
+            entry.boundary_id
+            for entry in SM.mutations()
+            if "state_mutation_lease" in entry.lock_owner
+        ]
+        self.assertEqual(
+            sorted(leased),
+            ["manage.doctor", "manage.structure-doctor", "reconcile.doctor"],
+        )
+        for boundary_id in leased:
+            with self.subTest(boundary_id=boundary_id):
+                entry = SM.boundary(boundary_id)
+                self.assertEqual(entry.classification, SM.CONDITIONAL_MUTATION)
+                self.assertEqual(entry.state_root_source, "doctor_fix.state_root")
+                self.assertEqual(entry.lease_span, "whole_command")
+                # The gate is `--fix` AND `--yes`; --fix alone must not write.
+                self.assertIn("--yes", entry.dry_run_predicate)
+                self.assertTrue(
+                    any("doctor-runs" in path for path in entry.writes),
+                    "a --fix surface must declare its run-artifact directory",
+                )
+
+    def test_doctor_fix_state_root_source_is_declared(self) -> None:
+        self.assertIn("doctor_fix.state_root", SM.STATE_ROOT_SOURCES)
+        self.assertIn("REPO-RELATIVE", SM.STATE_ROOT_SOURCES["doctor_fix.state_root"])
 
     def test_make_is_never_a_control_point(self) -> None:
         """Every Make target that merely forwards to a CLI inherits its blast

@@ -321,7 +321,7 @@ class SkillboxMcpServerTests(unittest.TestCase):
             @staticmethod
             def main(argv: list[str]) -> int:
                 print(json.dumps({"checks": []}))
-                raise SystemExit(2)
+                raise SystemExit(MODULE.MANAGE_EXIT_DRIFT)
 
         with mock.patch.object(MODULE, "send"), mock.patch.object(
             MODULE, "_RUNTIME_MANAGER", FakeRuntimeManager
@@ -329,8 +329,35 @@ class SkillboxMcpServerTests(unittest.TestCase):
             ok, exit_code, payload = MODULE.run_manage(["doctor", "--format", "json"])
 
         self.assertTrue(ok)
-        self.assertEqual(exit_code, 2)
+        self.assertEqual(exit_code, MODULE.MANAGE_EXIT_DRIFT)
         self.assertEqual(payload, {"checks": []})
+
+    def test_mirrored_drift_code_matches_runtime_constant(self) -> None:
+        env_manager = str(Path(MODULE.__file__).resolve().parent)
+        if env_manager not in sys.path:
+            sys.path.insert(0, env_manager)
+        from runtime_manager._shared import errors
+
+        self.assertEqual(MODULE.MANAGE_EXIT_DRIFT, errors.EXIT_DRIFT)
+        self.assertNotEqual(MODULE.MANAGE_EXIT_DRIFT, errors.EXIT_USAGE)
+
+    def test_run_manage_usage_error_exit_is_not_reported_ok(self) -> None:
+        # Regression: while drift shared exit 2 with argparse, a USAGE error
+        # returned ok=True to the MCP client. Usage errors must be ok=False.
+        class FakeRuntimeManager:
+            @staticmethod
+            def main(argv: list[str]) -> int:
+                print(json.dumps({"error": {"code": "USAGE_ERROR"}}))
+                raise SystemExit(2)
+
+        with mock.patch.object(MODULE, "send"), mock.patch.object(
+            MODULE, "_RUNTIME_MANAGER", FakeRuntimeManager
+        ):
+            ok, exit_code, payload = MODULE.run_manage(["doctr", "--format", "json"])
+
+        self.assertFalse(ok)
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(payload["error"]["code"], "USAGE_ERROR")
 
     def test_run_manage_in_process_crash_mirrors_subprocess_failure(self) -> None:
         class FakeRuntimeManager:

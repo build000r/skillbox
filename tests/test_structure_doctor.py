@@ -141,14 +141,21 @@ class ExitCodeSemanticsTests(unittest.TestCase):
         for row in coverage["siblings_not_run"]:
             self.assertTrue(row["symptom"])
 
-    def test_any_fail_exits_nonzero(self):
+    def test_any_fail_exits_drift_not_error(self):
+        """A FAIL is EXIT_DRIFT (4), never 1.
+
+        1 means "this command could not produce a verdict". A gate that ran and
+        failed produced a verdict — the family reserves 4 for exactly that, so a
+        caller can tell "the doctor is broken" from "the tree is broken".
+        """
         payload = self._run(
             {
                 "structure_invariants": (KIND_STRUCTURE, STATUS_FAIL, "broke"),
                 "runtime_doctor": (KIND_RUNTIME, STATUS_PASS, "ok"),
             }
         )
-        self.assertEqual(payload["exit_code"], 1)
+        self.assertEqual(payload["exit_code"], SD.EXIT_DRIFT)
+        self.assertNotEqual(payload["exit_code"], 1)
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["summary"]["fail"], 1)
 
@@ -173,7 +180,7 @@ class ExitCodeSemanticsTests(unittest.TestCase):
                 "c": (KIND_STRUCTURE, STATUS_PASS, "ok"),
             }
         )
-        self.assertEqual(payload["exit_code"], 1)
+        self.assertEqual(payload["exit_code"], SD.EXIT_DRIFT)
         self.assertEqual(payload["summary"]["fail"], 1)
         self.assertEqual(payload["summary"]["inco"], 1)
         self.assertEqual(payload["summary"]["pass"], 1)
@@ -290,24 +297,66 @@ class CapTimeoutTests(unittest.TestCase):
 
 
 class RuntimeGateReachabilityTests(unittest.TestCase):
-    def test_missing_makefile_is_inco(self):
+    def test_missing_outer_doctor_script_is_inco(self):
         ctx = DoctorContext(runtime_root=Path("/nonexistent-xyz"), config_root=None, cwd=ROOT_DIR)
         status, detail = SD._run_runtime_doctor(ctx)
         self.assertEqual(status, STATUS_INCO)
-        self.assertIn("Makefile", detail)
+        self.assertIn("04-reconcile.py", detail)
 
-    def test_make_unavailable_is_inco(self):
+    def test_interpreter_unavailable_is_inco(self):
         ctx = _stub_context()
         with mock.patch.object(SD.subprocess, "run", side_effect=FileNotFoundError):
             status, detail = SD._run_runtime_doctor(ctx)
         self.assertEqual(status, STATUS_INCO)
 
-    def test_runtime_doctor_nonzero_is_fail(self):
+    def test_gate_calls_the_script_not_make(self):
+        """`make` exits 2 on ANY failing recipe, which would erase EXIT_DRIFT(4)
+        and turn every real runtime failure into a silent INCO."""
+        ctx = _stub_context()
+        fake = mock.Mock(returncode=0, stdout="summary: 0 failed", stderr="")
+        with mock.patch.object(SD.subprocess, "run", return_value=fake) as run:
+            SD._run_runtime_doctor(ctx)
+        argv = run.call_args.args[0]
+        self.assertNotIn("make", argv)
+        self.assertTrue(str(argv[1]).endswith("scripts/04-reconcile.py"))
+        self.assertEqual(argv[2], "doctor")
+
+    def test_runtime_doctor_drift_exit_is_fail(self):
+        """Exit 4 is the outer doctor's verdict: it ran and found a difference."""
+        ctx = _stub_context()
+        fake = mock.Mock(returncode=SD.EXIT_DRIFT, stdout="summary: 1 failed", stderr="")
+        with mock.patch.object(SD.subprocess, "run", return_value=fake):
+            status, detail = SD._run_runtime_doctor(ctx)
+        self.assertEqual(status, STATUS_FAIL)
+        self.assertIn("1 failed", detail)
+
+    def test_runtime_doctor_error_exit_is_inco_not_fail(self):
+        """Exit 1 means the outer doctor could not produce a verdict.
+
+        Reporting FAIL there would claim knowledge this gate does not have —
+        the same INCO rule every other gate follows for an unreachable
+        dependency. Before the family ladder, 1 and 4 were indistinguishable
+        here and every outer hiccup read as a structural regression.
+        """
         ctx = _stub_context()
         fake = mock.Mock(returncode=1, stdout="boom", stderr="")
         with mock.patch.object(SD.subprocess, "run", return_value=fake):
-            status, _ = SD._run_runtime_doctor(ctx)
-        self.assertEqual(status, STATUS_FAIL)
+            status, detail = SD._run_runtime_doctor(ctx)
+        self.assertEqual(status, STATUS_INCO)
+        self.assertIn("could not produce a verdict", detail)
+
+    def test_runtime_doctor_detail_skips_make_wrapper_noise(self):
+        """`make: *** [doctor] Error 4` is make's line, not the doctor's."""
+        ctx = _stub_context()
+        fake = mock.Mock(
+            returncode=SD.EXIT_DRIFT,
+            stdout="summary: 16 passed, 0 warnings, 0 inconclusive, 1 failed\n",
+            stderr="make: *** [doctor] Error 4\n",
+        )
+        with mock.patch.object(SD.subprocess, "run", return_value=fake):
+            _status, detail = SD._run_runtime_doctor(ctx)
+        self.assertNotIn("Error 4", detail)
+        self.assertIn("summary:", detail)
 
     def test_runtime_doctor_zero_is_pass(self):
         ctx = _stub_context()

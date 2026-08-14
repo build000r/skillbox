@@ -221,6 +221,12 @@ The wrapper discovery contract. Agents should start here to learn the stable com
       "safe_first_try": "sbp evidence --repo <path> --format json"
     },
     {
+      "fallback": "If central is unreachable, use the local checkout at the registry path (~/repos/skillbox-config/wikis.yaml) and report degraded central-wiki evidence mode; do not hand-roll ssh.",
+      "json": true,
+      "name": "wiki",
+      "safe_first_try": "sbp wiki status --json"
+    },
+    {
       "json": true,
       "name": "cron",
       "safe_first_try": "sbp cron status --json"
@@ -2312,20 +2318,40 @@ Full provenance for ONE skill at ONE cwd: is it visible, via which layer, which 
 **Invocation:** `sbp doctor [--cwd <repo>] --format json` (a.k.a. structure-doctor)
 **Produced by:** `run_structure_doctor`
 
-The structural verification front door. Runs every gate read-only and returns `{ok, gates, summary, exit_code}`. FAIL is the only status that flips `exit_code`; INCO (e.g. a dependency unreachable) and PASS both exit 0 — INCO is never a regression. The example below uses canned gate outcomes (one of each status) for determinism; `duration_s` is real wall-clock in production (normalized to 0.0 here).
+The structural verification front door, and the reference implementation of the **doctor-family envelope**: `{ok, exit_code, schema_version, tool, checks, summary, next_actions, coverage, fix}`. Every doctor in the family (`sbp doctor`, `make doctor`, `manage.py doctor`) emits this same shape with the same lowercase `pass|warn|inco|fail` vocabulary, so one parser reads all of them.
+
+`fail` is the only status that flips `exit_code`, and it flips it to **4** (EXIT_DRIFT — 'ran fine, found a difference'), never 1: exit 1 means the doctor itself could not produce a verdict, exit 2 is reserved for argparse usage errors, and exit 3 (EXIT_NEEDS_INPUT) is what `--fix` returns when it has a plan and is waiting for `--yes`. `inco` (a dependency unreachable, a cap exceeded) exits 0 — it is never a regression.
+
+`checks[]` is the family-uniform finding list; `gates[]` is this doctor's own mirror of it, carrying the extra `kind` and `duration_s` a gate has. The example below uses canned gate outcomes (one of each status) for determinism; `duration_s` is real wall-clock in production (normalized to 0.0 here).
 
 ### Fields
 
 | Field | Stability | Meaning |
 |-------|-----------|---------|
-| `ok` | CONTRACT | True iff no gate is FAIL (INCO and PASS are both ok). |
-| `config_root` | CONTRACT | Resolved skillbox-config root, or null when not found (gates go INCO). |
+| `ok` | CONTRACT | True iff no check is fail (inco and warn are both ok). |
+| `exit_code` | CONTRACT | 0 ok | 4 EXIT_DRIFT (ran fine, found failures) | 1 the doctor itself could not run | 3 confirmation required (--fix without --yes). 2 is reserved for argparse and is never a verdict. |
+| `schema_version` | CONTRACT | Doctor-family envelope version; every doctor in the family emits the same string. |
+| `tool` | CONTRACT | The exact command that produced this envelope, as an agent would type it. |
+| `checks` | CONTRACT | One row per finding, uniform across the whole family; see the check field table. |
+| `summary` | CONTRACT | Status counters (pass/warn/inco/fail + total) plus this doctor's structure budget; structure_within_budget guards the <60s promise. |
+| `next_actions` | info | Ordered commands to run next; advisory wording. |
+| `coverage` | CONTRACT | Doctor-family routing: front_door, what this run includes, and symptom-keyed siblings_not_run. |
+| `fix` | CONTRACT | This doctor's --fix contract: supported, dry_run_by_default, preview/apply/undo invocations, fixable_codes, run_artifact_dir. supported:false always carries a reason. |
+| `config_root` | CONTRACT | Resolved skillbox-config root, or null when not found (gates go inco). |
 | `runtime_root` | CONTRACT | Resolved runtime repo root. |
 | `cwd` | CONTRACT | Absolute resolved cwd the gates ran against. |
-| `gates` | CONTRACT | One row per gate in declaration order; see the gate field table. |
-| `summary` | CONTRACT | Gate counters + structure budget; structure_within_budget guards the <60s promise. |
-| `exit_code` | CONTRACT | 1 iff any gate FAILed, else 0 (INCO never flips it). |
-| `coverage` | CONTRACT | Doctor-family routing: front_door, what this run includes, and symptom-keyed siblings_not_run. |
+| `gates` | CONTRACT | Structure-doctor-specific mirror of checks[], carrying gate kind + duration; see the gate field table. |
+
+#### `checks[]` (one finding — the family-uniform row)
+
+| Field | Stability | Meaning |
+|-------|-----------|---------|
+| `code` | CONTRACT | Stable finding id — the thing to alert on. Never renamed silently. |
+| `status` | CONTRACT | One of pass / warn / inco / fail (lowercase in JSON, uppercase in text). Only fail flips exit_code; inco means the check could not reach its dependency and is never a regression. |
+| `message` | CONTRACT | One-line human outcome for this finding. |
+| `details` | info | Structured evidence for the finding; shape varies per code. |
+| `fix_command` | CONTRACT | Exact command that clears this finding, or null when there is no known remedy. |
+| `fixable` | CONTRACT | True iff `--fix --yes` would act on this finding. Only fail-status findings with a registered fixer are fixable; warn is advisory and never auto-fixed. |
 
 #### `gates[]` (one gate outcome)
 
@@ -2333,9 +2359,9 @@ The structural verification front door. Runs every gate read-only and returns `{
 |-------|-----------|---------|
 | `name` | CONTRACT | Gate id (e.g. structure_invariants, mcp_parity, runtime_doctor). |
 | `kind` | CONTRACT | 'structure' or 'runtime'; only structure gates count toward the budget. |
-| `status` | CONTRACT | PASS | FAIL | INCO. Only FAIL flips exit_code; INCO is never a regression. |
+| `status` | CONTRACT | One of pass / fail / inco. Only fail flips exit_code; inco is never a regression. |
 | `duration_s` | info | Wall-clock the gate took (non-deterministic; normalized in this example). |
-| `fix_command` | CONTRACT | Exact command to remediate this gate when not PASS. |
+| `fix_command` | CONTRACT | Exact command to remediate this gate when not pass. |
 | `detail` | info | Human one-line outcome detail. |
 
 ### Example payload
@@ -2344,6 +2370,53 @@ The structural verification front door. Runs every gate read-only and returns `{
 
 ```json
 {
+  "checks": [
+    {
+      "code": "structure_invariants",
+      "details": {
+        "duration_s": 0.0,
+        "kind": "structure"
+      },
+      "fix_command": "<fix for structure_invariants>",
+      "fixable": false,
+      "message": "12 invariant(s) passed",
+      "status": "pass"
+    },
+    {
+      "code": "mcp_parity",
+      "details": {
+        "duration_s": 0.0,
+        "kind": "structure"
+      },
+      "fix_command": "<fix for mcp_parity>",
+      "fixable": true,
+      "message": "claude/codex MCP drift: foo only in claude",
+      "status": "fail"
+    },
+    {
+      "code": "skill_drift",
+      "details": {
+        "duration_s": 0.0,
+        "kind": "structure"
+      },
+      "fix_command": "<fix for skill_drift>",
+      "fix_reason": "no registered auto-fix; apply fix_command by hand and re-run the doctor",
+      "fixable": false,
+      "message": "skillbox-config repo not found on this box",
+      "status": "inco"
+    },
+    {
+      "code": "runtime_doctor",
+      "details": {
+        "duration_s": 0.0,
+        "kind": "runtime"
+      },
+      "fix_command": "<fix for runtime_doctor>",
+      "fixable": false,
+      "message": "make doctor: all checks pass",
+      "status": "pass"
+    }
+  ],
   "config_root": null,
   "coverage": {
     "front_door": "sbp doctor",
@@ -2354,7 +2427,7 @@ The structural verification front door. Runs every gate read-only and returns `{
     "siblings_not_run": [
       {
         "doctor": "sbp registry doctor",
-        "symptom": "repos.yaml vs on-disk git estate drift"
+        "symptom": "registry/repos.yaml vs the on-disk git estate"
       },
       {
         "doctor": "sbp cass doctor",
@@ -2370,12 +2443,25 @@ The structural verification front door. Runs every gate read-only and returns `{
       },
       {
         "doctor": "make self-test",
-        "symptom": "canonical CI gate on an exact SHA"
+        "symptom": "canonical CI gate against an exact SHA"
       }
-    ]
+    ],
+    "tool": "sbp doctor"
   },
   "cwd": "<RUNTIME_ROOT>/sample-repo",
-  "exit_code": 1,
+  "exit_code": 4,
+  "fix": {
+    "apply": "--fix --yes takes a backup, executes each fixable finding's fix_command, and records the result",
+    "confirmation_required": true,
+    "dry_run_by_default": true,
+    "fixable_codes": [
+      "mcp_parity"
+    ],
+    "preview": "--fix (no --yes) prints the plan, writes a run artifact, and exits 3",
+    "run_artifact_dir": "/Users/b/repos/opensource/skillbox/.skillbox-state/doctor-runs/structure-doctor",
+    "supported": true,
+    "undo": "--undo <run-artifact.json> plans the restore and exits 3; --undo <run-artifact.json> --yes restores the backups and removes what the fix created, refusing any path that has changed since"
+  },
   "gates": [
     {
       "detail": "12 invariant(s) passed",
@@ -2383,7 +2469,7 @@ The structural verification front door. Runs every gate read-only and returns `{
       "fix_command": "<fix for structure_invariants>",
       "kind": "structure",
       "name": "structure_invariants",
-      "status": "PASS"
+      "status": "pass"
     },
     {
       "detail": "claude/codex MCP drift: foo only in claude",
@@ -2391,7 +2477,7 @@ The structural verification front door. Runs every gate read-only and returns `{
       "fix_command": "<fix for mcp_parity>",
       "kind": "structure",
       "name": "mcp_parity",
-      "status": "FAIL"
+      "status": "fail"
     },
     {
       "detail": "skillbox-config repo not found on this box",
@@ -2399,7 +2485,7 @@ The structural verification front door. Runs every gate read-only and returns `{
       "fix_command": "<fix for skill_drift>",
       "kind": "structure",
       "name": "skill_drift",
-      "status": "INCO"
+      "status": "inco"
     },
     {
       "detail": "make doctor: all checks pass",
@@ -2407,11 +2493,18 @@ The structural verification front door. Runs every gate read-only and returns `{
       "fix_command": "<fix for runtime_doctor>",
       "kind": "runtime",
       "name": "runtime_doctor",
-      "status": "PASS"
+      "status": "pass"
     }
+  ],
+  "next_actions": [
+    "<fix for mcp_parity>",
+    "sbp doctor --format json  # re-run: skill_drift were inconclusive, not failures",
+    "python3 .env-manager/manage.py structure-doctor --fix  # plan the auto-fixes",
+    "python3 scripts/04-reconcile.py doctor --format json"
   ],
   "ok": false,
   "runtime_root": "<RUNTIME_ROOT>",
+  "schema_version": "2026-08-14+doctor-family.v1",
   "summary": {
     "fail": 1,
     "inco": 1,
@@ -2420,8 +2513,10 @@ The structural verification front door. Runs every gate read-only and returns `{
     "structure_budget_s": 60.0,
     "structure_duration_s": 0.0,
     "structure_within_budget": true,
-    "total": 4
-  }
+    "total": 4,
+    "warn": 0
+  },
+  "tool": "sbp doctor"
 }
 ```
 

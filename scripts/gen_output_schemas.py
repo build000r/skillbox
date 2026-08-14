@@ -240,21 +240,35 @@ FIELD_NOTES: dict[str, dict[str, tuple[str, str]]] = {
         "next_actions": (INFO, "Commands from remediation, or the already-visible sentinel."),
     },
     "doctor": {
-        "ok": (CONTRACT, "True iff no gate is FAIL (INCO and PASS are both ok)."),
-        "config_root": (CONTRACT, "Resolved skillbox-config root, or null when not found (gates go INCO)."),
+        "ok": (CONTRACT, "True iff no check is fail (inco and warn are both ok)."),
+        "exit_code": (CONTRACT, "0 ok | 4 EXIT_DRIFT (ran fine, found failures) | 1 the doctor itself could not run | 3 confirmation required (--fix without --yes). 2 is reserved for argparse and is never a verdict."),
+        "schema_version": (CONTRACT, "Doctor-family envelope version; every doctor in the family emits the same string."),
+        "tool": (CONTRACT, "The exact command that produced this envelope, as an agent would type it."),
+        "checks": (CONTRACT, "One row per finding, uniform across the whole family; see the check field table."),
+        "summary": (CONTRACT, "Status counters (pass/warn/inco/fail + total) plus this doctor's structure budget; structure_within_budget guards the <60s promise."),
+        "next_actions": (INFO, "Ordered commands to run next; advisory wording."),
+        "coverage": (CONTRACT, "Doctor-family routing: front_door, what this run includes, and symptom-keyed siblings_not_run."),
+        "fix": (CONTRACT, "This doctor's --fix contract: supported, dry_run_by_default, preview/apply/undo invocations, fixable_codes, run_artifact_dir. supported:false always carries a reason."),
+        "config_root": (CONTRACT, "Resolved skillbox-config root, or null when not found (gates go inco)."),
         "runtime_root": (CONTRACT, "Resolved runtime repo root."),
         "cwd": (CONTRACT, "Absolute resolved cwd the gates ran against."),
-        "gates": (CONTRACT, "One row per gate in declaration order; see the gate field table."),
-        "summary": (CONTRACT, "Gate counters + structure budget; structure_within_budget guards the <60s promise."),
-        "exit_code": (CONTRACT, "1 iff any gate FAILed, else 0 (INCO never flips it)."),
-        "coverage": (CONTRACT, "Doctor-family routing: front_door, what this run includes, and symptom-keyed siblings_not_run."),
+        "gates": (CONTRACT, "Structure-doctor-specific mirror of checks[], carrying gate kind + duration; see the gate field table."),
+    },
+    "doctor.check": {
+        "code": (CONTRACT, "Stable finding id — the thing to alert on. Never renamed silently."),
+        "status": (CONTRACT, "One of pass / warn / inco / fail (lowercase in JSON, uppercase in text). Only fail flips exit_code; inco means the check could not reach its dependency and is never a regression."),
+        "message": (CONTRACT, "One-line human outcome for this finding."),
+        "details": (INFO, "Structured evidence for the finding; shape varies per code."),
+        "fix_command": (CONTRACT, "Exact command that clears this finding, or null when there is no known remedy."),
+        "fixable": (CONTRACT, "True iff `--fix --yes` would act on this finding. Only fail-status findings with a registered fixer are fixable; warn is advisory and never auto-fixed."),
+        "fix_reason": (INFO, "Why this finding is not fixable, when it is not. Blank on passing checks."),
     },
     "doctor.gate": {
         "name": (CONTRACT, "Gate id (e.g. structure_invariants, mcp_parity, runtime_doctor)."),
         "kind": (CONTRACT, "'structure' or 'runtime'; only structure gates count toward the budget."),
-        "status": (CONTRACT, "PASS | FAIL | INCO. Only FAIL flips exit_code; INCO is never a regression."),
+        "status": (CONTRACT, "One of pass / fail / inco. Only fail flips exit_code; inco is never a regression."),
         "duration_s": (INFO, "Wall-clock the gate took (non-deterministic; normalized in this example)."),
-        "fix_command": (CONTRACT, "Exact command to remediate this gate when not PASS."),
+        "fix_command": (CONTRACT, "Exact command to remediate this gate when not pass."),
         "detail": (INFO, "Human one-line outcome detail."),
     },
     "fleet_converge": {
@@ -1057,14 +1071,27 @@ SURFACES: list[dict[str, Any]] = [
         "long": "`sbp doctor [--cwd <repo>] --format json` (a.k.a. structure-doctor)",
         "fn": "run_structure_doctor",
         "intro": (
-            "The structural verification front door. Runs every gate read-only and returns "
-            "`{ok, gates, summary, exit_code}`. FAIL is the only status that flips `exit_code`; "
-            "INCO (e.g. a dependency unreachable) and PASS both exit 0 — INCO is never a "
-            "regression. The example below uses canned gate outcomes (one of each status) for "
-            "determinism; `duration_s` is real wall-clock in production (normalized to 0.0 here)."
+            "The structural verification front door, and the reference implementation of the "
+            "**doctor-family envelope**: `{ok, exit_code, schema_version, tool, checks, summary, "
+            "next_actions, coverage, fix}`. Every doctor in the family (`sbp doctor`, "
+            "`make doctor`, `manage.py doctor`) emits this same shape with the same lowercase "
+            "`pass|warn|inco|fail` vocabulary, so one parser reads all of them.\n\n"
+            "`fail` is the only status that flips `exit_code`, and it flips it to **4** "
+            "(EXIT_DRIFT — 'ran fine, found a difference'), never 1: exit 1 means the doctor "
+            "itself could not produce a verdict, exit 2 is reserved for argparse usage errors, "
+            "and exit 3 (EXIT_NEEDS_INPUT) is what `--fix` returns when it has a plan and is "
+            "waiting for `--yes`. `inco` (a dependency unreachable, a cap exceeded) exits 0 — "
+            "it is never a regression.\n\n"
+            "`checks[]` is the family-uniform finding list; `gates[]` is this doctor's own "
+            "mirror of it, carrying the extra `kind` and `duration_s` a gate has. The example "
+            "below uses canned gate outcomes (one of each status) for determinism; "
+            "`duration_s` is real wall-clock in production (normalized to 0.0 here)."
         ),
         "example": example_doctor,
-        "nested": [("doctor.gate", "`gates[]` (one gate outcome)", None)],
+        "nested": [
+            ("doctor.check", "`checks[]` (one finding — the family-uniform row)", None),
+            ("doctor.gate", "`gates[]` (one gate outcome)", None),
+        ],
     },
     {
         "key": "fleet_converge",
@@ -1103,6 +1130,9 @@ def _first_nested(example: dict[str, Any], notes_key: str) -> dict[str, Any] | N
     if leaf == "gate":
         gates = example.get("gates") or []
         return gates[0] if gates else None
+    if leaf == "check":
+        checks = example.get("checks") or []
+        return checks[0] if checks else None
     if leaf == "beads":
         return example.get("beads") or None
     if leaf == "fix":

@@ -136,6 +136,38 @@ class ContractDriftTests(unittest.TestCase):
             "must be added to the machine contract (capabilities/robot-docs).",
         )
 
+    def test_exit_code_vocabulary_matches_the_family(self) -> None:
+        """box.py's exit 2 is a USAGE code, not a drift code.
+
+        It used to be spelled EXIT_DRIFT, which collided head-on with the
+        family vocabulary in .env-manager/runtime_manager/_shared/errors.py
+        (EXIT_USAGE=2, EXIT_NEEDS_INPUT=3, EXIT_DRIFT=4). box.py has no drift
+        verb at all: the only user of the constant is BoxArgumentParser.error,
+        i.e. exactly what argparse itself exits with.
+        """
+        env_manager = str(BOX_SCRIPT.parent.parent / ".env-manager")
+        if env_manager not in sys.path:
+            sys.path.insert(0, env_manager)
+        from runtime_manager._shared import errors
+
+        self.assertEqual(BOX.EXIT_USAGE, 2)
+        self.assertEqual(BOX.EXIT_USAGE, errors.EXIT_USAGE)
+        self.assertNotEqual(BOX.EXIT_USAGE, errors.EXIT_DRIFT)
+        self.assertFalse(
+            hasattr(BOX, "EXIT_DRIFT"),
+            "box.py has no drift surface; a constant named EXIT_DRIFT here means "
+            "the family exit-code vocabulary drifted back apart.",
+        )
+
+    def test_argparse_usage_error_exits_with_the_usage_code(self) -> None:
+        import subprocess
+
+        result = subprocess.run(
+            [sys.executable, str(BOX_SCRIPT), "no-such-verb", "--json"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, BOX.EXIT_USAGE, result.stderr)
+
     def test_status_no_probe_returns_inventory_state(self) -> None:
         box = BOX.Box(id="fast", profile="dev-small", state="ready")
         status = BOX.box_health(box, probe=False)
@@ -209,6 +241,42 @@ class DispatchGateWiringTests(unittest.TestCase):
             marker = (Path(tmpdir) / ".skillbox-state" / "dryrun-markers"
                       / ".skillbox-dryrun-operator_teardown-gatebox")
             self.assertTrue(marker.exists(), "dry-run did not stamp the teardown marker")
+
+    def test_real_mutating_exec_via_argv_is_gated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._env(tmpdir)
+            result = self._run(
+                env, "exec", "gatebox", "--format", "json", "--", "systemctl", "restart", "nginx"
+            )
+            self.assertNotEqual(result.returncode, 0)
+            payload = json.loads(result.stdout)
+            self.assertIn(payload["error"]["type"], ("dirty_tree_refused", "dryrun_marker_required"))
+
+    def test_dry_run_exec_via_argv_stamps_a_command_bound_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._env(tmpdir)
+            result = self._run(
+                env, "exec", "gatebox", "--dry-run", "--format", "json",
+                "--", "systemctl", "restart", "nginx",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            key = BOX.box_exec_marker_key("gatebox", "systemctl restart nginx")
+            marker = (Path(tmpdir) / ".skillbox-state" / "dryrun-markers"
+                      / f".skillbox-dryrun-operator_box_exec-{key}")
+            self.assertTrue(marker.exists(), "exec dry-run did not stamp the command-bound marker")
+            # A different command must NOT be authorized by that marker.
+            other = BOX.box_exec_marker_key("gatebox", "systemctl restart other")
+            self.assertFalse(
+                (marker.parent / f".skillbox-dryrun-operator_box_exec-{other}").exists()
+            )
+
+    def test_real_compose_down_via_argv_is_gated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._env(tmpdir)
+            result = self._run(env, "compose-down", "--format", "json")
+            self.assertNotEqual(result.returncode, 0)
+            payload = json.loads(result.stdout)
+            self.assertIn(payload["error"]["type"], ("dirty_tree_refused", "dryrun_marker_required"))
 
     def test_real_up_via_argv_is_gated(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

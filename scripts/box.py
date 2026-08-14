@@ -38,10 +38,17 @@ REPO_ROOT = SCRIPT_DIR.parent
 # and checked subprocess output redaction.
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+from lib import dcglib as _dcglib  # noqa: E402
+from lib.redaction import redact_text as redact_diagnostic_text  # noqa: E402
 from lib.opslib import (  # noqa: E402
+    MARKER_SOURCE_BOX_CLI,
     SSH_READ_RETRY_POLICY,
     RetryPolicy,
+    box_exec_marker_key,
+    classify_box_exec_command,
     classify_ssh_failure,
+    command_hash,
+    dryrun_marker_payload,
     locked_inventory_update,
     resolve_inventory_path,
     run_checked,
@@ -98,10 +105,17 @@ def inventory_journal_path(inventory: Path | None = None) -> Path:
 
 EXIT_OK = 0
 EXIT_ERROR = 1
-EXIT_DRIFT = 2
+#: argparse's own usage exit code. box.py has no drift verb; this constant is
+#: purely "the CLI was invoked wrong", so it carries the family-wide name
+#: (EXIT_USAGE=2, EXIT_NEEDS_INPUT=3, EXIT_DRIFT=4 in
+#: .env-manager/runtime_manager/_shared/errors.py). Do NOT reuse it for drift.
+EXIT_USAGE = 2
 BOX_COMMAND_NAMES = {
     "capabilities",
+    "compose-down",
+    "compose-up",
     "down",
+    "exec",
     "import",
     "inventory-rebuild",
     "list",
@@ -504,7 +518,10 @@ def emit_error_or_print(
 def _box_agent_command(name: str) -> dict[str, Any]:
     safe_first_try = {
         "capabilities": "python3 scripts/box.py capabilities --json",
+        "compose-down": "python3 scripts/box.py compose-down --dry-run --format json",
+        "compose-up": "python3 scripts/box.py compose-up --dry-run --format json",
         "down": "python3 scripts/box.py down <box-id> --dry-run --format json",
+        "exec": "python3 scripts/box.py exec <box-id> --format json -- docker ps",
         "import": "python3 scripts/box.py profiles --format json",
         "inventory-rebuild": "python3 scripts/box.py status <box-id> --history --format json",
         "list": "python3 scripts/box.py list --format json",
@@ -514,7 +531,10 @@ def _box_agent_command(name: str) -> dict[str, Any]:
         "register": "python3 scripts/box.py profiles --format json",
         "robot-docs": "python3 scripts/box.py robot-docs guide",
         "robot-triage": "python3 scripts/box.py --robot-triage",
-        "ssh": "Use MCP operator_box_exec for non-interactive commands, or make box-ssh BOX=<id> for a TTY.",
+        "ssh": (
+            "python3 scripts/box.py exec <box-id> --format json -- <command> for "
+            "non-interactive commands, or make box-ssh BOX=<id> for a TTY."
+        ),
         "status": "python3 scripts/box.py status --format json",
         "unregister": "python3 scripts/box.py status <box-id> --format json",
         "up": "python3 scripts/box.py up <box-id> --profile dev-small --dry-run --format json",
@@ -526,11 +546,17 @@ def _box_agent_command(name: str) -> dict[str, Any]:
     command = {
         "name": name,
         "json": name in BOX_JSON_COMMANDS,
-        "mutates": name in {"down", "import", "inventory-rebuild", "register", "unregister", "up", "upgrade"},
-        "destructive": name == "down",
-        "dry_run": name in {"down", "up", "upgrade"},
+        "mutates": name in {
+            "compose-down", "compose-up", "down", "exec", "import", "inventory-rebuild",
+            "register", "unregister", "up", "upgrade",
+        },
+        "destructive": name in {"compose-down", "down"},
+        "dry_run": name in {"compose-down", "compose-up", "down", "exec", "up", "upgrade"},
         "safe_first_try": safe_first_try,
         "mutation_command": {
+            "compose-down": "python3 scripts/box.py compose-down --format json",
+            "compose-up": "python3 scripts/box.py compose-up --format json",
+            "exec": "python3 scripts/box.py exec <box-id> --format json -- <command>",
             "import": "python3 scripts/box.py import <box-id> --host <host> --no-probe --format json",
             "inventory-rebuild": "python3 scripts/box.py inventory-rebuild --from-journal --format json",
             "register": "python3 scripts/box.py register <box-id> --host <host> --no-probe --format json",
@@ -547,6 +573,42 @@ def _box_agent_command(name: str) -> dict[str, Any]:
         command["read_side_effects"] = {
             "default": "none",
             "opt_in": "--write-cache updates last_ssh_target in workspace/boxes.json when a better SSH target is discovered",
+        }
+    if name == "exec":
+        command["command_policy"] = {
+            "read_only_fast_path": (
+                "Allowlisted inspection commands (docker ps, git status, df, ls, ...) run "
+                "immediately with no dry-run friction."
+            ),
+            "mutating_requires": (
+                "Anything else — mutating verbs, unknown commands, shell chaining — needs a "
+                "fresh --dry-run of the IDENTICAL command; the marker is bound to box id + "
+                "command hash, so a preview of command A cannot authorize command B."
+            ),
+            "usage": "python3 scripts/box.py exec <box-id> [--dry-run] --format json -- <command>",
+            "safe_alternative": "python3 scripts/box.py exec <box-id> --dry-run --format json -- <command>",
+        }
+    if name == "compose-down":
+        command["confirmation"] = {
+            "required_for_real_down": True,
+            "accepted_flags": [],
+            "safe_alternative": "python3 scripts/box.py compose-down --dry-run --format json",
+        }
+    if name == "compose-up":
+        command["gate_policy"] = {
+            "marker_required": False,
+            "clean_tree_required": False,
+            "rationale": (
+                "Mutating but CONSTRUCTIVE: it builds and starts containers and destroys "
+                "no state. The marker gate exists to prove you previewed something you "
+                "cannot take back; starting a stack is undone by compose-down, which IS "
+                "gated. Requiring a clean tree to start your dev environment would refuse "
+                "the normal working state and train operators to reach for "
+                "SKILLBOX_CLI_MUTATION_GATE=skip, which is worse than no gate. This also "
+                "matches the tool it replaces: operator_compose_up declares "
+                "destructive=false, dry_run_required=false, requires_user_confirmation=false."
+            ),
+            "dry_run": "Optional preview. Writes nothing and starts nothing.",
         }
     return command
 
@@ -577,9 +639,14 @@ def box_capabilities_payload() -> dict[str, Any]:
                     "python3 scripts/box.py upgrade <box-id> --deploy-manifest <deploy.json> "
                     "--dry-run --format json"
                 ),
+                "python3 scripts/box.py exec <box-id> --dry-run --format json -- <command>",
+                "python3 scripts/box.py compose-down --dry-run --format json",
             ],
             "real_teardown_requires": "Pass --yes or --confirm <box-id>; --dry-run does not require confirmation.",
-            "non_tty_alternative": "Use MCP operator_box_exec for remote commands instead of box.py ssh.",
+            "non_tty_alternative": (
+                "Use python3 scripts/box.py exec <box-id> --format json -- <command> "
+                "for remote commands instead of box.py ssh."
+            ),
         },
         "read_side_effects": {
             "status": {
@@ -596,6 +663,40 @@ def box_capabilities_payload() -> dict[str, Any]:
             "up": "operator_provision",
             "down": "operator_teardown",
             "ssh": "operator_box_exec",
+            "exec": "operator_box_exec",
+            "compose-down": "operator_compose_down",
+            "compose-up": "operator_compose_up",
+        },
+        "mcp_status": {
+            "server": "skillbox-operator",
+            "state": "deprecated",
+            "replacement": "python3 scripts/box.py <command> --format json",
+            "skill": "skills/box-fleet-operator/SKILL.md",
+            "note": (
+                "The skillbox-operator MCP server is deprecated. Every operator_* tool has a "
+                "box.py or scripts/04-reconcile.py equivalent carrying the same gates "
+                "(clean tree, dry-run marker, DCG guard). mcp_equivalents above is kept only "
+                "to translate older transcripts; prefer the CLI."
+            ),
+            "tool_parity": "10/10",
+            "non_box_replacements": {
+                "operator_doctor": "python3 scripts/04-reconcile.py doctor --format json",
+                "operator_render": "python3 scripts/04-reconcile.py render --format json",
+            },
+            "gaps": {},
+        },
+        "command_guard": {
+            "verbs": ["exec"],
+            "guard": DCG_INTERFACE,
+            "expected_version": DCG_PINNED_VERSION,
+            "authoritative": "every real run, including the read-only allowlist fast path",
+            "advisory_sites": list(BOX_EXEC_DCG_ADVISORY_SITES),
+            "fail_closed": (
+                "A deny, a missing binary, a timeout, malformed JSON, an incompatible "
+                "version, and an unrecognized decision all block. There is no "
+                "'no verdict' outcome."
+            ),
+            "error_types": ["dcg_denied", "dcg_unavailable"],
         },
         "exit_codes": {
             "0": "success",
@@ -636,14 +737,41 @@ Safe mutation pattern:
   python3 scripts/box.py upgrade <box-id> --deploy-manifest <deploy.json> --dry-run --format json
   Real teardown requires --yes or --confirm <box-id> because it destroys infrastructure.
 
+Remote commands on a box (non-interactive, JSON):
+  python3 scripts/box.py exec <box-id> --format json -- docker ps
+  Allowlisted inspection commands run immediately. Anything else (mutating verbs,
+  unknown commands, shell chaining) is refused until you preview the IDENTICAL
+  command first, which stamps a marker bound to box id + command hash:
+  python3 scripts/box.py exec <box-id> --dry-run --format json -- <command>
+  then re-run the identical command without --dry-run.
+
+Local container stack:
+  python3 scripts/box.py compose-up --dry-run --format json
+  python3 scripts/box.py compose-up [--no-build] [--surfaces] --format json
+  Not gated: starting the stack is constructive and compose-down is the gated
+  inverse (`make up` is the ungated text-mode equivalent).
+  python3 scripts/box.py compose-down --dry-run --format json
+  python3 scripts/box.py compose-down --format json
+  Same gate: the real down needs a clean tree and a fresh preview marker
+  (`make down` is the ungated text-mode equivalent).
+
 Read-side commands:
   status and list do not write workspace/boxes.json by default.
   Use status --write-cache only when you intentionally want to update cached
   last_ssh_target values after a successful probe.
 
 Remote commands:
-  box.py ssh is for interactive terminals. Agents should use MCP operator_box_exec
-  for non-interactive commands on a box.
+  box.py ssh is for interactive terminals. Agents should use
+  `python3 scripts/box.py exec <box-id> --format json -- <command>` for
+  non-interactive commands on a box. Read-only inspection commands run
+  immediately; a mutating or unrecognized command needs a clean tree and a fresh
+  preview of the identical command. Every real run is checked by the destructive
+  command guard, which fails closed.
+
+Operator MCP server:
+  The skillbox-operator MCP server is deprecated. Every operator_* tool has a
+  box.py or scripts/04-reconcile.py equivalent with the same gates; see
+  `capabilities --format json` -> mcp_status, and skills/box-fleet-operator.
 """
 
 
@@ -4114,15 +4242,23 @@ def _upgrade_marker_key(box_id: str, deploy_manifest: str) -> str:
 
 
 def stamp_cli_dryrun_marker(tool_name: str, key: str) -> None:
+    """Mint a session-AGNOSTIC dry-run marker (see opslib's marker contract).
+
+    The payload is built by the shared builder so the CLI and the operator MCP
+    cannot drift on field names. ``session_scope="any"`` is deliberate and
+    explicit: every `python3 scripts/box.py ...` run is a fresh process under
+    whatever shell the agent spawned, so a CLI session id would differ between
+    the dry-run and the real run and would refuse the marker it just minted.
+    The MCP honours the declared scope instead of inferring one.
+    """
     marker = _cli_dryrun_marker_path(tool_name, key)
     marker.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "tool": tool_name,
-        "key": key,
-        "source": "box-cli",
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "note": f"dry-run completed for {tool_name} key={key}",
-    }
+    payload = dryrun_marker_payload(
+        tool_name,
+        key,
+        source=MARKER_SOURCE_BOX_CLI,
+        created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    )
     marker.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 
 
@@ -5196,6 +5332,585 @@ def cmd_ssh(box_id: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# box exec — gated, non-interactive remote command execution
+#
+# Robot-CLI equivalent of MCP operator_box_exec. Same two-tier policy, same
+# classifier (lib.opslib), and the SAME marker store: the marker key is
+# box_exec_marker_key(box_id, command), so a preview taken through either
+# surface authorizes the other and a marker minted for command A can never
+# authorize command B.
+# ---------------------------------------------------------------------------
+
+BOX_EXEC_MARKER_TOOL = "operator_box_exec"
+COMPOSE_DOWN_MARKER_TOOL = "operator_compose_down"
+COMPOSE_DOWN_MARKER_KEY = "local"
+
+# ---------------------------------------------------------------------------
+# DCG (destructive command guard) adapter — FAIL CLOSED
+#
+# The marker gate proves the operator PREVIEWED this exact command. It does not
+# prove the command is safe. The guard is the second half of the policy, and
+# `box.py exec` runs the SAME adapter (lib.dcglib) at the SAME two authoritative
+# call sites as MCP operator_box_exec:
+#
+#   AUTHORITATIVE — immediately before an actual ssh. That is the read-only
+#     allowlist fast path AND the marker-authorized mutating path. A deny, a
+#     missing binary, a timeout, malformed JSON, an incompatible version, and an
+#     unrecognized response ALL block. There is no "no verdict" outcome.
+#   NON-AUTHORITATIVE — the --dry-run preview (BOX_EXEC_DCG_ADVISORY_SITES). A
+#     preview executes nothing, so an unavailable guard is annotated on the
+#     payload instead of failing the preview; the real run it authorizes is
+#     still gated authoritatively.
+#
+# The names below live in THIS module's namespace on purpose: lib.dcglib
+# resolves them at call time, so tests patch box.py's own surface.
+# ---------------------------------------------------------------------------
+
+DCG_INTERFACE = _dcglib.DCG_INTERFACE
+DCG_EVAL_TIMEOUT_SECONDS = _dcglib.DCG_EVAL_TIMEOUT_SECONDS
+DCG_ROBOT_SCHEMA_VERSION = _dcglib.DCG_ROBOT_SCHEMA_VERSION
+DCG_SURFACE_NAME = "box.py exec"
+BOX_EXEC_DCG_ADVISORY_SITES = ("box_exec:dry_run_preview",)
+
+DCG_PINNED_VERSION, DCG_PIN_IMPORT_ERROR, _dcg_normalize_version = _dcglib.load_pinned_version(
+    REPO_ROOT / ".env-manager"
+)
+
+
+def _dcg_binary_path() -> str:
+    """Resolve the pinned DCG binary, or "" (a fail-closed signal, not a skip)."""
+    return _dcglib.resolve_dcg_binary()
+
+
+def dcg_blocks_execution(verdict: dict[str, Any] | None) -> bool:
+    """True unless DCG explicitly allowed the command."""
+    return _dcglib.dcg_blocks_execution(verdict)
+
+
+def evaluate_command_with_dcg(
+    command: str,
+    *,
+    timeout: int = DCG_EVAL_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Statically evaluate *command* with the pinned DCG binary. Never runs it."""
+    return _dcglib.evaluate_command(
+        command,
+        timeout=timeout,
+        pinned_version=DCG_PINNED_VERSION,
+        pin_import_error=DCG_PIN_IMPORT_ERROR,
+        resolve_binary=_dcg_binary_path,
+        run_command=run_checked,
+        redact=redact_diagnostic_text,
+        normalize_version=_dcg_normalize_version,
+        interface=DCG_INTERFACE,
+        schema_version=DCG_ROBOT_SCHEMA_VERSION,
+    )
+
+
+def dcg_advisory(command: str, *, site: str) -> dict[str, Any]:
+    """Verdict for an explicitly NON-AUTHORITATIVE call site (the preview)."""
+    if site not in BOX_EXEC_DCG_ADVISORY_SITES:
+        raise ValueError(f"{site!r} is not a declared non-authoritative DCG site")
+    return _dcglib.annotate_advisory(evaluate_command_with_dcg(command), site=site)
+
+
+def _emit_dcg_refusal(
+    box_id: str,
+    plan: dict[str, Any],
+    verdict: dict[str, Any],
+    *,
+    is_json: bool,
+) -> int:
+    """Structured refusal for an authoritative DCG block. Nothing ran.
+
+    Same wording and remediation as MCP operator_box_exec (both call
+    lib.dcglib.dcg_denial); only the envelope is box.py's.
+    """
+    denial = _dcglib.dcg_denial(DCG_SURFACE_NAME, verdict)
+    if is_json:
+        payload = structured_error(
+            denial["message"],
+            error_type=denial["error_type"],
+            recoverable=denial["recoverable"],
+            next_actions=denial["next_actions"],
+        )
+        payload["ok"] = False
+        payload["box_id"] = box_id
+        payload["command_hash"] = plan["command_hash"]
+        payload["executed"] = False
+        payload["dcg"] = verdict
+        emit_json(payload)
+    else:
+        print(denial["message"], file=sys.stderr)
+        for action in denial["next_actions"]:
+            print(f"  next: {action}", file=sys.stderr)
+    return EXIT_ERROR
+
+
+def box_exec_command_string(command_argv: list[str]) -> str:
+    """Join the post-`--` argv into the single command string we hash and run.
+
+    shlex-quoting keeps an argument that contains spaces one argument on the
+    remote side, and it is applied consistently, so the hash of a given argv is
+    stable across invocations.
+    """
+    return shell_join([str(token) for token in command_argv])
+
+
+def box_exec_plan(box_id: str, command_argv: list[str]) -> dict[str, Any]:
+    """Pure planning helper shared by cmd_exec and the dispatch-level gate."""
+    command = box_exec_command_string(command_argv)
+    classification = classify_box_exec_command(command)
+    return {
+        "command": command,
+        "classification": classification,
+        "marker_key": box_exec_marker_key(box_id, command),
+        "command_hash": command_hash(command),
+    }
+
+
+def box_exec_command_hint(box_id: str, command: str) -> str:
+    return f"python3 scripts/box.py exec {box_id} --dry-run --format json -- {command}"
+
+
+def _box_exec_ssh_host(box: "Box") -> str:
+    """Inventory-derived SSH target (no probing) — mirrors operator_box_exec."""
+    return str(box.tailscale_ip or box.tailscale_hostname or box.droplet_ip or "").strip()
+
+
+def cmd_exec(
+    box_id: str,
+    *,
+    command_argv: list[str],
+    dry_run: bool = False,
+    timeout: int = 120,
+    fmt: str = "text",
+) -> int:
+    is_json = fmt == "json"
+    plan = box_exec_plan(box_id, command_argv)
+    command = plan["command"]
+    classification = plan["classification"]
+
+    if not command.strip():
+        return emit_error_or_print(
+            "No command given. Pass the command after `--`.",
+            is_json=is_json,
+            error_type="missing_command",
+            next_actions=[f"python3 scripts/box.py exec {box_id} --format json -- docker ps"],
+        )
+
+    boxes = load_inventory()
+    box = find_box(boxes, box_id)
+    if box is None or box.state == "destroyed":
+        return emit_error_or_print(
+            f"Box {box_id!r} not found or destroyed.",
+            is_json=is_json,
+            error_type="box_not_found",
+            next_actions=[
+                "python3 scripts/box.py list --format json",
+                "python3 scripts/box.py register <box-id> --host <tailscale-hostname> --format json",
+            ],
+        )
+
+    host = _box_exec_ssh_host(box)
+    if not host:
+        return emit_error_or_print(
+            f"Box {box_id!r} has no reachable address.",
+            is_json=is_json,
+            error_type="no_ssh_target",
+            next_actions=[f"python3 scripts/box.py status {box_id} --format json"],
+        )
+
+    try:
+        user = _validate_ssh_user(box.ssh_user)
+        host = _validate_host(host)
+    except ValueError as exc:
+        return emit_error_or_print(
+            str(exc),
+            is_json=is_json,
+            error_type="invalid_box_config",
+            next_actions=[f"python3 scripts/box.py status {box_id} --format json"],
+        )
+
+    if dry_run:
+        payload: dict[str, Any] = {
+            "ok": True,
+            "dry_run": True,
+            "box_id": box_id,
+            "classification": classification["verdict"],
+            "reason": classification["reason"],
+            "would_run": {
+                "ssh_user": user,
+                "host": host,
+                "command": command,
+                "command_hash": plan["command_hash"],
+                "timeout": timeout,
+            },
+            "next_actions": [
+                f"python3 scripts/box.py exec {box_id} --format json -- {command}",
+            ],
+        }
+        # NON-AUTHORITATIVE site: a preview executes nothing, so an unavailable
+        # guard is annotated, not fatal. The real run this preview authorizes
+        # still passes the authoritative gate below.
+        payload["dcg"] = dcg_advisory(command, site=BOX_EXEC_DCG_ADVISORY_SITES[0])
+        if is_json:
+            emit_json(payload)
+        else:
+            print(f"[dry-run] {user}@{host}: {command}")
+            print(f"  classification: {classification['verdict']} ({classification['reason']})")
+            print(f"  guard: {payload['dcg']['verdict']} ({payload['dcg']['reason_code']})")
+            print(f"  re-run without --dry-run to execute (marker {plan['command_hash']})")
+        return EXIT_OK
+
+    # AUTHORITATIVE DCG gate. Covers BOTH real-run paths — the read-only
+    # allowlist fast path and the marker-authorized mutating path — exactly as
+    # MCP operator_box_exec does. Runs immediately before ssh; a block means
+    # nothing ran.
+    verdict = evaluate_command_with_dcg(command)
+    if dcg_blocks_execution(verdict):
+        return _emit_dcg_refusal(box_id, plan, verdict, is_json=is_json)
+
+    # CONSUME-ON-DISPATCH. Every gate has passed and the command is about to be
+    # issued, so the marker is spent HERE — not after a successful exit. A
+    # mutating command that fails AFTER mutating the box would otherwise leave a
+    # replayable marker for the rest of the TTL; one preview authorizes exactly
+    # one ATTEMPT, and a retry (a new mutating action against a box in an
+    # unknown state) needs a fresh preview. Consumption is deliberately placed
+    # after the DCG gate: a blocked command never dispatched, so it never spent
+    # its authorization. Clearing on the read-only fast path would be a no-op,
+    # so it is skipped; clearing an absent marker is harmless.
+    if classification["verdict"] != "read-only":
+        clear_cli_dryrun_marker(BOX_EXEC_MARKER_TOOL, plan["marker_key"])
+
+    try:
+        completed = ssh_cmd(user, host, command, timeout=timeout)
+    except FileNotFoundError:
+        return emit_error_or_print(
+            "ssh not found on this machine.",
+            is_json=is_json,
+            error_type="ssh_not_found",
+            next_actions=["install an ssh client, then re-run"],
+        )
+
+    rc = int(completed.returncode)
+    stdout = str(completed.stdout or "")
+    stderr = str(completed.stderr or "")
+    result: dict[str, Any] = {
+        "ok": rc == 0,
+        "box_id": box_id,
+        "classification": classification["verdict"],
+        "reason": classification["reason"],
+        "gate": "read-only-allowlist" if classification["verdict"] == "read-only" else "dryrun-marker",
+        "command": command,
+        "command_hash": plan["command_hash"],
+        "exit_code": rc,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+    if rc != 0:
+        result.update(
+            structured_error(
+                f"Remote command exited {rc} on box {box_id!r}.",
+                error_type="remote_command_failed",
+                next_actions=[f"python3 scripts/box.py status {box_id} --format json"],
+            )
+        )
+    if is_json:
+        emit_json(result)
+    else:
+        if stdout:
+            print(stdout.rstrip())
+        if stderr:
+            print(stderr.rstrip(), file=sys.stderr)
+        if rc != 0:
+            print(f"Remote command exited {rc}.", file=sys.stderr)
+    return EXIT_OK if rc == 0 else EXIT_ERROR
+
+
+# ---------------------------------------------------------------------------
+# box compose-down — gated JSON equivalent of `make down`
+#
+# `make down` runs COMPOSEF down as ungated text. This verb drives the SAME
+# compose stack (same --env-file resolution, same -f layering) behind the
+# clean-tree + dry-run-marker gate, and reuses the operator_compose_down marker
+# key so an MCP preview and a CLI preview are interchangeable.
+# ---------------------------------------------------------------------------
+
+def compose_env_file_args() -> list[str]:
+    """Mirror the Makefile's _ENV_FILE_ARG: state-root operator env, else legacy .env."""
+    for candidate in (operator_secret_dir() / ".env", REPO_ROOT / ".env"):
+        if candidate.is_file():
+            return ["--env-file", str(candidate)]
+    return []
+
+
+def compose_monoserver_layer_args() -> list[str]:
+    """Mirror the Makefile's _MONOSERVER_LAYER: client override when focused."""
+    focus_path = REPO_ROOT / "workspace" / ".focus.json"
+    if focus_path.is_file():
+        try:
+            focus = json.loads(focus_path.read_text(encoding="utf-8"))
+            client_id = str(focus.get("client_id", "") or "")
+            override = (
+                REPO_ROOT / "workspace" / ".compose-overrides"
+                / f"docker-compose.client-{client_id}.yml"
+            )
+            if client_id and override.is_file():
+                return ["-f", str(override.relative_to(REPO_ROOT))]
+        except (json.JSONDecodeError, OSError):
+            pass
+    return ["-f", "docker-compose.monoserver.yml"]
+
+
+def compose_argv(args: list[str]) -> list[str]:
+    """The Makefile's COMPOSEF, as argv."""
+    return [
+        "docker", "compose",
+        *compose_env_file_args(),
+        "-f", "docker-compose.yml",
+        *compose_monoserver_layer_args(),
+        *args,
+    ]
+
+
+def run_compose(args: list[str], *, timeout: int = 300) -> tuple[bool, int, Any]:
+    cmd = compose_argv(args)
+    checked = run_checked(cmd, timeout=timeout, redact=True, cwd=REPO_ROOT)
+    if checked.get("error_code") == "COMMAND_NOT_FOUND":
+        return False, -1, {
+            "error": {
+                "type": "docker_not_found",
+                "message": "docker not found. Install Docker to manage the local container stack.",
+                "recoverable": False,
+            }
+        }
+    if checked.get("error_code") == "TIMEOUT":
+        return False, -1, {
+            "error": {
+                "type": "timeout",
+                "message": f"docker compose timed out after {timeout}s.",
+                "recoverable": True,
+            }
+        }
+    rc = int(checked["rc"])
+    stdout = str(checked.get("stdout") or "").strip()
+    stderr = str(checked.get("stderr_redacted") or "").strip()
+    if stdout:
+        try:
+            return rc == 0, rc, json.loads(stdout)
+        except json.JSONDecodeError:
+            pass
+    return rc == 0, rc, {"exit_code": rc, "stdout": stdout, "stderr": stderr}
+
+
+def compose_up_steps(*, build: bool, surfaces: bool) -> list[dict[str, Any]]:
+    """The compose invocations a real `compose-up` would run, in order.
+
+    Kept pure so the preview and the real run cannot drift apart: both walk this
+    list. `up` is the headline step; `up-surfaces` is optional and a failure
+    there does not fail the headline, exactly as operator_compose_up behaves.
+    """
+    steps: list[dict[str, Any]] = []
+    if build:
+        steps.append({"step": "build", "args": ["build"], "timeout": 600, "headline": False})
+    steps.append({"step": "up", "args": ["up", "-d"], "timeout": 120, "headline": True})
+    if surfaces:
+        steps.append({
+            "step": "up-surfaces",
+            "args": ["--profile", "surfaces", "up", "-d"],
+            "timeout": 60,
+            "headline": False,
+        })
+    return steps
+
+
+def cmd_compose_up(
+    *,
+    build: bool = True,
+    surfaces: bool = False,
+    dry_run: bool = False,
+    fmt: str = "text",
+) -> int:
+    """Robot-JSON equivalent of MCP operator_compose_up (and of `make up`).
+
+    Deliberately NOT marker-gated — see _box_agent_command("compose-up")
+    ["gate_policy"] for the reasoning. --dry-run is a genuine preview: it runs
+    no compose subcommand that changes anything.
+    """
+    is_json = fmt == "json"
+    steps = compose_up_steps(build=build, surfaces=surfaces)
+
+    if dry_run:
+        # A read-only probe so the operator can see what is ALREADY running.
+        # Non-fatal on purpose: unlike the compose-down preview, where "what
+        # would stop" IS the payload, the up plan is fully knowable without
+        # docker, so a missing daemon must not hide the plan.
+        probe_ok, _probe_code, probe_data = run_compose(["ps", "--format", "json"], timeout=30)
+        payload = {
+            "ok": True,
+            "dry_run": True,
+            "action": "compose up",
+            "build": build,
+            "surfaces": surfaces,
+            "steps": [
+                {"step": step["step"], "compose_command": compose_argv(step["args"])}
+                for step in steps
+            ],
+            "headline_step": "up",
+            "current_state": probe_data if probe_ok else {"probe_failed": probe_data},
+            "gated": False,
+            "next_actions": ["python3 scripts/box.py compose-up --format json"],
+        }
+        if is_json:
+            emit_json(payload)
+        else:
+            for step in payload["steps"]:
+                print(f"[dry-run] {step['step']}: " + shell_join(step["compose_command"]))
+            print("  re-run without --dry-run to build and start the local stack")
+        return EXIT_OK
+
+    results: list[dict[str, Any]] = []
+    headline_ok = True
+    for step in steps:
+        ok, code, data = run_compose(step["args"], timeout=int(step["timeout"]))
+        results.append({"step": step["step"], "ok": ok, "exit_code": code, "detail": data})
+        if ok:
+            continue
+        if step["step"] == "build":
+            payload = {"ok": False, "action": "compose up", "steps": results}
+            payload.update(
+                structured_error(
+                    "docker compose build failed.",
+                    error_type="build_failed",
+                    next_actions=["python3 scripts/box.py compose-up --dry-run --format json"],
+                )
+            )
+            if is_json:
+                emit_json(payload)
+            else:
+                print("docker compose build failed.", file=sys.stderr)
+            return EXIT_ERROR
+        if step["headline"]:
+            headline_ok = False
+            payload = {
+                "ok": False,
+                "action": "compose up",
+                "steps": results,
+                "headline_step": "up",
+                "headline_ok": False,
+            }
+            payload.update(
+                structured_error(
+                    "docker compose up failed.",
+                    error_type="up_failed",
+                    next_actions=["python3 scripts/box.py compose-up --dry-run --format json"],
+                )
+            )
+            if is_json:
+                emit_json(payload)
+            else:
+                print("docker compose up failed.", file=sys.stderr)
+            return EXIT_ERROR
+        # A non-headline step (surfaces) failed: keep going, report it.
+
+    partial_failures = [step for step in results if not step["ok"]]
+    payload = {
+        # ok tracks the HEADLINE step so it never contradicts the exit code. An
+        # optional surface failure is reported in partial_failures, which callers
+        # must inspect — same contract as operator_compose_up.
+        "ok": headline_ok,
+        "action": "compose up",
+        "steps": results,
+        "headline_step": "up",
+        "headline_ok": headline_ok,
+        "partial_failures": partial_failures,
+        "next_actions": (
+            ["python3 scripts/04-reconcile.py doctor --format json"]
+            if not partial_failures
+            else ["Inspect steps[] for optional surface failures."]
+        ),
+    }
+    if is_json:
+        emit_json(payload)
+    elif partial_failures:
+        names = ", ".join(step["step"] for step in partial_failures)
+        print(f"Local compose stack started; optional step(s) failed: {names}.", file=sys.stderr)
+    else:
+        print("Local compose stack started.")
+    # The headline succeeded, so the stack IS up. An optional surface failure is
+    # reported, not fatal — same contract as operator_compose_up.
+    return EXIT_OK
+
+
+def cmd_compose_down(*, dry_run: bool = False, fmt: str = "text") -> int:
+    is_json = fmt == "json"
+    if dry_run:
+        ok, code, data = run_compose(["ps", "--format", "json"], timeout=30)
+        if not ok:
+            payload = {
+                "ok": False,
+                "dry_run": True,
+                "action": "compose down",
+                "exit_code": code,
+                "detail": data,
+            }
+            payload.update(
+                structured_error(
+                    "docker compose ps failed during the compose-down preview.",
+                    error_type="compose_preview_failed",
+                    next_actions=["docker compose ps", "python3 scripts/box.py compose-down --dry-run --format json"],
+                )
+            )
+            if is_json:
+                emit_json(payload)
+            else:
+                print("docker compose ps failed during the compose-down preview.", file=sys.stderr)
+            return EXIT_ERROR
+        payload = {
+            "ok": True,
+            "dry_run": True,
+            "action": "compose down",
+            "compose_command": compose_argv(["down"]),
+            "would_stop": data,
+            "next_actions": ["python3 scripts/box.py compose-down --format json"],
+        }
+        if is_json:
+            emit_json(payload)
+        else:
+            print("[dry-run] " + shell_join(compose_argv(["down"])))
+            print("  re-run without --dry-run to stop the local stack")
+        return EXIT_OK
+
+    # CONSUME-ON-DISPATCH: spend the marker as the real `compose down` is
+    # issued, not after it succeeds. A down that fails partway has still stopped
+    # containers, so the stack is in an unknown state and a retry needs a fresh
+    # preview rather than the marker the first attempt was authorized by.
+    clear_cli_dryrun_marker(COMPOSE_DOWN_MARKER_TOOL, COMPOSE_DOWN_MARKER_KEY)
+    ok, code, data = run_compose(["down"], timeout=120)
+    payload = {
+        "ok": ok,
+        "action": "compose down",
+        "exit_code": code,
+        "detail": data,
+    }
+    if not ok:
+        payload.update(
+            structured_error(
+                "docker compose down failed.",
+                error_type="compose_down_failed",
+                next_actions=["docker compose ps", "python3 scripts/box.py compose-down --dry-run --format json"],
+            )
+        )
+    if is_json:
+        emit_json(payload)
+    else:
+        print("Local compose stack stopped." if ok else "docker compose down failed.",
+              file=sys.stdout if ok else sys.stderr)
+    return EXIT_OK if ok else EXIT_ERROR
+
+
+# ---------------------------------------------------------------------------
 # box list
 # ---------------------------------------------------------------------------
 
@@ -5428,12 +6143,22 @@ class BoxArgumentParser(argparse.ArgumentParser):
                     next_actions=next_actions,
                 )
             )
-            raise SystemExit(EXIT_DRIFT)
+            raise SystemExit(EXIT_USAGE)
         super().error(message)
 
 
+def _argv_before_separator(argv: list[str]) -> list[str]:
+    """Tokens up to the first literal `--`.
+
+    Everything after `--` is a REMOTE command (box.py exec), not box.py's own
+    argv: rewriting a `--json` in there would corrupt the command the operator
+    previewed and hashed.
+    """
+    return argv[: argv.index("--")] if "--" in argv else argv
+
+
 def _argv_requests_json_diagnostics(argv: list[str]) -> bool:
-    for index, token in enumerate(argv):
+    for index, token in enumerate(_argv_before_separator(argv)):
         if token in BOX_JSON_FLAG_ALIASES:
             return True
         if token == "--format" and index + 1 < len(argv) and argv[index + 1] == "json":
@@ -5462,7 +6187,13 @@ def _normalize_agent_argv(argv: list[str]) -> tuple[list[str], list[str]]:
     command_seen = False
     current_command: str | None = None
     pending_json = False
-    for token in argv:
+    for index, token in enumerate(argv):
+        if token == "--":
+            # Remote-command boundary (box.py exec): pass the tail through
+            # untouched so alias rewriting cannot mutate the hashed command.
+            normalized.extend(argv[index:])
+            pending_json = False
+            break
         if token == "--robot-help":
             normalized.extend(["robot-docs", "guide"])
             command_seen = True
@@ -5582,6 +6313,58 @@ def build_parser() -> argparse.ArgumentParser:
 
     ssh_parser = subparsers.add_parser("ssh", help="SSH into a box.")
     ssh_parser.add_argument("box_id", type=_validate_box_id, help="Box identifier.")
+
+    exec_parser = subparsers.add_parser(
+        "exec",
+        help="Run a non-interactive command on a box (read-only fast path; mutating needs a dry-run marker).",
+    )
+    exec_parser.add_argument("box_id", type=_validate_box_id, help="Box identifier.")
+    exec_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview the exact command and stamp a marker bound to box id + command hash.",
+    )
+    exec_parser.add_argument("--timeout", type=int, default=120, help="Remote command timeout in seconds (default: 120).")
+    exec_parser.add_argument("--format", choices=("text", "json"), default="text")
+    exec_parser.add_argument(
+        "remote_command",
+        nargs="*",
+        metavar="-- COMMAND",
+        help="Command to run on the box, after a literal `--`.",
+    )
+
+    compose_up_parser = subparsers.add_parser(
+        "compose-up",
+        help="Build and start the local container stack (JSON equivalent of `make up`).",
+    )
+    compose_up_parser.add_argument(
+        "--no-build",
+        dest="build",
+        action="store_false",
+        help="Skip the image build and only start the stack.",
+    )
+    compose_up_parser.add_argument(
+        "--surfaces",
+        action="store_true",
+        help="Also start the optional api+web surfaces profile.",
+    )
+    compose_up_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the compose commands that would run. Starts nothing.",
+    )
+    compose_up_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    compose_down_parser = subparsers.add_parser(
+        "compose-down",
+        help="Stop the local container stack (gated JSON equivalent of `make down`).",
+    )
+    compose_down_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview what would stop and stamp the compose-down marker.",
+    )
+    compose_down_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     register_parser = subparsers.add_parser("register", help="Register an existing shared or manually created box in local inventory.")
     register_parser.add_argument("box_id", nargs="?", default=None, type=_validate_box_id, help="Local box identifier. Defaults to a host-derived alias.")
@@ -5731,7 +6514,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             if args.dry_run and result == EXIT_OK:
                 stamp_cli_dryrun_marker("operator_provision", args.box_id)
-            elif not args.dry_run and result == EXIT_OK:
+            elif not args.dry_run:
+                # CONSUME-ON-DISPATCH: the gate passed and the real run was
+                # issued, so the marker is spent whatever the exit code. A
+                # half-provisioned box is exactly the state a fresh preview
+                # exists to describe.
                 clear_cli_dryrun_marker("operator_provision", args.box_id)
             return result
         if args.command == "down":
@@ -5753,7 +6540,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             if args.dry_run and result == EXIT_OK:
                 stamp_cli_dryrun_marker("operator_teardown", args.box_id)
-            elif not args.dry_run and down_confirmed and result == EXIT_OK:
+            elif not args.dry_run and down_confirmed:
+                # CONSUME-ON-DISPATCH: a teardown that failed partway (droplet
+                # deleted, volume cleanup stuck) has still destroyed state; the
+                # retry must be previewed against the NEW state, not authorized
+                # by the marker the first attempt already spent.
                 clear_cli_dryrun_marker("operator_teardown", args.box_id)
             return result
         if args.command == "upgrade":
@@ -5779,7 +6570,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             if args.dry_run and result == EXIT_OK:
                 stamp_cli_dryrun_marker("operator_upgrade", upgrade_key)
-            elif not args.dry_run and result == EXIT_OK:
+            elif not args.dry_run:
+                # CONSUME-ON-DISPATCH: a failed upgrade leaves the box between
+                # releases, so the retry is a new mutating action.
                 clear_cli_dryrun_marker("operator_upgrade", upgrade_key)
             return result
         if args.command == "status":
@@ -5796,6 +6589,61 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_posture_proof(args.box_id, fmt=args.format)
         if args.command == "ssh":
             return cmd_ssh(args.box_id)
+        if args.command == "exec":
+            plan = box_exec_plan(args.box_id, list(args.remote_command or []))
+            mutating = plan["classification"]["verdict"] != "read-only"
+            if not args.dry_run and mutating:
+                # Parity with MCP operator_box_exec: a mutating/unknown command
+                # needs a fresh preview of the IDENTICAL command (marker bound
+                # to box id + command hash) from a committed tree.
+                refused = cli_mutation_gate(
+                    BOX_EXEC_MARKER_TOOL,
+                    plan["marker_key"],
+                    display=f"{args.box_id}: {plan['command']}",
+                    fmt=args.format,
+                    command_hint=box_exec_command_hint(args.box_id, plan["command"]),
+                )
+                if refused is not None:
+                    return refused
+            result = cmd_exec(
+                args.box_id,
+                command_argv=list(args.remote_command or []),
+                dry_run=args.dry_run,
+                timeout=args.timeout,
+                fmt=args.format,
+            )
+            if args.dry_run and result == EXIT_OK:
+                stamp_cli_dryrun_marker(BOX_EXEC_MARKER_TOOL, plan["marker_key"])
+            # The marker is consumed inside cmd_exec at the dispatch moment
+            # (CONSUME-ON-DISPATCH), not here on a successful exit — a mutating
+            # command that fails after mutating must not stay replayable.
+            return result
+        if args.command == "compose-up":
+            # No mutation gate on purpose: constructive, reversible by the gated
+            # compose-down. See _box_agent_command("compose-up")["gate_policy"].
+            return cmd_compose_up(
+                build=args.build,
+                surfaces=args.surfaces,
+                dry_run=args.dry_run,
+                fmt=args.format,
+            )
+        if args.command == "compose-down":
+            if not args.dry_run:
+                refused = cli_mutation_gate(
+                    COMPOSE_DOWN_MARKER_TOOL,
+                    COMPOSE_DOWN_MARKER_KEY,
+                    display="the local compose stack",
+                    fmt=args.format,
+                    command_hint="python3 scripts/box.py compose-down --dry-run --format json",
+                )
+                if refused is not None:
+                    return refused
+            result = cmd_compose_down(dry_run=args.dry_run, fmt=args.format)
+            if args.dry_run and result == EXIT_OK:
+                stamp_cli_dryrun_marker(COMPOSE_DOWN_MARKER_TOOL, COMPOSE_DOWN_MARKER_KEY)
+            # Consumption happens inside cmd_compose_down at the dispatch moment
+            # (CONSUME-ON-DISPATCH), so a failed `down` cannot be replayed.
+            return result
         if args.command in ("register", "import"):
             return cmd_register(
                 args.box_id,

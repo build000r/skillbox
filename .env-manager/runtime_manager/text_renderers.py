@@ -3,6 +3,21 @@ from __future__ import annotations
 from .shared import *
 from .runtime_ops import service_bootstrap_task_ids, service_dependency_ids, task_dependency_ids
 
+# The ONE doctor-family envelope/vocabulary module. It lives under scripts/lib
+# (not under runtime_manager) because scripts/04-reconcile.py provably cannot
+# import runtime_manager — see tests/test_reconcile.py RuntimeDoctorExitVocabularyTests
+# — and a second copy of the vocabulary is exactly the drift this bead retires.
+from lib.doctor_contract import (  # noqa: E402
+    display_status,
+    finding_from_obj,
+    routing_line,
+    summarize,
+    summary_line,
+)
+
+#: This doctor's name in the family routing table (lib/doctor_contract.FAMILY).
+DOCTOR_TOOL_NAME = "python3 .env-manager/manage.py doctor"
+
 
 def _render_header_lines(model: dict[str, Any]) -> list[str]:
     available_clients = ", ".join(client["id"] for client in model.get("clients") or []) or "(none)"
@@ -165,23 +180,21 @@ def detail_lines(details: dict[str, Any]) -> list[str]:
 
 def print_doctor_text(results: list[CheckResult]) -> None:
     for result in results:
-        print(f"{result.status.upper():4} {result.code}: {result.message}")
+        # display_status() is the human spelling of the ONE machine vocabulary
+        # (pass|warn|inco|fail): JSON stays lowercase, text stays shouty.
+        print(f"{display_status(result.status):4} {result.code}: {result.message}")
         if result.details:
             for line in detail_lines(result.details):
                 print(f"     {line}")
+        # JSON carries fix_command on passing checks too (the remediation
+        # vocabulary is discoverable before it is needed); text does not, because
+        # a "fix:" under a PASS reads like something is wrong.
+        if getattr(result, "fix_command", None) and result.status != "pass":
+            print(f"     fix: {result.fix_command}")
 
-    counts = {
-        "pass": sum(1 for item in results if item.status == "pass"),
-        "warn": sum(1 for item in results if item.status == "warn"),
-        "fail": sum(1 for item in results if item.status == "fail"),
-    }
     print()
-    print(
-        "summary: "
-        f"{counts['pass']} passed, "
-        f"{counts['warn']} warnings, "
-        f"{counts['fail']} failed"
-    )
+    print(routing_line(DOCTOR_TOOL_NAME))
+    print(summary_line(summarize(finding_from_obj(result) for result in results)))
 
 
 def _print_status_header(status_payload: dict[str, Any]) -> None:

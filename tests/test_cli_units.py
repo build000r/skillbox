@@ -132,7 +132,7 @@ class CliUnitTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["tool"], "skillbox-manage")
-        self.assertEqual(payload["contract_version"], "2026-05-09")
+        self.assertEqual(payload["contract_version"], "2026-08-14")
         _assert_elapsed_meta(self, payload)
         self.assertIn("capabilities", payload["agent_surfaces"])
         self.assertTrue(any(command["name"] == "next" for command in payload["commands"]))
@@ -184,7 +184,7 @@ class CliUnitTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["contract_version"], "2026-05-09")
+        self.assertEqual(payload["contract_version"], "2026-08-14")
         registry_entries = {entry["id"]: entry for entry in payload["registry"]["capabilities"]}
         next_entry = registry_entries["brain.next"]
         self.assertEqual(next_entry["risk"], "low")
@@ -2472,6 +2472,77 @@ except RuntimeError as exc:
 
         self.assertEqual(emitted[-1]["error"]["type"], "LOCAL_RUNTIME_START_BLOCKED")
         self.assertEqual(emitted[-1]["error"]["blocked_services"], ["api"])
+
+
+class ExitCodeLadderContractTests(unittest.TestCase):
+    """Drift and argparse-usage exits must never share a number again.
+
+    Before this contract EXIT_DRIFT was 2 -- the same code argparse exits with
+    on a bad invocation -- so `manage.py doctor; [ $? -eq 2 ]` could not tell
+    "ran fine, found drift" from "you typed it wrong". Exit 2 is reserved for
+    usage (argparse exits 2 on paths we do not route through our own error()
+    override, so usage cannot be moved), 3 was already published as "operator
+    input required", and drift therefore owns 4.
+    """
+
+    def test_ladder_values_are_distinct_and_usage_owns_two(self) -> None:
+        ladder = {
+            "ok": CLI.EXIT_OK,
+            "error": CLI.EXIT_ERROR,
+            "usage": CLI.EXIT_USAGE,
+            "needs_input": CLI.EXIT_NEEDS_INPUT,
+            "drift": CLI.EXIT_DRIFT,
+        }
+
+        self.assertEqual(ladder, {"ok": 0, "error": 1, "usage": 2, "needs_input": 3, "drift": 4})
+        self.assertEqual(len(set(ladder.values())), len(ladder))
+        # The parser constant is an alias, not an independent literal that can
+        # be edited out from under the ladder.
+        self.assertEqual(CLI._EXIT_USAGE, CLI.EXIT_USAGE)
+        self.assertNotEqual(CLI.EXIT_DRIFT, CLI._EXIT_USAGE)
+
+    def test_capabilities_exit_codes_match_the_ladder(self) -> None:
+        result = _run_manage("capabilities", "--json", "--no-adapters")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        exit_codes = json.loads(result.stdout)["exit_codes"]
+
+        self.assertEqual(
+            set(exit_codes),
+            {str(code) for code in (CLI.EXIT_OK, CLI.EXIT_ERROR, CLI.EXIT_USAGE, CLI.EXIT_NEEDS_INPUT, CLI.EXIT_DRIFT)},
+        )
+        usage_doc = exit_codes[str(CLI.EXIT_USAGE)].lower()
+        drift_doc = exit_codes[str(CLI.EXIT_DRIFT)].lower()
+        self.assertIn("usage", usage_doc)
+        self.assertNotIn("drift", usage_doc)
+        self.assertIn("drift", drift_doc)
+
+    def test_doctor_drift_and_usage_error_exit_differently_end_to_end(self) -> None:
+        # End-to-end through main() -> process exit status, not just the handler
+        # return value: the whole point is what `$?` shows a scripted caller.
+        driver = (
+            "import sys; sys.path.insert(0, %r)\n"
+            "from unittest import mock\n"
+            "from runtime_manager import cli\n"
+            "fail = cli.CheckResult('fail', 'synthetic-drift', 'induced drift', {})\n"
+            "with mock.patch.object(cli, 'doctor_results', return_value=[fail]):\n"
+            "    sys.exit(cli.main(['doctor', '--format', 'json']))\n"
+        ) % str(ENV_MANAGER_DIR)
+        drift = subprocess.run(
+            [sys.executable, "-c", driver],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "PYTHONPATH": str(ENV_MANAGER_DIR)},
+        )
+        usage = _run_manage("doctr", "--json")
+
+        self.assertEqual(drift.returncode, CLI.EXIT_DRIFT, drift.stderr)
+        self.assertEqual(json.loads(drift.stdout)["checks"][0]["status"], "fail")
+        self.assertEqual(usage.returncode, CLI.EXIT_USAGE, usage.stdout)
+        self.assertEqual(json.loads(usage.stdout)["error"]["code"], "USAGE_ERROR")
+        self.assertNotEqual(drift.returncode, usage.returncode)
 
 
 if __name__ == "__main__":

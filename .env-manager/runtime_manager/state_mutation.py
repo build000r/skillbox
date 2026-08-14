@@ -125,6 +125,10 @@ SURFACE_PULSE = "pulse"
 SURFACE_BOX = "box"
 SURFACE_OPERATOR_MCP = "operator_mcp"
 SURFACE_MAKE = "make"
+#: The OUTER half — ``scripts/04-reconcile.py``. It provably cannot import
+#: ``runtime_manager`` (pinned by tests/test_reconcile.py), so it was invisible
+#: to every enumerator here until ``doctor --fix`` gave it a mutating surface.
+SURFACE_RECONCILE = "reconcile"
 
 SURFACE_KINDS = (
     SURFACE_MANAGE,
@@ -132,6 +136,7 @@ SURFACE_KINDS = (
     SURFACE_BOX,
     SURFACE_OPERATOR_MCP,
     SURFACE_MAKE,
+    SURFACE_RECONCILE,
 )
 
 SURFACE_ENTRYPOINTS = {
@@ -140,6 +145,7 @@ SURFACE_ENTRYPOINTS = {
     SURFACE_BOX: "scripts/box.py",
     SURFACE_OPERATOR_MCP: "scripts/operator_mcp_server.py",
     SURFACE_MAKE: "Makefile",
+    SURFACE_RECONCILE: "scripts/04-reconcile.py",
 }
 
 #: Not a boundary field — the set of state-root resolvers the boundaries below
@@ -166,6 +172,12 @@ STATE_ROOT_SOURCES: Mapping[str, str] = {
         "workflows.py:2386 _stewardship_state_root -> model storage.state_root else env "
         "SKILLBOX_STATE_ROOT else None (no fallback path at all)"
     ),
+    "git_scan_cache.state_root": (
+        "git_scan_cache.py:83 resolve_state_root -> env SKILLBOX_STATE_ROOT else "
+        "<runtime_root>/.skillbox-state; the cache file itself is "
+        "<state_root>/git-scan/last-scan.json (git_scan_cache.py:73 CACHE_REL_PATH, "
+        ":101 cache_path)"
+    ),
     "opslib.inventory": (
         "scripts/lib/opslib.py:235 resolve_inventory_path -> env SKILLBOX_STATE_ROOT else "
         "<repo>/.skillbox-state; the inventory itself is <repo>/workspace/boxes.json unless "
@@ -188,6 +200,13 @@ STATE_ROOT_SOURCES: Mapping[str, str] = {
     "runtime_model.root_dir": (
         "runtime model root_dir (scripts/lib/runtime_model.py:539 default './.skillbox-state' for "
         "storage.state_root); repo-tracked paths under <root_dir>, not a state root"
+    ),
+    "doctor_fix.state_root": (
+        "scripts/lib/doctor_fix.py:242 resolve_state_root -> env SKILLBOX_STATE_ROOT else "
+        "<repo>/.skillbox-state, and a RELATIVE override is resolved against the repo root "
+        "(REPO-RELATIVE — deliberately the self-test.sh:178 / opslib.py:235 reading, not the "
+        "cwd-relative one). Run artifacts land under <state_root>/doctor-runs/<slug>/ "
+        "(doctor_fix.py:104 RUNS_DIRNAME, :283 runs_dir)"
     ),
     "home": "$HOME — ~/.claude, ~/.skillbox-state, user crontab; outside every state root",
     "remote": "the state root ON THE REMOTE BOX; not resolvable from the operator host",
@@ -294,6 +313,13 @@ LOCK_OVERRIDES = (
     "policy_eval.update_repo_override_policy (policy_eval.py:1273-1313); PER-FILE ONLY"
 )
 LOCK_SELFTEST = "flock ${SKILLBOX_STATE_ROOT}/self-test/toolchain/.lock (scripts/self-test.sh:186)"
+LOCK_DOCTOR_FIX = (
+    "state_mutation_lease(state_root, boundary_id) — the REAL cross-process state-root lease "
+    "(state_mutation.py:3001), taken by doctor_fix.mutation_gate (scripts/lib/doctor_fix.py:324) "
+    "for the whole apply span. Fail-closed twice over: the lease refuses any boundary_id not "
+    "classified as a mutation in this MANIFEST, and doctor_fix._load_state_mutation "
+    "(doctor_fix.py:243) refuses to mutate at all if this module cannot be imported"
+)
 MARKER_NOT_A_LOCK = (
     "dry-run marker under ${STATE_ROOT}/dryrun-markers "
     "(operator_mcp_server.py:1500) — an advisory consent stamp, NOT a lock"
@@ -308,7 +334,7 @@ _MANAGE_READ = (
     ("client-diff", "publish.py:854 diff_client_bundle; candidate bundle built in tempfile.TemporaryDirectory (publish.py:874)"),
     ("client-open", ""),  # placeholder replaced below (mutation) — never emitted
     ("distribution-preview", "distribution/preview.py:57 preview_manifest; reads the lockfile only"),
-    ("doctor", "cli.py:4023 -> runtime_ops.py:1856 doctor_results; check_filesystem (runtime_ops.py:629) only scans"),
+    ("doctor", ""),  # placeholder replaced below (mutation) — never emitted
     ("explain", "cli.py:4406 _handle_explain -> agent_decisions.explain_payload"),
     ("fleet converge", "cli.py:4138 _handle_fleet_converge -> fleet_converge.py:740 build_fleet_converge_plan; zero write primitives in fleet_converge.py"),
     ("forge status", "forge.py:407 forge_status"),
@@ -346,12 +372,7 @@ _MANAGE_READ = (
     ("snap replay", "cli.py:4707 branch"),
     ("state-backup verify", "state_backup.py:593 verify_state_backup; hashes an existing archive"),
     ("status", "cli.py:4038 -> runtime_status"),
-    (
-        "structure-doctor",
-        "cli.py:3821 -> structure_doctor.py:574; writes no state. CAVEAT: shells out to "
-        "pytest (structure_doctor.py:204) which drops __pycache__ bytecode dirs — "
-        "incidental, not state-root state",
-    ),
+    ("structure-doctor", ""),  # placeholder replaced below (mutation) — never emitted
     ("worker-status", ""),  # placeholder replaced below (mutation) — never emitted
 )
 
@@ -504,6 +525,39 @@ _MANAGE_BOUNDARIES: tuple[Boundary, ...] = tuple(
         evidence=("cli.py:2836 -> distribution/rollback.py:50", "rollback.py:180 install_dir mkdir", "rollback.py:223-224 lockfile atomic_write_text"),
     ),
     _b(
+        SURFACE_MANAGE, "doctor", CONDITIONAL_MUTATION,
+        state_root_source="doctor_fix.state_root",
+        dry_run_predicate=(
+            "`--fix` alone NEVER mutates: cli.py:4470 routes to doctor_fix.run_fix(confirmed="
+            "args.yes) and run_fix returns a `preview` artifact + EXIT_NEEDS_INPUT(3) at "
+            "doctor_fix.py:551 unless `--yes` is also present. Without `--fix` the command is "
+            "pure READ (runtime_ops.py:1898 doctor_results -> check_filesystem runtime_ops.py:629 "
+            "only scans). So: two flags, fail-closed, and the preview branch still writes ONLY "
+            "its own run artifact"
+        ),
+        nested_call_policy=(
+            "spawns `manage.py sync` as a subprocess fixer (cli.py:4393 "
+            "runtime_doctor_fix_registry); that child re-enters manage.sync (TRUE_DRY_RUN) but "
+            "NOT this boundary — the lease is not reentrant and is held by the parent only"
+        ),
+        lease_span="whole_command",
+        lock_owner=LOCK_DOCTOR_FIX,
+        writes=(
+            "<state_root>/doctor-runs/runtime-doctor/<stamp>-<run_id>.json (run artifact, 0600)",
+            "<state_root>/doctor-runs/runtime-doctor/<stamp>-<run_id>.backup/ (pre-change backups)",
+            "whatever the dispatched fixer writes — today only `manage.py sync` (skills.lock, "
+            "install trees)",
+        ),
+        evidence=(
+            "cli.py:4461 _handle_doctor -> --undo/--fix routing before any emit",
+            "cli.py:4393 runtime_doctor_fix_registry — declared FixSpec argv, never the "
+            "finding's fix_command string",
+            "scripts/lib/doctor_fix.py:437 run_fix; :267 mutation_gate takes the lease BEFORE "
+            "backups; :581 capture_backups runs before the first fixer",
+            "scripts/lib/doctor_fix.py:629 undo_run restores from the artifact's backup manifest",
+        ),
+    ),
+    _b(
         SURFACE_MANAGE, "down", TRUE_DRY_RUN,
         state_root_source="runtime_model.root_dir",
         dry_run_predicate="`if dry_run:` runtime_ops.py:5969 — early continue before stop_process / remove_pid_file / log_runtime_event",
@@ -600,6 +654,38 @@ _MANAGE_BOUNDARIES: tuple[Boundary, ...] = tuple(
         lock_owner=UNOWNED,
         writes=("git branch -D forge/<skill>", "~/.claude/forge-decisions.jsonl"),
         evidence=("cli.py:2542 -> forge.py:910 forge_reject", "forge.py:944 `_run_git(repo, [\"branch\", \"-D\", branch], ...)`"),
+    ),
+    _b(
+        SURFACE_MANAGE, "git-status", CONDITIONAL_MUTATION,
+        state_root_source="git_scan_cache.state_root",
+        dry_run_predicate=(
+            "NO FLAG. The scan itself is genuinely read-only (git_inventory never fetches or "
+            "writes), but EVERY live scan write-throughs its envelope to the git-scan cache: "
+            "`write_git_scan_cache(report, root_dir)` cli.py:4129, unconditional on the live "
+            "path. The write predicate is therefore the INVERSE of a dry-run flag — `--cached` "
+            "(cli.py:4107 `if getattr(args, \"cached\", False):` -> _serve_cached_git_status "
+            "cli.py:4145) is the only write-free invocation. A failed cache write degrades to a "
+            "stderr note and never fails the scan (cli.py:4130-4131), so callers cannot tell "
+            "from the exit code whether state moved. The docstring at cli.py:4083 calls the "
+            "command 'read-only'; that is true of the git estate, NOT of the state root"
+        ),
+        nested_call_policy=(
+            "delegates_external: git subprocesses per repo (read-only porcelain). "
+            "--live additionally delegates an origin comparison to the reconcile skill"
+        ),
+        lease_span="single_write (the write-through at the end of one scan)",
+        lock_owner=UNOWNED + " — the write is an atomic replace, but nothing serializes two concurrent scans",
+        writes=(
+            "<state_root>/git-scan/last-scan.json (current generation)",
+            "<state_root>/git-scan/last-scan.json `previous` generation (rotated, one deep — the prior scan is displaced on every run)",
+        ),
+        evidence=(
+            "cli.py:4318 registry row -> cli.py:4082 _handle_git_status",
+            "cli.py:4129 `write_git_scan_cache(report, root_dir)`",
+            "git_scan_cache.py:105 write_scan_cache -> :120 cache_path + :121 mkdir(parents=True)",
+            "git_scan_cache.py:124-129 rotation: the displaced generation is retained once as `previous`",
+            "scripts/sbp:1644 `sbp git`/`sbp gs` front door -> `python3 .env-manager/manage.py git-status`",
+        ),
     ),
     _b(
         SURFACE_MANAGE, "mcp sync", CONDITIONAL_MUTATION,
@@ -1010,6 +1096,39 @@ _MANAGE_BOUNDARIES: tuple[Boundary, ...] = tuple(
         evidence=("cli.py:2948 -> workflows.py:3032 run_stewardship_report", "workflows.py:3017-3019 report paths", "workflows.py:3026-3028 write_json_file / write_text_file"),
     ),
     _b(
+        SURFACE_MANAGE, "structure-doctor", CONDITIONAL_MUTATION,
+        state_root_source="doctor_fix.state_root",
+        dry_run_predicate=(
+            "same two-flag gate as manage.doctor: cli.py:4016 _handle_structure_doctor routes "
+            "`--fix` to doctor_fix.run_fix(confirmed=args.yes); without `--yes` it writes a "
+            "`preview` artifact and returns EXIT_NEEDS_INPUT(3) (doctor_fix.py:551). Without "
+            "`--fix` the command writes no state. CAVEAT (pre-existing, unrelated to --fix): it "
+            "shells out to pytest (structure_doctor.py:204), which drops __pycache__ bytecode "
+            "dirs — incidental, not state-root state"
+        ),
+        nested_call_policy=(
+            "front door of the doctor family — shells out to `make doctor` "
+            "(structure_doctor.py:_run_runtime_doctor) for a gate verdict, but that child is a "
+            "READ invocation with no --fix, so no nested lease is attempted. Its own fixer "
+            "dispatches `manage.py mcp sync --apply` (CONDITIONAL_MUTATION) as a subprocess"
+        ),
+        lease_span="whole_command",
+        lock_owner=LOCK_DOCTOR_FIX,
+        writes=(
+            "<state_root>/doctor-runs/structure-doctor/<stamp>-<run_id>.json (run artifact, 0600)",
+            "<state_root>/doctor-runs/structure-doctor/<stamp>-<run_id>.backup/",
+            "whatever the dispatched fixer writes — today only `manage.py mcp sync --apply` "
+            "(~/.claude.json, .mcp.json, ~/.codex/config.toml surfaces, backed up first)",
+        ),
+        evidence=(
+            "cli.py:4016 _handle_structure_doctor -> --undo/--fix routing",
+            "structure_doctor.py:904 structure_doctor_fix_registry — only the mcp_parity gate "
+            "has a declared fixer; every other gate records why it is not auto-fixable",
+            "structure_doctor.py:981 run_structure_doctor returns the shared doctor_envelope",
+            "scripts/lib/doctor_fix.py:750 run_fix; :324 mutation_gate; :581 capture_backups",
+        ),
+    ),
+    _b(
         SURFACE_MANAGE, "swimmers-launch", TRUE_DRY_RUN,
         state_root_source="external",
         dry_run_predicate="`if dry_run:` swimmers_launch.py:301 — returns before the POST",
@@ -1150,7 +1269,7 @@ _PULSE_BOUNDARIES: tuple[Boundary, ...] = (
 )
 
 # --------------------------------------------------------------------------
-# box CLI — 15 surfaces
+# box CLI — 19 surfaces
 # --------------------------------------------------------------------------
 
 _BOX_UP_LIKE_EVIDENCE = (
@@ -1162,6 +1281,15 @@ _BOX_BOUNDARIES: tuple[Boundary, ...] = (
     _read(SURFACE_BOX, "capabilities", "scripts/box.py:5361 dispatch -> box_capabilities_payload + emit_json"),
     _read(SURFACE_BOX, "list", "scripts/box.py:5044 cmd_list — pure read of the inventory"),
     _read(SURFACE_BOX, "profiles", "scripts/box.py:5078 cmd_profiles — pure read"),
+    _read(
+        SURFACE_BOX, "place",
+        "scripts/box.py:6014 cmd_place -> dispatch scripts/box.py:6661",
+        "reads only: load_machines_config (machines.py:429) + load_inventory + "
+        "placement.gather_observations (placement.py:156) + list_profiles; "
+        "neither placement.py nor machines.py contains a single write primitive "
+        "(no write_text/mkdir/os.replace/json.dump), and cmd_place ends at box.py:6042 "
+        "with emit_json — no save_inventory, no journal append",
+    ),
     _read(SURFACE_BOX, "robot-docs", "scripts/box.py:5364 dispatch -> box_robot_docs_guide"),
     _read(SURFACE_BOX, "robot-triage", "scripts/box.py:5371 dispatch -> box_robot_triage_payload"),
     _read(
@@ -1169,6 +1297,82 @@ _BOX_BOUNDARIES: tuple[Boundary, ...] = (
         "scripts/box.py:4942 cmd_posture_proof — network/doctl probes only; the 'proof artifact' "
         "is emitted to stdout at box.py:4972, never written to disk. Note box.py:97-113 "
         "BOX_COMMAND_NAMES omits posture-proof, so the --json rewrite does not fire for it",
+    ),
+    _b(
+        SURFACE_BOX, "compose-up", TRUE_DRY_RUN,
+        state_root_source="external",
+        dry_run_predicate=(
+            "`if dry_run:` box.py:5744 inside cmd_compose_up runs ONLY "
+            "`docker compose ps --format json` (a read probe, non-fatal) and returns "
+            "at box.py:5771 before the `for step in steps:` loop at box.py:5775 that "
+            "issues build/up. Write-free: no marker is stamped and no container is "
+            "created. UNGATED BY DESIGN — dispatch at box.py:6621 calls cmd_compose_up "
+            "directly with no cli_mutation_gate, unlike compose-down at box.py:6630. "
+            "Rationale is published at box.py _box_agent_command('compose-up')"
+            "['gate_policy']: the verb is constructive, its destructive inverse "
+            "(compose-down) keeps the clean-tree + marker gate, and requiring a clean "
+            "tree to start a dev stack would refuse the normal working state and drive "
+            "operators to SKILLBOX_CLI_MUTATION_GATE=skip. Matches the classification "
+            "of the tool it replaces (operator_compose_up: destructive=false, "
+            "dry_run_required=false, requires_user_confirmation=false)"
+        ),
+        nested_call_policy=(
+            "delegates_external: docker compose build + up -d (+ optional "
+            "`--profile surfaces up -d`) over the Makefile's COMPOSEF stack "
+            "(box.py:5666 compose_argv)"
+        ),
+        lease_span="cross_process_infra; no marker and no lease are taken",
+        lock_owner=UNOWNED + "; the compose project itself is the real serializer",
+        writes=(
+            "local docker images built",
+            "local docker containers/networks created and started",
+        ),
+        evidence=(
+            "scripts/box.py:5728 cmd_compose_up",
+            "box.py:5707 compose_up_steps — ONE step plan walked by both the preview "
+            "and the real run",
+            "box.py:5677 run_compose -> :5666 compose_argv (replicates Makefile COMPOSEF: "
+            "--env-file <state-root>/operator/.env, -f docker-compose.yml, "
+            "-f <monoserver layer>)",
+            "box.py:6621 dispatch — no cli_mutation_gate call",
+            "box.py:6336 compose_up_parser (--no-build / --surfaces / --dry-run / --format)",
+        ),
+    ),
+    _b(
+        SURFACE_BOX, "compose-down", CONDITIONAL_MUTATION,
+        state_root_source="external",
+        dry_run_predicate=(
+            "`if dry_run:` box.py:5848 inside cmd_compose_down runs `docker compose ps "
+            "--format json` (a probe) and returns before the real `run_compose([\"down\"])` "
+            "at box.py:5890. The real run is marker-gated in dispatch: box.py:6631 "
+            "`if not args.dry_run:` -> cli_mutation_gate(COMPOSE_DOWN_MARKER_TOOL, "
+            "COMPOSE_DOWN_MARKER_KEY) box.py:6632-6638, i.e. dirty tree first "
+            "(box.py:4326 dirty_tree_refused) then the marker (box.py:4339 "
+            "dryrun_marker_required). Marker tool/key are 'operator_compose_down'/'local' "
+            "(box.py:5345-5346) — byte-identical to the operator MCP marker, so an "
+            "MCP preview authorizes this verb and vice versa. CONSUME-ON-DISPATCH: the "
+            "marker is cleared at box.py:5889, one line BEFORE the real down is issued, so "
+            "a down that fails partway (containers already stopped) cannot be replayed — "
+            "the retry needs a fresh preview of the new state. "
+            "SKILLBOX_CLI_MUTATION_GATE=skip (box.py:4314) disables both checks. "
+            "NOTE: `make down` reaches the same compose stack with NO gate at all"
+        ),
+        nested_call_policy="delegates_external: docker compose down over the Makefile's COMPOSEF stack (box.py:5666 compose_argv)",
+        lease_span="cross_process_infra; the marker is consumed on dispatch at box.py:5889",
+        lock_owner=MARKER_NOT_A_LOCK + "; the compose project itself is the real serializer",
+        writes=(
+            "local docker containers/networks torn down",
+            "${STATE_ROOT}/dryrun-markers/.skillbox-dryrun-operator_compose_down-local",
+        ),
+        evidence=(
+            "scripts/box.py:5846 cmd_compose_down",
+            "box.py:5890 `ok, code, data = run_compose([\"down\"], timeout=120)`",
+            "box.py:5677 run_compose -> :5666 compose_argv (replicates Makefile COMPOSEF: "
+            "--env-file <state-root>/operator/.env, -f docker-compose.yml, -f <monoserver layer>)",
+            "box.py:6643 stamp_cli_dryrun_marker (preview) / box.py:5889 "
+            "clear_cli_dryrun_marker (consume-on-dispatch)",
+            "tests/test_box_exec_gate.py ComposeDownGateTests + ConsumeOnDispatchTests",
+        ),
     ),
     _b(
         SURFACE_BOX, "down", TRUE_DRY_RUN,
@@ -1186,6 +1390,61 @@ _BOX_BOUNDARIES: tuple[Boundary, ...] = (
         lock_owner=LOCK_INVENTORY,
         writes=("workspace/boxes.json", "workspace/boxes-journal.jsonl", "the DigitalOcean droplet + volume (destroyed)"),
         evidence=_BOX_UP_LIKE_EVIDENCE + ("scripts/box.py:4366 cmd_down", "box.py:4375 `if not dry_run and not confirmed:`"),
+    ),
+    _b(
+        SURFACE_BOX, "exec", CONDITIONAL_MUTATION,
+        state_root_source="remote",
+        dry_run_predicate=(
+            "Full gate chain, in order, and deliberately the same shape as "
+            "operator_box_exec: classification -> dirty tree -> marker -> DCG -> ssh. "
+            "(1) Classifier bypass: `mutating = plan[\"classification\"][\"verdict\"] != "
+            "\"read-only\"` box.py:6594 — a command on the read-only allowlist "
+            "(opslib.py:491 classify_box_exec_command) skips the MARKER, not the guard. "
+            "(2) `if dry_run:` box.py:5535 returns the would_run envelope before "
+            "`ssh_cmd(user, host, command, ...)` box.py:5587 — nothing remote is touched — "
+            "and dispatch stamps the marker at box.py:6616. The preview annotates a "
+            "NON-AUTHORITATIVE guard advisory (box.py:5556 dcg_advisory, site "
+            "'box_exec:dry_run_preview'), which never blocks because nothing runs. "
+            "(3) Anything mutating OR UNRECOGNIZED with no marker is refused by "
+            "cli_mutation_gate (box.py:4303): dirty tree first (box.py:4326 "
+            "dirty_tree_refused), then marker (box.py:4339 dryrun_marker_required). "
+            "The marker key binds the box id AND the CANONICALIZED command hash "
+            "(opslib.py:465 box_exec_marker_key -> :376 command_hash -> :335 "
+            "canonical_command), so a marker minted for command A never authorizes "
+            "command B; only quoting STYLE is folded, which is what makes a CLI preview "
+            "and an MCP run of the same command land on one marker. "
+            "(4) AUTHORITATIVE DCG gate on BOTH real-run paths (allowlisted and "
+            "marker-authorized): box.py:5570 evaluate_command_with_dcg -> "
+            "dcg_blocks_execution, immediately before ssh, via the adapter shared with "
+            "operator_box_exec (scripts/lib/dcglib.py:147 evaluate_command, fail-closed). "
+            "A block means nothing ran, and the marker is NOT spent. "
+            "(5) CONSUME-ON-DISPATCH: the marker is cleared at box.py:5584, after the "
+            "guard and before ssh — one preview buys one ATTEMPT, so a command that "
+            "mutates the box and then exits non-zero cannot be replayed. "
+            "SKILLBOX_CLI_MUTATION_GATE=skip (box.py:4314) disables the dirty-tree and "
+            "marker checks; it does NOT disable the DCG gate"
+        ),
+        nested_call_policy="remote_exec: arbitrary ssh command; blast radius is the command string",
+        lease_span="cross_process_infra (remote); the local marker is consumed on dispatch at box.py:5584",
+        lock_owner=MARKER_NOT_A_LOCK,
+        writes=(
+            "arbitrary remote state",
+            "${STATE_ROOT}/dryrun-markers/.skillbox-dryrun-operator_box_exec-<sha256(box_id)[:16]>.<command_hash>",
+        ),
+        evidence=(
+            "scripts/box.py:5481 cmd_exec -> dispatch scripts/box.py:6592",
+            "box.py:5460 box_exec_plan (marker_key + command_hash)",
+            "box.py:5570-5572 authoritative DCG gate; box.py:5584 clear_cli_dryrun_marker "
+            "(consume-on-dispatch); box.py:5587 ssh_cmd",
+            "scripts/lib/opslib.py:465 box_exec_marker_key — the SAME helper operator_mcp_server "
+            "delegates to (operator_mcp_server.py:1633), which is why CLI-stamped and "
+            "MCP-stamped markers are byte-interoperable",
+            "scripts/lib/opslib.py:417 dryrun_marker_payload — one payload builder for both "
+            "writers; CLI markers declare session_scope='any', MCP markers 'session' "
+            "(operator_mcp_server.py:1846 _stamp_dryrun_marker, :1808 scope check)",
+            "tests/test_box_exec_gate.py MarkerInteropTests / CommandCanonicalizationTests / "
+            "MarkerSessionContractTests / ConsumeOnDispatchTests",
+        ),
     ),
     _b(
         SURFACE_BOX, "import", UNCONDITIONAL_MUTATION,
@@ -1302,68 +1561,71 @@ _OPMCP_BOUNDARIES: tuple[Boundary, ...] = (
         state_root_source="remote",
         dry_run_predicate=(
             "Three-way. Read-only classifier bypass: "
-            "`if classification[\"verdict\"] == \"read-only\" and not dry_run_param:` :1243. "
-            "Dry run stamps a marker: `if dry_run_param: _stamp_dryrun_marker(...)` :1255-1256. "
-            "Real run requires that marker: `if not _has_dryrun_marker(\"operator_box_exec\", marker_key)` :1287. "
-            "Marker key binds to the EXACT command via sha256 (:1511 _box_exec_marker_key)"
+            "`if classification[\"verdict\"] == \"read-only\" and not dry_run_param:` :1339. "
+            "Dry run stamps a marker: `if dry_run_param: _stamp_dryrun_marker(...)` :1354-1355. "
+            "Real run requires that marker: `if not _has_dryrun_marker(\"operator_box_exec\", marker_key)` :1387. "
+            "Marker key binds to the EXACT command via sha256 of the canonicalized command "
+            "(:1621 _box_exec_marker_key -> opslib.py:465). A valid marker is still not a "
+            "guard bypass: the authoritative DCG evaluation runs at :1424 immediately before "
+            "run_ssh, on BOTH the allowlisted and the marker-authorized path"
         ),
         nested_call_policy="remote_exec: arbitrary ssh command; blast radius is the command string",
-        lease_span="cross_process_infra (remote); the local marker is consumed one-shot at :1331",
+        lease_span="cross_process_infra (remote); the local marker is consumed ON DISPATCH at :1439 — before run_ssh, not after a zero exit, so a command that mutates and then fails cannot be replayed",
         lock_owner=MARKER_NOT_A_LOCK,
         writes=("arbitrary remote state", "${STATE_ROOT}/dryrun-markers/.skillbox-dryrun-operator_box_exec-<key>"),
-        evidence=("scripts/operator_mcp_server.py:490 tool decl", "operator_mcp_server.py:1147 handle_operator_box_exec", "operator_mcp_server.py:1723 _stamp_dryrun_marker", "operator_mcp_server.py:1773 _clear_dryrun_marker"),
+        evidence=("scripts/operator_mcp_server.py:514 tool decl", "operator_mcp_server.py:1225 handle_operator_box_exec", "operator_mcp_server.py:1846 _stamp_dryrun_marker", "operator_mcp_server.py:1902 _clear_dryrun_marker", "operator_mcp_server.py:1439 consume-on-dispatch"),
     ),
     _b(
         SURFACE_OPERATOR_MCP, "operator_compose_down", CONDITIONAL_MUTATION,
         state_root_source="external",
-        dry_run_predicate="dry-run branch simulates via `docker compose ps` (:1387); the real run requires a marker: `if not _has_dryrun_marker(\"operator_compose_down\", \"local\")` :1411-1412",
+        dry_run_predicate="dry-run branch simulates via `docker compose ps` (:1498) and stamps at :1517; the real run requires a marker: `if not _has_dryrun_marker(\"operator_compose_down\", \"local\")` :1520, consumed ON DISPATCH at :1531 immediately before `run_compose([\"down\"])`",
         nested_call_policy="delegates_external: docker compose down",
         lease_span="cross_process_infra",
         lock_owner=MARKER_NOT_A_LOCK + "; the compose project itself is the real serializer",
         writes=("local docker containers/networks torn down", "${STATE_ROOT}/dryrun-markers/..."),
-        evidence=("scripts/operator_mcp_server.py:574 tool decl (destructive=True at :582)", "operator_mcp_server.py:1382 handle_operator_compose_down"),
+        evidence=("scripts/operator_mcp_server.py:600 tool decl (destructive=True at :608)", "operator_mcp_server.py:1491 handle_operator_compose_down"),
     ),
     _b(
         SURFACE_OPERATOR_MCP, "operator_compose_up", UNCONDITIONAL_MUTATION,
         state_root_source="external",
         dry_run_predicate=(
             "NONE — this is the ONE mutating operator tool with no dry_run parameter and no "
-            "marker requirement. Its only inputs are `build` and `surfaces` (:552); "
-            "handle_operator_compose_up (:1335) goes straight to run_compose. Asymmetric with "
+            "marker requirement. Its only inputs are `build` and `surfaces` (:586); "
+            "handle_operator_compose_up (:1444) goes straight to run_compose. Asymmetric with "
             "operator_compose_down, which does require a marker"
         ),
         nested_call_policy="delegates_external: docker compose up",
         lease_span="cross_process_infra",
         lock_owner=UNOWNED + " (compose project lock is the only serializer)",
         writes=("local docker images built", "containers started"),
-        evidence=("scripts/operator_mcp_server.py:543 tool decl", "operator_mcp_server.py:1335 handle_operator_compose_up"),
+        evidence=("scripts/operator_mcp_server.py:569 tool decl", "operator_mcp_server.py:1444 handle_operator_compose_up"),
     ),
     _b(
         SURFACE_OPERATOR_MCP, "operator_provision", CONDITIONAL_MUTATION,
         state_root_source="opslib.inventory",
-        dry_run_predicate="`if dry_run_param: args.append(\"--dry-run\")` / `elif not _has_dryrun_marker(\"operator_provision\", box_id_param): return _dry_run_required_error(` :1078-1087",
+        dry_run_predicate="`if dry_run_param: args.append(\"--dry-run\")` / `elif not _has_dryrun_marker(\"operator_provision\", box_id_param): return _dry_run_required_error(` :1153-1159; the marker is consumed on dispatch at :1174 (any real run, not only a successful one)",
         nested_call_policy="reenters_subprocess: box.up (which itself checkpoints the inventory nine times)",
         lease_span="cross_process_infra",
         lock_owner=MARKER_NOT_A_LOCK + "; the nested box.up write takes " + LOCK_INVENTORY,
         writes=("everything box.up writes", "${STATE_ROOT}/dryrun-markers/..."),
         delegates_to=("box.up",),
-        evidence=("scripts/operator_mcp_server.py:398 tool decl", "operator_mcp_server.py:1010 handle_operator_provision", "operator_mcp_server.py:1098 _clear_dryrun_marker"),
+        evidence=("scripts/operator_mcp_server.py:422 tool decl", "operator_mcp_server.py:1083 handle_operator_provision", "operator_mcp_server.py:1174 _clear_dryrun_marker"),
     ),
     _b(
         SURFACE_OPERATOR_MCP, "operator_teardown", CONDITIONAL_MUTATION,
         state_root_source="opslib.inventory",
-        dry_run_predicate="`if dry_run_param: args.append(\"--dry-run\")` / `elif not _has_dryrun_marker(\"operator_teardown\", box_id_param): return _dry_run_required_error(` :1124-1127",
+        dry_run_predicate="`if dry_run_param: args.append(\"--dry-run\")` / `elif not _has_dryrun_marker(\"operator_teardown\", box_id_param): return _dry_run_required_error(` :1202-1208; the marker is consumed on dispatch at :1220 (any real run, not only a successful one)",
         nested_call_policy="reenters_subprocess: box.down",
         lease_span="cross_process_infra",
         lock_owner=MARKER_NOT_A_LOCK + "; the nested box.down write takes " + LOCK_INVENTORY,
         writes=("everything box.down writes", "${STATE_ROOT}/dryrun-markers/..."),
         delegates_to=("box.down",),
-        evidence=("scripts/operator_mcp_server.py:464 tool decl (destructive=True at :472)", "operator_mcp_server.py:1102 handle_operator_teardown", "operator_mcp_server.py:1142 _clear_dryrun_marker"),
+        evidence=("scripts/operator_mcp_server.py:488 tool decl (destructive=True at :496)", "operator_mcp_server.py:1178 handle_operator_teardown", "operator_mcp_server.py:1220 _clear_dryrun_marker"),
     ),
 )
 
 # --------------------------------------------------------------------------
-# Make targets — 51 surfaces
+# Make targets — 52 surfaces
 # --------------------------------------------------------------------------
 
 _MAKE_DELEGATION_ONLY = (
@@ -1399,8 +1661,17 @@ def _make_read_delegate(target: str, delegate: str) -> Boundary:
 
 _MAKE_BOUNDARIES: tuple[Boundary, ...] = (
     _read(SURFACE_MAKE, "help", "Makefile:44 help — printf block only"),
-    _read(SURFACE_MAKE, "render", "Makefile render -> `python3 scripts/04-reconcile.py render` (outer reconcile, read-only)"),
-    _read(SURFACE_MAKE, "doctor", "Makefile doctor -> `python3 scripts/04-reconcile.py doctor` (outer reconcile, read-only)"),
+    _read(
+        SURFACE_MAKE, "render",
+        "Makefile render -> `python3 scripts/04-reconcile.py render` (outer reconcile, read-only)",
+        delegates_to=("reconcile.render",),
+    ),
+    _read(
+        SURFACE_MAKE, "doctor",
+        "Makefile doctor -> `python3 scripts/04-reconcile.py doctor`. Stays READ: the recipe "
+        "passes no --fix, and --fix without --yes writes nothing but its own preview artifact",
+        delegates_to=("reconcile.doctor",),
+    ),
     _read(SURFACE_MAKE, "logs", "Makefile logs -> `$(COMPOSEF) logs -f --tail=200`"),
     _make_read_delegate("runtime-render", "manage.render"),
     _make_read_delegate("runtime-status", "manage.status"),
@@ -1425,6 +1696,35 @@ _MAKE_BOUNDARIES: tuple[Boundary, ...] = (
         writes=("$(mktemp -d) scratch only (e2e-smoke.sh:77-80)",),
         evidence=("Makefile e2e-smoke -> ./scripts/e2e-smoke.sh", "e2e-smoke.sh:504 manage.py render", "e2e-smoke.sh:516 manage.py sync --dry-run", "e2e-smoke.sh:726 run_step 'state-mutation' 'required'"),
         delegates_to=("manage.render", "manage.sync"),
+    ),
+    _b(
+        SURFACE_MAKE, "git-estate-e2e", CONDITIONAL_MUTATION,
+        state_root_source="git_scan_cache.state_root",
+        dry_run_predicate=(
+            _MAKE_DELEGATION_ONLY + " "
+            "NONE, and the label is misleading: Makefile:71 advertises the target as "
+            "'read-only' and git-estate-e2e.sh:6 repeats it, which is true of the GIT ESTATE "
+            "(a mktemp fixture, git-estate-e2e.sh:28, torn down by the EXIT trap at :32) but "
+            "NOT of the state root. run_sbp (git-estate-e2e.sh:187-192) sets SKILLBOX_ROOT, "
+            "SKILLBOX_INVOKE_CWD and SKILLBOX_CONFIG_ROOT but NOT SKILLBOX_STATE_ROOT, so each "
+            "of its six live `sbp git` scans (:221, :253, :272, :273, :298, :310) reaches "
+            "manage.git-status, whose unconditional write-through (cli.py:4129) rotates the "
+            "REAL <state_root>/git-scan/last-scan.json. Running this target therefore destroys "
+            "the operator's previous git-scan generation"
+        ),
+        nested_call_policy="reenters_subprocess: scripts/sbp git -> manage.git-status (six times)",
+        lease_span="inherited from manage.git-status (six independent single_writes)",
+        lock_owner="inherited from manage.git-status (" + UNOWNED + ")",
+        writes=(
+            "$(mktemp -d) fixture estate + origins + config (git-estate-e2e.sh:28-37, removed on exit)",
+            "everything manage.git-status writes — <state_root>/git-scan/last-scan.json, rotated once per scan",
+        ),
+        evidence=(
+            "Makefile:174 git-estate-e2e -> `@./scripts/git-estate-e2e.sh`",
+            "git-estate-e2e.sh:187 run_sbp — no SKILLBOX_STATE_ROOT in the env it builds",
+            "scripts/sbp:1644 git-status branch -> `python3 .env-manager/manage.py git-status`",
+        ),
+        delegates_to=("manage.git-status",),
     ),
     _b(
         SURFACE_MAKE, "bootstrap-env", CONDITIONAL_MUTATION,
@@ -1636,10 +1936,57 @@ _MAKE_BOUNDARIES: tuple[Boundary, ...] = (
     _make_delegate("box-unregister", "box.unregister", UNCONDITIONAL_MUTATION),
 )
 
+# --------------------------------------------------------------------------
+# 04-reconcile CLI — the outer half, 5 leaf surfaces
+# --------------------------------------------------------------------------
+
+_RECONCILE_BOUNDARIES: tuple[Boundary, ...] = (
+    _read(SURFACE_RECONCILE, "capabilities", "04-reconcile.py:2135 capabilities_parser -> capabilities_payload; builds a dict from the model"),
+    _b(
+        SURFACE_RECONCILE, "doctor", CONDITIONAL_MUTATION,
+        state_root_source="doctor_fix.state_root",
+        dry_run_predicate=(
+            "two flags, fail-closed: `--fix` alone routes to doctor_fix.run_fix(confirmed="
+            "args.yes) (04-reconcile.py:1879 doctor_fix_command) which writes a `preview` "
+            "artifact and returns EXIT_NEEDS_INPUT(3) unless `--yes` is also present "
+            "(doctor_fix.py:551). Plain `doctor` — which is what `make doctor` runs — writes "
+            "nothing; doctor_results only reads the manifest, filesystem, and compose config"
+        ),
+        nested_call_policy=(
+            "leaf. Its only registered fixer is an in-process-safe `mkdir -p` of the missing "
+            "expected directories (04-reconcile.py:1821 doctor_fix_registry); it re-enters no "
+            "other boundary"
+        ),
+        lease_span="whole_command",
+        lock_owner=LOCK_DOCTOR_FIX,
+        writes=(
+            "<state_root>/doctor-runs/reconcile-doctor/<stamp>-<run_id>.json (run artifact, 0600)",
+            "<state_root>/doctor-runs/reconcile-doctor/<stamp>-<run_id>.backup/",
+            "the missing directories named by the `expected-directories` finding (mkdir -p)",
+        ),
+        evidence=(
+            "04-reconcile.py:1879 doctor_fix_command; :1905 doctor_undo",
+            "04-reconcile.py main() doctor branch routes --undo then --fix before emitting",
+            "scripts/lib/doctor_fix.py:267 mutation_gate -> state_mutation_lease; the outer "
+            "half reaches this module by sys.path-inserting .env-manager at call time "
+            "(doctor_fix.py:243 _load_state_mutation), which is the ONLY runtime_manager import "
+            "the outer half performs and it is lazy, local, and refuses on failure",
+        ),
+    ),
+    _read(SURFACE_RECONCILE, "render", "04-reconcile.py:2154 render_parser -> load_yaml + emit; no write primitives on the path"),
+    _read(SURFACE_RECONCILE, "robot-docs", "04-reconcile.py:2141 robot_docs_parser -> robot_docs_guide(); returns a string"),
+    _read(SURFACE_RECONCILE, "robot-triage", "04-reconcile.py:2148 robot_triage_parser -> robot_triage_payload(); reads the model"),
+)
+
 #: Every classified public boundary, sorted for byte-stable rendering.
 MANIFEST: tuple[Boundary, ...] = tuple(
     sorted(
-        _MANAGE_BOUNDARIES + _PULSE_BOUNDARIES + _BOX_BOUNDARIES + _OPMCP_BOUNDARIES + _MAKE_BOUNDARIES,
+        _MANAGE_BOUNDARIES
+        + _PULSE_BOUNDARIES
+        + _BOX_BOUNDARIES
+        + _OPMCP_BOUNDARIES
+        + _MAKE_BOUNDARIES
+        + _RECONCILE_BOUNDARIES,
         key=lambda b: (b.surface, b.key),
     )
 )
@@ -1769,6 +2116,15 @@ def enumerate_box_surfaces(root_dir: Path | str | None = None) -> tuple[str, ...
     return _add_parser_names(_repo_root(root_dir) / "scripts" / "box.py")
 
 
+def enumerate_reconcile_surfaces(root_dir: Path | str | None = None) -> tuple[str, ...]:
+    """``04-reconcile.py`` subcommands, read from the source AST (never imported).
+
+    AST, not import, for the usual reason plus one of its own: the outer half is
+    a *script*, not a module, and its filename is not even a legal identifier.
+    """
+    return _add_parser_names(_repo_root(root_dir) / "scripts" / "04-reconcile.py")
+
+
 def enumerate_operator_mcp_surfaces(root_dir: Path | str | None = None) -> tuple[str, ...]:
     """Operator MCP tool names, read from the ``TOOLS`` literal via AST."""
     source = _repo_root(root_dir) / "scripts" / "operator_mcp_server.py"
@@ -1800,11 +2156,14 @@ def enumerate_operator_mcp_surfaces(root_dir: Path | str | None = None) -> tuple
 
 
 _MAKE_TARGET_RE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_.-]*)\s*:(?!=)")
-_MAKE_DELEGATE_RE = re.compile(r"(manage\.py|box\.py|pulse\.py)\s+([a-z][a-z0-9-]*)")
+_MAKE_DELEGATE_RE = re.compile(
+    r"(manage\.py|box\.py|pulse\.py|04-reconcile\.py)\s+([a-z][a-z0-9-]*)"
+)
 _MAKE_ENTRYPOINT_SURFACE = {
     "manage.py": SURFACE_MANAGE,
     "box.py": SURFACE_BOX,
     "pulse.py": SURFACE_PULSE,
+    "04-reconcile.py": SURFACE_RECONCILE,
 }
 
 
@@ -1840,6 +2199,7 @@ def enumerate_live_surfaces(root_dir: Path | str | None = None) -> dict[str, tup
         SURFACE_BOX: enumerate_box_surfaces(root_dir),
         SURFACE_OPERATOR_MCP: enumerate_operator_mcp_surfaces(root_dir),
         SURFACE_MAKE: enumerate_make_surfaces(root_dir),
+        SURFACE_RECONCILE: enumerate_reconcile_surfaces(root_dir),
     }
 
 
