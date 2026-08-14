@@ -65,6 +65,25 @@ class SbpWrapperContractTests(unittest.TestCase):
         self.assertIn("sbp recalibrate --json", payload["error"]["next_actions"])
         self.assertIn("fixes[].command", payload["error"]["next_actions"][1])
 
+    def test_unknown_flags_are_rejected_with_did_you_mean(self) -> None:
+        # R-204: unknown --flags used to fall into the service-token bucket and
+        # get silently swallowed (`status --jsonn` ran in text mode, exit 0).
+        result = _run_sbp("status", "--jsonn")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("unknown flag --jsonn", result.stderr)
+        self.assertIn("did you mean --json?", result.stderr)
+        self.assertIn("sbp status --json", result.stderr)
+
+        short_typo = _run_sbp("capabilities", "--jsn")
+        self.assertEqual(short_typo.returncode, 2)
+        self.assertIn("did you mean --json?", short_typo.stderr)
+
+        no_guess = _run_sbp("status", "--zzqx")
+        self.assertEqual(no_guess.returncode, 2)
+        self.assertIn("unknown flag --zzqx", no_guess.stderr)
+        self.assertIn("sbp help", no_guess.stderr)
+
     def test_legacy_sync_requires_preview_or_explicit_apply(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             source = _make_skill_source(Path(tmpdir))

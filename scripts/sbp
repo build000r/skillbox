@@ -1158,6 +1158,45 @@ if [[ "${action}" != "mmdx" && "${action}" != "swimmers-launch" && "${action}" !
   esac
 fi
 
+reject_unknown_flag() {
+  # A --flag that reached the positional/service bucket is never valid input —
+  # swallowing it silently (e.g. `status --jsonn` running in text mode) is the
+  # worst outcome for an agent. Reject loudly with a did-you-mean.
+  local token="$1"
+  local known_flags=(--json --dry-run --force --yes --full --issues-only \
+    --no-global --no-project --show-sources --show-shadowed --no-open \
+    --tmux --tmux-submit --format --wait-seconds --mode --lines --limit \
+    --only --root --depth --live --no-live --human --keep --cached --delta \
+    --auto-fix --verify)
+  local stem="${token#--}"
+  local suggestion=""
+  local candidate=""
+  for candidate in "${known_flags[@]}"; do
+    case "${candidate}" in
+      "--${stem:0:3}"*)
+        suggestion="${candidate}"
+        break
+        ;;
+    esac
+  done
+  if [[ -z "${suggestion}" && ${#stem} -ge 2 ]]; then
+    for candidate in "${known_flags[@]}"; do
+      case "${candidate}" in
+        "--${stem:0:2}"*)
+          suggestion="${candidate}"
+          break
+          ;;
+      esac
+    done
+  fi
+  echo "${wrapper_name}: unknown flag ${token} for '${action}'" >&2
+  if [[ -n "${suggestion}" ]]; then
+    echo "did you mean ${suggestion}? Exact command: ${wrapper_name} ${action} ${suggestion}" >&2
+  fi
+  echo "full flag reference: ${wrapper_name} help" >&2
+  exit 2
+}
+
 append_passthrough_token() {
   local token="$1"
   case "${action}" in
@@ -1169,6 +1208,9 @@ append_passthrough_token() {
         --yes)
           sync_yes="true"
           ;;
+        --*)
+          reject_unknown_flag "${token}"
+          ;;
         *)
           sync_paths+=("${token}")
           ;;
@@ -1178,6 +1220,11 @@ append_passthrough_token() {
       passthrough_args+=("${token}")
       ;;
     *)
+      case "${token}" in
+        --*)
+          reject_unknown_flag "${token}"
+          ;;
+      esac
       services+=("${token}")
       ;;
   esac
