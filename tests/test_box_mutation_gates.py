@@ -111,6 +111,38 @@ class MutationGateTests(unittest.TestCase):
         dirty_probe.assert_not_called()
 
 
+class ContractDriftTests(unittest.TestCase):
+    """R-211: every registered subparser must be declared in BOX_COMMAND_NAMES.
+
+    posture-proof was a ghost surface — a working subcommand absent from the
+    contract, so capabilities/robot-docs never advertised it and the --json
+    argv alias was rejected for it (F-box-03).
+    """
+
+    def test_parser_and_contract_agree(self) -> None:
+        import re
+        import subprocess
+
+        help_text = subprocess.run(
+            [sys.executable, str(BOX_SCRIPT), "--help"],
+            capture_output=True, text=True, check=False,
+        ).stdout
+        match = re.search(r"\{([a-z0-9,\-]+)\}", help_text)
+        assert match, help_text[:300]
+        registered = set(match.group(1).split(","))
+        self.assertEqual(
+            registered, BOX.BOX_COMMAND_NAMES,
+            "argparse subcommands and BOX_COMMAND_NAMES drifted — a new verb "
+            "must be added to the machine contract (capabilities/robot-docs).",
+        )
+
+    def test_status_no_probe_returns_inventory_state(self) -> None:
+        box = BOX.Box(id="fast", profile="dev-small", state="ready")
+        status = BOX.box_health(box, probe=False)
+        self.assertTrue(status["probes_skipped"])
+        self.assertFalse(status["ssh_reachable"])
+
+
 class FailClosedDefaultTests(unittest.TestCase):
     def test_cmd_down_default_is_unconfirmed(self) -> None:
         self.assertIs(inspect.signature(BOX.cmd_down).parameters["confirmed"].default, False)

@@ -697,7 +697,7 @@ class BoxRefactorTests(unittest.TestCase):
         lock = threading.Lock()
         all_started = threading.Event()
 
-        def health(box: object) -> dict[str, object]:
+        def health(box: object, *, probe: bool = True) -> dict[str, object]:
             with lock:
                 started.append(box.id)
                 if len(started) == len(boxes):

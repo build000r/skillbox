@@ -106,6 +106,7 @@ BOX_COMMAND_NAMES = {
     "inventory-rebuild",
     "list",
     "place",
+    "posture-proof",
     "profiles",
     "register",
     "robot-docs",
@@ -508,6 +509,7 @@ def _box_agent_command(name: str) -> dict[str, Any]:
         "inventory-rebuild": "python3 scripts/box.py status <box-id> --history --format json",
         "list": "python3 scripts/box.py list --format json",
         "place": "python3 scripts/box.py place --need os:linux --format json",
+        "posture-proof": "python3 scripts/box.py posture-proof <box-id> --format json",
         "profiles": "python3 scripts/box.py profiles --format json",
         "register": "python3 scripts/box.py profiles --format json",
         "robot-docs": "python3 scripts/box.py robot-docs guide",
@@ -4855,7 +4857,7 @@ def cmd_inventory_rebuild(*, from_journal: bool, fmt: str) -> int:
 # box status
 # ---------------------------------------------------------------------------
 
-def cmd_status(box_id: str | None, *, fmt: str, write_cache: bool = False, history: bool = False) -> int:
+def cmd_status(box_id: str | None, *, fmt: str, write_cache: bool = False, history: bool = False, probe: bool = True) -> int:
     is_json = fmt == "json"
     boxes = load_inventory()
     ssh_target_snapshot = inventory_ssh_target_snapshot(boxes)
@@ -4878,7 +4880,7 @@ def cmd_status(box_id: str | None, *, fmt: str, write_cache: bool = False, histo
                 print(msg, file=sys.stderr)
             return EXIT_ERROR
 
-        status = box_health(box)
+        status = box_health(box, probe=probe)
         if history:
             status["history"] = read_inventory_journal(box.id)
         cache_written = persist_inventory_if_ssh_targets_changed(
@@ -4902,7 +4904,7 @@ def cmd_status(box_id: str | None, *, fmt: str, write_cache: bool = False, histo
         if active_boxes:
             max_workers = min(5, len(active_boxes))
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                statuses = list(executor.map(box_health, active_boxes))
+                statuses = list(executor.map(lambda box: box_health(box, probe=probe), active_boxes))
         else:
             statuses = []
         payload: dict[str, Any] = {
@@ -4932,7 +4934,7 @@ def cmd_status(box_id: str | None, *, fmt: str, write_cache: bool = False, histo
         return EXIT_OK
 
 
-def box_health(box: Box) -> dict[str, Any]:
+def box_health(box: Box, *, probe: bool = True) -> dict[str, Any]:
     phone_url = browser_url_for(box.tailscale_ip)
     status: dict[str, Any] = {
         "id": box.id,
@@ -4961,6 +4963,13 @@ def box_health(box: Box) -> dict[str, Any]:
         "network_checks": {},
         "remote_probes": {},
     }
+
+    if not probe:
+        # Inventory-only fast path (status --no-probe): no SSH, tailnet, or
+        # container probes. All-box status with unreachable boxes otherwise
+        # spends up to tens of seconds producing zero bytes.
+        status["probes_skipped"] = True
+        return status
 
     if box.state in ("destroyed", "creating"):
         return status
@@ -5534,6 +5543,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Opt in to updating cached last_ssh_target values in workspace/boxes.json after probes.",
     )
     status_parser.add_argument("--history", action="store_true", help="Show append-only transition history for one box.")
+    status_parser.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="Skip SSH/tailnet/container probes; return inventory-derived state immediately.",
+    )
     status_parser.add_argument("--format", choices=("text", "json"), default="text")
 
     rebuild_parser = subparsers.add_parser("inventory-rebuild", help="Rebuild boxes.json from the append-only transition journal.")
@@ -5726,7 +5740,13 @@ def main(argv: list[str] | None = None) -> int:
                 clear_cli_dryrun_marker("operator_upgrade", args.box_id)
             return result
         if args.command == "status":
-            return cmd_status(args.box_id, fmt=args.format, write_cache=args.write_cache, history=args.history)
+            return cmd_status(
+                args.box_id,
+                fmt=args.format,
+                write_cache=args.write_cache,
+                history=args.history,
+                probe=not args.no_probe,
+            )
         if args.command == "inventory-rebuild":
             return cmd_inventory_rebuild(from_journal=args.from_journal, fmt=args.format)
         if args.command == "posture-proof":
