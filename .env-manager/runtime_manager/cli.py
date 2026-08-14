@@ -4222,6 +4222,18 @@ def _handle_render(args: argparse.Namespace, root_dir: Path, model: dict[str, An
     return EXIT_OK
 
 
+# Runtime-verb success envelope (pass-2 ergonomics R-207 / F-man-02): the five
+# runtime verbs' success payloads carry ok + schema_version like the brain
+# verbs do, so agents can gate on ok uniformly instead of special-casing.
+RUNTIME_VERB_SCHEMA_VERSION = "2026-08-14+runtime_verbs"
+
+
+def _stamp_runtime_envelope(payload: dict[str, Any], *, ok: bool = True) -> dict[str, Any]:
+    payload.setdefault("ok", ok)
+    payload.setdefault("schema_version", RUNTIME_VERB_SCHEMA_VERSION)
+    return payload
+
+
 def _handle_sync(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     # `.actions` is a list of OBJECTS (id/action/kind/text/...), never strings:
     # machine consumers assert on `.id`, display consumers read `.text`.
@@ -4239,7 +4251,7 @@ def _handle_sync(args: argparse.Namespace, root_dir: Path, model: dict[str, Any]
         )
     )
     if args.format == "json":
-        emit_json({"actions": records, "dry_run": args.dry_run, "next_actions": next_actions_for_sync()})
+        emit_json(_stamp_runtime_envelope({"actions": records, "dry_run": args.dry_run, "next_actions": next_actions_for_sync()}))
     else:
         print("\n".join(action_texts(records)))
     return EXIT_OK
@@ -4274,10 +4286,10 @@ def _handle_doctor(args: argparse.Namespace, root_dir: Path, model: dict[str, An
     results = doctor_results(model, root_dir)
     has_fail = any(result.status == "fail" for result in results)
     if args.format == "json":
-        emit_json({
+        emit_json(_stamp_runtime_envelope({
             "checks": [asdict(result) for result in results],
             "next_actions": next_actions_for_doctor(results),
-        })
+        }, ok=not has_fail))
     else:
         print_doctor_text(results)
     if has_fail:
@@ -4289,7 +4301,7 @@ def _handle_status(args: argparse.Namespace, root_dir: Path, model: dict[str, An
     status_payload = runtime_status(model)
     if args.format == "json":
         status_payload["next_actions"] = next_actions_for_status(status_payload)
-        emit_json(compact_runtime_status(status_payload) if args.compact else status_payload)
+        emit_json(_stamp_runtime_envelope(compact_runtime_status(status_payload) if args.compact else status_payload))
     else:
         print_status_text(status_payload)
     return EXIT_OK
@@ -4312,7 +4324,7 @@ def _handle_skills(args: argparse.Namespace, root_dir: Path, model: dict[str, An
         evidence_provider=evidence_provider,
     )
     if args.format == "json":
-        emit_json(payload if args.full else compact_skill_visibility_payload(payload))
+        emit_json(_stamp_runtime_envelope(payload if args.full else compact_skill_visibility_payload(payload)))
     else:
         print_skill_visibility_text(
             payload,
@@ -7446,7 +7458,7 @@ def _handle_logs(args: argparse.Namespace, root_dir: Path, model: dict[str, Any]
         "next_actions": ["status --format json"],
     }
     if args.format == "json":
-        emit_json(logs_payload)
+        emit_json(_stamp_runtime_envelope(logs_payload))
     else:
         print_service_logs_text(logs_payload)
     return EXIT_OK

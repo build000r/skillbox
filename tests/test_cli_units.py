@@ -1602,7 +1602,10 @@ except RuntimeError as exc:
             mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
         ):
             self.assertEqual(CLI._handle_status(_ns(format="json", compact=True), root, model, "reuse"), CLI.EXIT_OK)
-        self.assertEqual(emitted[-1], {"compact": True})
+        self.assertEqual(
+            emitted[-1],
+            {"compact": True, "ok": True, "schema_version": CLI.RUNTIME_VERB_SCHEMA_VERSION},
+        )
 
         skill_payload = {"summary": {"ok": True}}
         with (
@@ -1629,7 +1632,10 @@ except RuntimeError as exc:
                 ),
                 CLI.EXIT_OK,
             )
-        self.assertEqual(emitted[-1], {"compact": True})
+        self.assertEqual(
+            emitted[-1],
+            {"compact": True, "ok": True, "schema_version": CLI.RUNTIME_VERB_SCHEMA_VERSION},
+        )
 
         with (
             mock.patch.object(CLI, "collect_mcp_audit", return_value={"summary": {"ok": True}}),
