@@ -49,7 +49,7 @@
       "completed_at": "2026-08-14T17:21:09Z",
       "mode": "full",
       "target_sha": "3b41382ca52aaa257a4f6ecb24b3ec2e49778575",
-      "end_sha": "4996a30f8a5fd0f1437f9d6ac9ab4cc3c3982b88",
+      "end_sha": "1787393",
       "target_branch": "main",
       "feature_branch": null,
       "summary": {
@@ -62,13 +62,14 @@
         "recommendations_applied": 10,
         "recommendations_deferred_to_beads": 1,
         "extra_user_requested_changes": 1,
-        "substantive_commits": 11,
+        "substantive_commits": 12,
         "dimensions_touched": 8,
         "p0_findings": 1,
         "p0_fixed": 1,
         "ambition_bar_met": true,
         "ambition_bar_self_prompt_run": false,
-        "fresh_eyes_rounds": "in-flight at manifest write; result recorded in HANDOFF/scorecard"
+        "fresh_eyes_rounds": 2,
+        "fresh_eyes_round1_verdict": "NEEDS-FIXES (2 P1, 6 P2; all fixed in 1787393)"
       },
       "artifacts": {
         "partials": "audit/partial/pass2/",

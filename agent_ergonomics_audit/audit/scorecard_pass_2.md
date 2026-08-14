@@ -45,3 +45,20 @@ error pedagogy. Details: `audit/applied_changes.jsonl`.
 - intent_inference/error_pedagogy: silent flag swallow eliminated; robot-docs topics validated; repo/send-later errors teach
 - regression_resistance: +4 new test files/gates (smoke, mutation gates, drift, help-atlas equality)
 - self_documentation: capabilities complete + role block; doctor routing discoverable; help single-sourced
+
+## Fresh-eyes (Phase 7)
+
+Round 1 (adversarial, fresh-context reviewer over a290d80..4996a30): verdict
+NEEDS-FIXES — 2 P1 (misdirecting did-you-mean on known flags; runtime envelope
+undocumented + drift gate structurally blind to emit-time stamping), 6 P2
+(doctor pointer ordering, upgrade marker not manifest-bound, test markers in
+the real store, missing argv-level gate tests, state-root priority, docstring
+overclaim + ungated up). Clean classes explicitly verified: unknown-flag
+rejection (10 legit probes), help refactor under sbo/symlink/bash-3.2,
+marker-store byte-interop both directions, clear-on-success semantics,
+stdout/stderr discipline, no tautological tests.
+
+All 8 findings fixed in commit 1787393 (up now gated behind operator_provision
+for full MCP parity). Round 2: scoped self-review of the fix diff + full
+verification sweep (265 tests across box/sbp/doctor/schema suites) — clean.
+Note: round 2 was a scoped diff review, not a second full adversarial round.
