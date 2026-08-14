@@ -4,8 +4,7 @@ Every `commands[].safe_first_try` in `sbp capabilities --json` that contains no
 <placeholder> is executed for real. The contract asserted per command:
 
 - exit code is 0 (success) or 1 (findings/no-go) — never a usage error;
-- when the invocation requests JSON, stdout parses as JSON;
-- stdout is empty on non-{0,1} exits (errors belong on stderr).
+- when the invocation requests JSON, stdout parses as JSON.
 
 Known-broken or host-dependent entries are skipped VISIBLY with a reason (and
 a bead id where one exists) — a skip here is a tracked debt, not a pass.

@@ -947,7 +947,10 @@ class BoxRefactorTests(unittest.TestCase):
         for argv, handler_name in dispatch_cases:
             with self.subTest(command=argv[0]):
                 emit_json = mock.Mock()
-                with mock.patch.object(sys, "argv", ["box.py", *argv]), \
+                # Dispatch-only test: the CLI mutation gate has its own suite
+                # (tests/test_box_mutation_gates.py); skip it here.
+                with mock.patch.dict(os.environ, {"SKILLBOX_CLI_MUTATION_GATE": "skip"}), \
+                    mock.patch.object(sys, "argv", ["box.py", *argv]), \
                     mock.patch.object(BOX, "load_dotenv"), \
                     mock.patch.object(BOX, "emit_json", emit_json), \
                     mock.patch.object(BOX, "cmd_up", return_value=11), \

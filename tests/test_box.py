@@ -663,6 +663,9 @@ class BoxTests(unittest.TestCase):
                 "archive_sha256": archive_sha256,
             }), encoding="utf-8")
             env = self._env_with_inventory(tmpdir)
+            # Real (non-dry-run) up sits behind the CLI mutation gate; this
+            # test exercises the credential check past it.
+            env["SKILLBOX_CLI_MUTATION_GATE"] = "skip"
 
             result = self._run(
                 "up", "no-token", "--profile", "dev-small", "--deploy-manifest", str(manifest_path), "--format", "json",
@@ -713,6 +716,7 @@ class BoxTests(unittest.TestCase):
                 ],
             }))
             env = self._env_with_inventory(tmpdir)
+            env["SKILLBOX_CLI_MUTATION_GATE"] = "skip"  # tests conflict detection past the gate
             env.update({
                 "SKILLBOX_DO_TOKEN": "fake-token",
                 "SKILLBOX_DO_SSH_KEY_ID": "12345",
@@ -1078,6 +1082,9 @@ class BoxTests(unittest.TestCase):
             "HOME": os.environ.get("HOME", ""),
             "SKILLBOX_BOX_INVENTORY": str(inv_path),
             "SKILLBOX_STATE_ROOT": str(state_root),
+            # Keep test-stamped dry-run markers out of the real repo's
+            # interop marker store (.skillbox-state/dryrun-markers).
+            "SKILLBOX_DRYRUN_MARKER_ROOT": str(state_root),
             "SKILLBOX_DO_TOKEN": "",
             "SKILLBOX_DO_SSH_KEY_ID": "",
             "SKILLBOX_TS_AUTHKEY": "",

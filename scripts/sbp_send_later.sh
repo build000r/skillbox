@@ -6,10 +6,11 @@ set -euo pipefail
 # its root filesystem is read-only, so the old hard-coded default crashed
 # every send-later verb, including doctor, before it could diagnose anything).
 default_state_root() {
-  if [[ -d /srv/skillbox ]]; then
-    echo "/srv/skillbox/state"
-  elif [[ -n "${SKILLBOX_STATE_ROOT:-}" ]]; then
+  # An explicitly-set env override always wins over host-shape probes.
+  if [[ -n "${SKILLBOX_STATE_ROOT:-}" ]]; then
     echo "${SKILLBOX_STATE_ROOT}"
+  elif [[ -d /srv/skillbox ]]; then
+    echo "/srv/skillbox/state"
   else
     echo "${SKILLBOX_ROOT:-${PWD}}/.skillbox-state"
   fi

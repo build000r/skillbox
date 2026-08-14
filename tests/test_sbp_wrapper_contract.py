@@ -100,7 +100,20 @@ class SbpWrapperContractTests(unittest.TestCase):
         no_guess = _run_sbp("status", "--zzqx")
         self.assertEqual(no_guess.returncode, 2)
         self.assertIn("unknown flag --zzqx", no_guess.stderr)
+        self.assertNotIn("did you mean", no_guess.stderr)
         self.assertIn("sbp help", no_guess.stderr)
+
+        # Fresh-eyes P1: a KNOWN flag in an unsupported position must teach the
+        # supported form, never misdirect (`--format` used to suggest --force).
+        known_flag = _run_sbp("status", "--format", "text")
+        self.assertEqual(known_flag.returncode, 2)
+        self.assertNotIn("--force", known_flag.stderr)
+        self.assertIn("only '--format json' is supported", known_flag.stderr)
+        self.assertIn("sbp status --json", known_flag.stderr)
+
+        equals_form = _run_sbp("status", "--format=json")
+        self.assertEqual(equals_form.returncode, 0, equals_form.stderr)
+        json.loads(equals_form.stdout)
 
     def test_send_later_json_surfaces_work_from_any_host(self) -> None:
         # R-205: STATE_DIR was hard-coded to /srv/skillbox, so every send-later

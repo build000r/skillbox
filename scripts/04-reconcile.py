@@ -1682,17 +1682,19 @@ def print_doctor_text(results: list[CheckResult]) -> None:
         "fail": sum(1 for item in results if item.status == "fail"),
     }
     print()
+    # Doctor-family routing: this doctor covers manifest/compose/skill-sync
+    # drift only. The superset front door (structural gates + this doctor via
+    # its runtime_doctor gate) is `sbp doctor`; its JSON carries the full
+    # sibling-doctor routing table in a `coverage` field. Printed BEFORE the
+    # summary so the summary stays the last meaningful line — sbp doctor's
+    # runtime_doctor gate reports exactly that line.
+    print("structural gates not checked here — front door: sbp doctor --format json")
     print(
         "summary: "
         f"{counts['pass']} passed, "
         f"{counts['warn']} warnings, "
         f"{counts['fail']} failed"
     )
-    # Doctor-family routing: this doctor covers manifest/compose/skill-sync
-    # drift only. The superset front door (structural gates + this doctor via
-    # its runtime_doctor gate) is `sbp doctor`; its JSON carries the full
-    # sibling-doctor routing table in a `coverage` field.
-    print("structural gates not checked here — front door: sbp doctor --format json")
 
 
 def doctor_results(skip_compose: bool, skip_skill_sync: bool) -> list[CheckResult]:

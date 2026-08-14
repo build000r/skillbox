@@ -4089,7 +4089,28 @@ def _cli_marker_ttl_seconds() -> int:
 
 def _cli_dryrun_marker_path(tool_name: str, key: str) -> Path:
     # Same directory + filename shape as operator_mcp_server so markers interop.
-    return REPO_ROOT / ".skillbox-state" / "dryrun-markers" / f".skillbox-dryrun-{tool_name}-{key}"
+    # SKILLBOX_DRYRUN_MARKER_ROOT is a TEST/break-glass override only — setting
+    # it forfeits interop with the MCP's store, which is fixed at the repo root.
+    override = os.environ.get("SKILLBOX_DRYRUN_MARKER_ROOT", "").strip()
+    base = Path(override) if override else REPO_ROOT / ".skillbox-state"
+    return base / "dryrun-markers" / f".skillbox-dryrun-{tool_name}-{key}"
+
+
+def _upgrade_marker_key(box_id: str, deploy_manifest: str) -> str:
+    """Bind the upgrade marker to box + the EXACT manifest previewed.
+
+    A dry-run with manifest A must not authorize a real run with manifest B
+    (mirrors the MCP box_exec key, which folds a command hash into the key).
+    Content is hashed when readable so an edited manifest also invalidates.
+    """
+    digest = hashlib.sha256()
+    resolved = str(Path(deploy_manifest).expanduser().resolve())
+    digest.update(resolved.encode("utf-8"))
+    try:
+        digest.update(Path(resolved).read_bytes())
+    except OSError:
+        pass
+    return f"{box_id}.{digest.hexdigest()[:16]}"
 
 
 def stamp_cli_dryrun_marker(tool_name: str, key: str) -> None:
@@ -4143,7 +4164,7 @@ def _repo_tree_dirty() -> str:
     return f"{len(lines)} uncommitted path(s), e.g. {lines[0].strip()}"
 
 
-def cli_mutation_gate(tool_name: str, box_id: str, *, fmt: str, command_hint: str) -> int | None:
+def cli_mutation_gate(tool_name: str, box_id: str, *, fmt: str, command_hint: str, display: str | None = None) -> int | None:
     """Shared pre-mutation gate for real (non-dry-run) destructive verbs.
 
     Returns None when the mutation may proceed, or an exit code after emitting
@@ -4174,8 +4195,9 @@ def cli_mutation_gate(tool_name: str, box_id: str, *, fmt: str, command_hint: st
         )
     if not cli_dryrun_marker_valid(tool_name, box_id):
         ttl_minutes = _cli_marker_ttl_seconds() // 60
+        subject = display if display is not None else box_id
         return emit_error_or_print(
-            f"Refusing real {tool_name} for {box_id!r}: no fresh dry-run preview. "
+            f"Refusing real {tool_name} for {subject!r}: no fresh dry-run preview. "
             f"Preview first, then re-run the identical command within {ttl_minutes} minutes.",
             is_json=is_json,
             error_type="dryrun_marker_required",
@@ -5683,7 +5705,21 @@ def main(argv: list[str] | None = None) -> int:
             emit_json(box_robot_triage_payload())
             return EXIT_OK
         if args.command == "up":
-            return cmd_up(
+            if not args.dry_run:
+                # Parity with MCP operator_provision: real provisioning (spends
+                # money, enrolls tailnet) requires a fresh dry-run preview.
+                refused = cli_mutation_gate(
+                    "operator_provision",
+                    args.box_id,
+                    fmt=args.format,
+                    command_hint=(
+                        f"python3 scripts/box.py up {args.box_id} "
+                        f"--profile {args.profile} --dry-run --format json"
+                    ),
+                )
+                if refused is not None:
+                    return refused
+            result = cmd_up(
                 args.box_id,
                 profile_name=args.profile,
                 blueprint=args.blueprint,
@@ -5693,6 +5729,11 @@ def main(argv: list[str] | None = None) -> int:
                 dry_run=args.dry_run,
                 fmt=args.format,
             )
+            if args.dry_run and result == EXIT_OK:
+                stamp_cli_dryrun_marker("operator_provision", args.box_id)
+            elif not args.dry_run and result == EXIT_OK:
+                clear_cli_dryrun_marker("operator_provision", args.box_id)
+            return result
         if args.command == "down":
             if not args.dry_run and down_confirmed:
                 refused = cli_mutation_gate(
@@ -5716,10 +5757,12 @@ def main(argv: list[str] | None = None) -> int:
                 clear_cli_dryrun_marker("operator_teardown", args.box_id)
             return result
         if args.command == "upgrade":
+            upgrade_key = _upgrade_marker_key(args.box_id, args.deploy_manifest)
             if not args.dry_run:
                 refused = cli_mutation_gate(
                     "operator_upgrade",
-                    args.box_id,
+                    upgrade_key,
+                    display=args.box_id,
                     fmt=args.format,
                     command_hint=(
                         f"python3 scripts/box.py upgrade {args.box_id} "
@@ -5735,9 +5778,9 @@ def main(argv: list[str] | None = None) -> int:
                 fmt=args.format,
             )
             if args.dry_run and result == EXIT_OK:
-                stamp_cli_dryrun_marker("operator_upgrade", args.box_id)
+                stamp_cli_dryrun_marker("operator_upgrade", upgrade_key)
             elif not args.dry_run and result == EXIT_OK:
-                clear_cli_dryrun_marker("operator_upgrade", args.box_id)
+                clear_cli_dryrun_marker("operator_upgrade", upgrade_key)
             return result
         if args.command == "status":
             return cmd_status(

@@ -540,6 +540,8 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
 | `source_roots` | info | Discovered skill source roots (only when --show-sources). |
 | `undefined_sources` | info | Linkable sources with no policy occurrence (only when --show-sources). |
 | `next_actions` | info | Ordered, copy-pasteable next commands for a human/agent. |
+| `ok` | CONTRACT | True on success; runtime-verb envelope stamped at emit time (see RUNTIME_VERB_SCHEMA_VERSION). |
+| `schema_version` | CONTRACT | Runtime-verb envelope version; stamped at emit time alongside ok. |
 
 ### Example payload
 
@@ -643,6 +645,7 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
   "next_actions": [
     "add missing cwd-scoped skills to the active client or project skill-repos.yaml"
   ],
+  "ok": true,
   "parity": {},
   "policy": {
     "files": [
@@ -684,6 +687,7 @@ The conflict-aware skill availability view for the current cwd. `sbp skills` emi
       "target": "project_or_client_skill_repos"
     }
   ],
+  "schema_version": "2026-08-14+runtime_verbs",
   "source_roots": [],
   "summary": {
     "archive_source_skills": 0,
@@ -780,6 +784,8 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
 | `recommendations` | info | Ranked human-facing remediation suggestions. |
 | `summary` | CONTRACT | Roll-up counters; keys are stable, add-only. Branch on these first. |
 | `next_actions` | info | Ordered, copy-pasteable next commands for a human/agent. |
+| `ok` | CONTRACT | True on success; runtime-verb envelope stamped at emit time (see RUNTIME_VERB_SCHEMA_VERSION). |
+| `schema_version` | CONTRACT | Runtime-verb envelope version; stamped at emit time alongside ok. |
 
 ### Example payload
 
@@ -997,6 +1003,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
       "state": "disabled"
     }
   ],
+  "ok": true,
   "overlay_audit": {
     "active": [
       "marketing"
@@ -1050,6 +1057,7 @@ The exploratory source-inventory surface. Same payload as `sbp skills --full` wi
     ]
   },
   "recommendations": [],
+  "schema_version": "2026-08-14+runtime_verbs",
   "source_roots": [
     {
       "id": "source:/private<FLEET>/private-skills",

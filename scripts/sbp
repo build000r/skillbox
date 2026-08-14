@@ -1058,32 +1058,49 @@ fi
 reject_unknown_flag() {
   # A --flag that reached the positional/service bucket is never valid input —
   # swallowing it silently (e.g. `status --jsonn` running in text mode) is the
-  # worst outcome for an agent. Reject loudly with a did-you-mean.
+  # worst outcome for an agent. Reject loudly with a did-you-mean. A KNOWN
+  # flag landing here (e.g. `--format text` on a runtime verb) gets a
+  # value/context message instead of a wrong suggestion, and suggestions use
+  # longest-prefix match so `--format` never suggests `--force`.
   local token="$1"
+  local base="${token%%=*}"
+  local stem="${base#--}"
   local known_flags=(--json --dry-run --force --yes --full --issues-only \
     --no-global --no-project --show-sources --show-shadowed --no-open \
     --tmux --tmux-submit --format --wait-seconds --mode --lines --limit \
     --only --root --depth --live --no-live --human --keep --cached --delta \
     --auto-fix --verify)
-  local stem="${token#--}"
   local suggestion=""
   local candidate=""
   for candidate in "${known_flags[@]}"; do
-    case "${candidate}" in
-      "--${stem:0:3}"*)
-        suggestion="${candidate}"
-        break
-        ;;
-    esac
-  done
-  if [[ -z "${suggestion}" && ${#stem} -ge 2 ]]; then
-    for candidate in "${known_flags[@]}"; do
-      case "${candidate}" in
-        "--${stem:0:2}"*)
-          suggestion="${candidate}"
-          break
+    if [[ "${candidate}" == "${base}" ]]; then
+      echo "${wrapper_name}: ${token} is not supported here for '${action}'" >&2
+      case "${base}" in
+        --format)
+          echo "only '--format json' is supported (text is the default). Exact command: ${wrapper_name} ${action} --json" >&2
+          ;;
+        --json)
+          echo "write it bare. Exact command: ${wrapper_name} ${action} --json" >&2
           ;;
       esac
+      echo "full flag reference: ${wrapper_name} help" >&2
+      exit 2
+    fi
+  done
+  if [[ -n "${stem}" ]]; then
+    local plen
+    for plen in 4 3 2; do
+      if [[ ${#stem} -lt ${plen} ]]; then
+        continue
+      fi
+      for candidate in "${known_flags[@]}"; do
+        case "${candidate}" in
+          "--${stem:0:${plen}}"*)
+            suggestion="${candidate}"
+            break 2
+            ;;
+        esac
+      done
     done
   fi
   echo "${wrapper_name}: unknown flag ${token} for '${action}'" >&2
@@ -1344,6 +1361,9 @@ while [[ $# -gt 0 ]]; do
         continue
       fi
       append_input_token "$1"
+      ;;
+    --format=json)
+      append_json_flag "--json"
       ;;
     --wait-seconds|--mode|--lines|--limit|--only|--root|--depth)
       if [[ $# -lt 2 ]]; then

@@ -143,6 +143,82 @@ class ContractDriftTests(unittest.TestCase):
         self.assertFalse(status["ssh_reachable"])
 
 
+class UpgradeMarkerKeyTests(unittest.TestCase):
+    def test_key_binds_box_and_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest_a = Path(tmpdir) / "a.json"
+            manifest_b = Path(tmpdir) / "b.json"
+            manifest_a.write_text('{"v":1}')
+            manifest_b.write_text('{"v":2}')
+            key_a = BOX._upgrade_marker_key("demo", str(manifest_a))
+            self.assertEqual(key_a, BOX._upgrade_marker_key("demo", str(manifest_a)))
+            # Different manifest, different box, or edited content → new key.
+            self.assertNotEqual(key_a, BOX._upgrade_marker_key("demo", str(manifest_b)))
+            self.assertNotEqual(key_a, BOX._upgrade_marker_key("other", str(manifest_a)))
+            manifest_a.write_text('{"v":1,"edited":true}')
+            self.assertNotEqual(key_a, BOX._upgrade_marker_key("demo", str(manifest_a)))
+
+
+class DispatchGateWiringTests(unittest.TestCase):
+    """Drive the gates through real argv (fresh-eyes P2: the unit tests alone
+    didn't pin main()'s wiring)."""
+
+    def _env(self, tmpdir: str) -> dict[str, str]:
+        state_root = Path(tmpdir) / ".skillbox-state"
+        state_root.mkdir(parents=True, exist_ok=True)
+        inv = state_root / "inventory" / "boxes.json"
+        inv.parent.mkdir(parents=True, exist_ok=True)
+        inv.write_text(json.dumps({"boxes": [
+            {"id": "gatebox", "profile": "dev-small", "state": "ready",
+             "droplet_id": "1", "droplet_ip": "10.0.0.9",
+             "tailscale_hostname": "skillbox-gatebox", "tailscale_ip": "100.100.0.9",
+             "ssh_user": "skillbox", "created_at": "", "updated_at": "",
+             "region": "nyc3", "size": "s-2vcpu-4gb"},
+        ]}))
+        return {
+            **os.environ,
+            "SKILLBOX_BOX_INVENTORY": str(inv),
+            "SKILLBOX_STATE_ROOT": str(state_root),
+            "SKILLBOX_DRYRUN_MARKER_ROOT": str(state_root),
+            "SKILLBOX_DO_TOKEN": "",
+        }
+
+    def _run(self, env: dict[str, str], *args: str):
+        import subprocess
+
+        return subprocess.run(
+            [sys.executable, str(BOX_SCRIPT), *args],
+            capture_output=True, text=True, check=False, env=env,
+        )
+
+    def test_real_down_via_argv_is_gated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._env(tmpdir)
+            result = self._run(env, "down", "gatebox", "--yes", "--format", "json")
+            self.assertNotEqual(result.returncode, 0)
+            payload = json.loads(result.stdout)
+            # Either gate refusing proves the dispatch wiring fires; which one
+            # depends on the repo's tree state when the suite runs.
+            self.assertIn(payload["error"]["type"], ("dirty_tree_refused", "dryrun_marker_required"))
+
+    def test_dry_run_down_via_argv_stamps_the_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._env(tmpdir)
+            result = self._run(env, "down", "gatebox", "--dry-run", "--format", "json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            marker = (Path(tmpdir) / ".skillbox-state" / "dryrun-markers"
+                      / ".skillbox-dryrun-operator_teardown-gatebox")
+            self.assertTrue(marker.exists(), "dry-run did not stamp the teardown marker")
+
+    def test_real_up_via_argv_is_gated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._env(tmpdir)
+            result = self._run(env, "up", "newbox", "--profile", "dev-small", "--format", "json")
+            self.assertNotEqual(result.returncode, 0)
+            payload = json.loads(result.stdout)
+            self.assertIn(payload["error"]["type"], ("dirty_tree_refused", "dryrun_marker_required"))
+
+
 class FailClosedDefaultTests(unittest.TestCase):
     def test_cmd_down_default_is_unconfirmed(self) -> None:
         self.assertIs(inspect.signature(BOX.cmd_down).parameters["confirmed"].default, False)

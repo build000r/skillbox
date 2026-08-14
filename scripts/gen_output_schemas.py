@@ -122,6 +122,8 @@ FIELD_NOTES: dict[str, dict[str, tuple[str, str]]] = {
         "do_NOT": (INFO, "Important anti-pattern for this verb."),
     },
     "skills": {
+        "ok": (CONTRACT, "True on success; runtime-verb envelope stamped at emit time (see RUNTIME_VERB_SCHEMA_VERSION)."),
+        "schema_version": (CONTRACT, "Runtime-verb envelope version; stamped at emit time alongside ok."),
         "cwd": (CONTRACT, "Absolute resolved cwd the visibility view was computed for."),
         "active_clients": (CONTRACT, "Client overlays active for this resolution."),
         "active_profiles": (CONTRACT, "Runtime profiles active for this resolution."),
@@ -474,7 +476,8 @@ def example_skills() -> dict[str, Any]:
             fleet.model(), cwd=str(fleet.repo("overlay-repo")),
             include_global=False, include_project=True, include_sources=False,
         )
-        return sv.compact_skill_visibility_payload(payload)
+        # Mirror the CLI emit path: runtime verbs stamp ok + schema_version.
+        return runtime_cli._stamp_runtime_envelope(sv.compact_skill_visibility_payload(payload))
 
     return _fleet_example(run)
 
@@ -500,10 +503,11 @@ def example_candidates() -> dict[str, Any]:
     """`sbp candidates` == `sbp skills --show-sources --full --no-global` at the cli repo."""
 
     def run(fleet: FixtureFleetT, _tmp: str) -> dict[str, Any]:
-        return sv.collect_skill_visibility(
+        # Mirror the CLI emit path: runtime verbs stamp ok + schema_version.
+        return runtime_cli._stamp_runtime_envelope(sv.collect_skill_visibility(
             fleet.model(), cwd=str(fleet.repo("healthy")),
             include_global=False, include_project=True, include_sources=True,
-        )
+        ))
 
     return _fleet_example(run)
 
