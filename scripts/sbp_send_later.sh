@@ -1,8 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STATE_DIR="${SBP_SEND_LATER_STATE_DIR:-/srv/skillbox/state/ntm-send-later}"
-LOG_DIR="${SBP_SEND_LATER_LOG_DIR:-/srv/skillbox/state/logs}"
+# State root resolution: env override > devbox layout (/srv/skillbox) > the
+# repo-local .skillbox-state used on operator machines (macOS has no /srv and
+# its root filesystem is read-only, so the old hard-coded default crashed
+# every send-later verb, including doctor, before it could diagnose anything).
+default_state_root() {
+  if [[ -d /srv/skillbox ]]; then
+    echo "/srv/skillbox/state"
+  elif [[ -n "${SKILLBOX_STATE_ROOT:-}" ]]; then
+    echo "${SKILLBOX_STATE_ROOT}"
+  else
+    echo "${SKILLBOX_ROOT:-${PWD}}/.skillbox-state"
+  fi
+}
+SBP_SEND_LATER_STATE_ROOT="$(default_state_root)"
+STATE_DIR="${SBP_SEND_LATER_STATE_DIR:-${SBP_SEND_LATER_STATE_ROOT}/ntm-send-later}"
+LOG_DIR="${SBP_SEND_LATER_LOG_DIR:-${SBP_SEND_LATER_STATE_ROOT}/logs}"
+
+ensure_state_dirs() {
+  # Fail with pedagogy, not a raw mkdir trace: name the resolved paths and the
+  # exact override that fixes an unwritable location.
+  local err=""
+  if ! err="$(mkdir -p "$STATE_DIR" "$LOG_DIR" 2>&1)"; then
+    echo "ERROR: cannot create send-later state dirs" >&2
+    echo "  state: $STATE_DIR" >&2
+    echo "  logs:  $LOG_DIR" >&2
+    echo "  cause: ${err}" >&2
+    echo "fix: export SBP_SEND_LATER_STATE_DIR=<writable-dir> SBP_SEND_LATER_LOG_DIR=<writable-dir>" >&2
+    exit 2
+  fi
+}
 SBP_BIN="${SBP_SEND_LATER_SBP_BIN:-$(command -v sbp 2>/dev/null || true)}"
 if [[ -z "${SBP_BIN}" ]]; then
   SBP_BIN="/home/skillbox/.local/bin/sbp"
@@ -220,7 +248,7 @@ resolve_deadline_epoch() {
 }
 
 install_cron() {
-  mkdir -p "$STATE_DIR" "$LOG_DIR"
+  ensure_state_dirs
   local tmp
   tmp="$(mktemp)"
   crontab -l 2>/dev/null | grep -v "$CRON_MARKER" > "$tmp" || true
@@ -544,7 +572,7 @@ schedule_job() {
     fi
   fi
 
-  mkdir -p "$STATE_DIR" "$LOG_DIR"
+  ensure_state_dirs
   install_cron >/dev/null
 
   local job
@@ -827,7 +855,7 @@ run_job() {
 }
 
 run_pending() {
-  mkdir -p "$STATE_DIR" "$LOG_DIR"
+  ensure_state_dirs
   local job rc
   shopt -s nullglob
   for job in "$STATE_DIR"/*.env; do
@@ -943,7 +971,7 @@ list_jobs() {
     esac
     shift
   done
-  mkdir -p "$STATE_DIR" "$LOG_DIR"
+  ensure_state_dirs
   local records; records="$(all_job_records)"
 
   if [[ "$json" == "true" ]]; then
@@ -998,7 +1026,7 @@ cmd_doctor() {
     esac
     shift
   done
-  mkdir -p "$STATE_DIR" "$LOG_DIR"
+  ensure_state_dirs
   local now; now="$(date -u +%s)"
 
   # --- cron tick health ---
@@ -1116,7 +1144,7 @@ cmd_gc() {
     esac
     shift
   done
-  mkdir -p "$STATE_DIR"
+  ensure_state_dirs
   shopt -s nullglob
   local f base removed=0
   for f in "$STATE_DIR"/*.log "$STATE_DIR"/*.done "$STATE_DIR"/*.last \
@@ -1167,7 +1195,7 @@ cancel_job() {
     shift
   done
 
-  mkdir -p "$STATE_DIR"
+  ensure_state_dirs
   shopt -s nullglob
 
   # Bulk modes: --all / --match GLOB / --done

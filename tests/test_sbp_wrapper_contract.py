@@ -84,6 +84,36 @@ class SbpWrapperContractTests(unittest.TestCase):
         self.assertIn("unknown flag --zzqx", no_guess.stderr)
         self.assertIn("sbp help", no_guess.stderr)
 
+    def test_send_later_json_surfaces_work_from_any_host(self) -> None:
+        # R-205: STATE_DIR was hard-coded to /srv/skillbox, so every send-later
+        # verb (doctor included) crashed on macOS with a raw mkdir error.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_extra = {
+                "SBP_SEND_LATER_STATE_DIR": str(Path(tmpdir) / "state"),
+                "SBP_SEND_LATER_LOG_DIR": str(Path(tmpdir) / "logs"),
+            }
+            listing = subprocess.run(
+                [str(SBP), "send-later", "list", "--json"],
+                cwd=ROOT_DIR, capture_output=True, text=True, check=False,
+                env={**os.environ, "SKILLBOX_ROOT": str(ROOT_DIR),
+                     "SKILLBOX_INVOKE_CWD": str(ROOT_DIR), **env_extra},
+            )
+            self.assertEqual(listing.returncode, 0, listing.stderr)
+            payload = json.loads(listing.stdout)
+            self.assertIn("jobs", payload)
+
+            unwritable = subprocess.run(
+                [str(SBP), "send-later", "list", "--json"],
+                cwd=ROOT_DIR, capture_output=True, text=True, check=False,
+                env={**os.environ, "SKILLBOX_ROOT": str(ROOT_DIR),
+                     "SKILLBOX_INVOKE_CWD": str(ROOT_DIR),
+                     "SBP_SEND_LATER_STATE_DIR": "/nonexistent-root/state",
+                     "SBP_SEND_LATER_LOG_DIR": "/nonexistent-root/logs"},
+            )
+            self.assertNotEqual(unwritable.returncode, 0)
+            self.assertIn("cannot create send-later state dirs", unwritable.stderr)
+            self.assertIn("SBP_SEND_LATER_STATE_DIR", unwritable.stderr)
+
     def test_legacy_sync_requires_preview_or_explicit_apply(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             source = _make_skill_source(Path(tmpdir))
