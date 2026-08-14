@@ -80,9 +80,10 @@ GRAPH_NODE_KINDS = frozenset(
 MCP_SURFACE_STATUS = "deprecated"
 MCP_DEPRECATION_NOTICE = (
     "The in-box MCP surface is DEPRECATED and FROZEN — no new tools. "
-    "Canonical agent path: python3 .env-manager/manage.py <command> --format json "
-    "(or `sbp <command> --format json`), with `robot-docs guide` for the workflow "
-    "and `capabilities --json` for the machine-readable contract."
+    "Canonical agent path: python3 .env-manager/manage.py <command> --format json, "
+    "with `robot-docs guide` for the workflow and `capabilities --json` for the "
+    "machine-readable contract. The `sbp` wrapper covers only a curated subset of "
+    "commands — run `sbp capabilities --json` to see it, and use manage.py for the rest."
 )
 # Every tool name the live server declares in ``mcp_server.TOOLS``. Frozen: new
 # entries are a contract change, not a routine addition. Kept in sync by
@@ -133,8 +134,10 @@ MCP_FROZEN_TOOLS = frozenset(
         "skillbox_worker_submit",
     }
 )
-# Read-only brain mirrors kept for one more release so orientation still works
-# over MCP while callers migrate. Everything else is frozen and deprecated.
+# Orientation mirrors kept for one more release so agents can still get their
+# bearings over MCP while callers migrate. Five are side-effect free;
+# ``skillbox_snap`` is ``local_write`` (it writes only when asked), so do not
+# describe this cluster as read-only. Everything else is frozen and deprecated.
 MCP_RETAINED_TOOLS = frozenset(
     {
         "skillbox_capabilities",
@@ -1557,12 +1560,12 @@ def mcp_surface_payload(specs: Iterable[CommandSpec] | None = None) -> dict[str,
             "python3 .env-manager/manage.py capabilities --json",
         ],
         "frozen": True,
-        "retained_read_only": sorted(MCP_RETAINED_TOOLS),
+        "retained_orientation": sorted(MCP_RETAINED_TOOLS),
         "declared_tools": declared,
         "counts": {
             "frozen_tools": len(MCP_FROZEN_TOOLS),
             "declared_tools": len(declared),
-            "retained_read_only": len(MCP_RETAINED_TOOLS),
+            "retained_orientation": len(MCP_RETAINED_TOOLS),
         },
     }
 

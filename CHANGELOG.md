@@ -21,7 +21,7 @@ release buckets.
 agent path is the **robot CLI plus skills**:
 
 ```bash
-python3 .env-manager/manage.py <command> --format json   # or: sbp <command> --format json
+python3 .env-manager/manage.py <command> --format json   # every command
 python3 .env-manager/manage.py robot-docs guide          # the workflow
 python3 .env-manager/manage.py capabilities --json       # machine-readable contract
 ```
@@ -33,7 +33,7 @@ migrate.
 Why: the MCP tool list was a lagging subset of `manage.py` and only ever covered
 what someone remembered to mirror, while the CLI already returns structured JSON
 with real exit codes. The parity mirror bought nothing and cost continuous
-maintenance — concretely, the command registry declared an `skillbox_explain_skill`
+maintenance — concretely, the command registry declared a `skillbox_explain_skill`
 tool the server never exposed, and the generated `docs/API_REFERENCE.md`
 published that ghost to agents as a real surface.
 
@@ -46,9 +46,13 @@ What to expect:
 - The deprecation is stamped on the runtime surface: MCP `initialize`
   instructions lead with it, every `tools/list` description carries it, and
   `capabilities --json` reports it under `registry.mcp_surface`.
-- **Retained read-only for one more release** so orientation keeps working
-  mid-migration: `skillbox_capabilities`, `skillbox_next`, `skillbox_graph`,
-  `skillbox_explain`, `skillbox_search`, `skillbox_snap`.
+- **Orientation tools retained for one more release** so agents can still get
+  their bearings mid-migration: `skillbox_capabilities`, `skillbox_next`,
+  `skillbox_graph`, `skillbox_explain`, `skillbox_search`, `skillbox_snap`. The
+  first five are side-effect free; `skillbox_snap` writes only when asked.
+- `sbp` is a convenience wrapper over a curated subset of commands
+  (`sbp capabilities --json` lists it), not a `manage.py` passthrough. Use
+  `manage.py` for anything `sbp` does not dispatch.
 
 Not affected: `scripts/operator_mcp_server.py` (`operator_*` tools) is retained.
 It enforces the dry-run marker gate on mutating `operator_box_exec`,

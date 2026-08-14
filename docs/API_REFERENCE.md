@@ -10,7 +10,7 @@ Do not edit by hand; run `python3 .env-manager/manage.py registry-docs --write`.
 Registry entries: 47.
 
 > **The in-box MCP surface is deprecated and frozen.**
-> The in-box MCP surface is DEPRECATED and FROZEN — no new tools. Canonical agent path: python3 .env-manager/manage.py <command> --format json (or `sbp <command> --format json`), with `robot-docs guide` for the workflow and `capabilities --json` for the machine-readable contract.
+> The in-box MCP surface is DEPRECATED and FROZEN — no new tools. Canonical agent path: python3 .env-manager/manage.py <command> --format json, with `robot-docs guide` for the workflow and `capabilities --json` for the machine-readable contract. The `sbp` wrapper covers only a curated subset of commands — run `sbp capabilities --json` to see it, and use manage.py for the rest.
 > Every `MCP mirror` line below is a legacy surface, not a recommendation.
 > The read-only orientation tools `skillbox_capabilities`, `skillbox_explain`, `skillbox_graph`, `skillbox_next`, `skillbox_search`, `skillbox_snap` are retained for one more release; the rest are frozen.
 > See `docs/ARCHITECTURE.md` for the deprecation record.
@@ -29,7 +29,7 @@ Explain one graph node - command, check, service, bead, skill, or MCP tool - wit
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: None
-- MCP mirror: `skillbox_explain` (deprecated surface; retained read-only for one more release)
+- MCP mirror: `skillbox_explain` (deprecated surface; orientation tool retained for one more release)
 
 **Inputs**
 
@@ -74,7 +74,7 @@ Expose the typed runtime graph and algorithm outputs such as cycles and critical
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: None
-- MCP mirror: `skillbox_graph` (deprecated surface; retained read-only for one more release)
+- MCP mirror: `skillbox_graph` (deprecated surface; orientation tool retained for one more release)
 
 **Inputs**
 
@@ -121,7 +121,7 @@ Rank the highest-leverage next actions with reasons, claim commands, and validat
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: None
-- MCP mirror: `skillbox_next` (deprecated surface; retained read-only for one more release)
+- MCP mirror: `skillbox_next` (deprecated surface; orientation tool retained for one more release)
 
 **Inputs**
 
@@ -166,7 +166,7 @@ Find commands, graph nodes, docs, Beads, checks, logs, and evidence by query.
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: None
-- MCP mirror: `skillbox_search` (deprecated surface; retained read-only for one more release)
+- MCP mirror: `skillbox_search` (deprecated surface; orientation tool retained for one more release)
 
 **Inputs**
 
@@ -207,7 +207,7 @@ Record, diff, and replay runtime observation snapshots inside declared snapshot 
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: None
-- MCP mirror: `skillbox_snap` (deprecated surface; retained read-only for one more release)
+- MCP mirror: `skillbox_snap` (deprecated surface; orientation tool retained for one more release)
 
 **Inputs**
 
@@ -270,7 +270,7 @@ List agent-facing commands and tools with risk, side effects, and output contrac
 - Risk: `low`
 - Entrypoint: `manage.py`
 - Owner binary: `sbp`
-- MCP mirror: `skillbox_capabilities` (deprecated surface; retained read-only for one more release)
+- MCP mirror: `skillbox_capabilities` (deprecated surface; orientation tool retained for one more release)
 
 **Inputs**
 

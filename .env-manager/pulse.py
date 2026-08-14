@@ -6,8 +6,10 @@ Watches declared vs actual state on a fixed interval. When drift is detected:
 - Safe drift (crashed service, missing log dir) is auto-healed.
 - Risky drift (missing required repo, config change) emits an event for agents.
 
-Every state change is logged to logs/runtime/runtime.log
-and queryable via the skillbox_pulse MCP tool.
+Every state change is logged to logs/runtime/runtime.log and queryable via
+`python3 .env-manager/pulse.py status`. (The skillbox_pulse MCP tool reads the
+same state, but that surface is deprecated and frozen — see
+docs/ARCHITECTURE.md §9.)
 
 Designed to run as a managed service declared in runtime.yaml.
 Start:  python3 .env-manager/pulse.py start [--interval 30] [--root-dir /workspace]

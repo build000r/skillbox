@@ -42,9 +42,9 @@ Median dimension uplift on touched surfaces: ~+150. No surface regressed.
    (former bare-snap payload); usage payload gains `default_action: create` and leads
    with `snap --format json`. `create`/`diff`/`replay` remain fully supported.
    MCP `skillbox_snap` with omitted action now creates a read-only snapshot (parity
-   with the CLI). Follow-up (not owned here): update the mcp_server.py `skillbox_snap`
-   description string ("Omit to return read-only usage") to say "Omit to create a
-   read-only snapshot; use action=actions for the menu".
+   with the CLI). Follow-up WITHDRAWN: it proposed rewording the mcp_server.py
+   `skillbox_snap` description, but the in-box MCP surface is now deprecated and
+   frozen (docs/ARCHITECTURE.md §9). Do not open new work against it.
 
 2. **manage.py: JSON-mode argparse errors -> parseable envelope (gkso).**
    `runtime_manager/cli.py`: `SkillboxArgumentParser.error` detects `--format json`

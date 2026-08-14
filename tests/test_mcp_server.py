@@ -54,7 +54,7 @@ class SkillboxMcpServerTests(unittest.TestCase):
                 self.assertIn("DEPRECATED", tool["description"])
                 self.assertIn("manage.py <command> --format json", tool["description"])
 
-    def test_retained_read_only_tools_are_marked_retained_not_merely_frozen(self) -> None:
+    def test_retained_orientation_tools_are_marked_retained_not_merely_frozen(self) -> None:
         by_name = {tool["name"]: tool for tool in MODULE.TOOLS}
         self.assertEqual(
             MODULE.RETAINED_TOOLS,
@@ -70,8 +70,22 @@ class SkillboxMcpServerTests(unittest.TestCase):
             ),
         )
         for name in MODULE.RETAINED_TOOLS:
-            self.assertIn("RETAINED READ-ONLY", by_name[name]["description"], name)
-        self.assertNotIn("RETAINED READ-ONLY", by_name["skillbox_up"]["description"])
+            self.assertIn("RETAINED", by_name[name]["description"], name)
+        self.assertNotIn("RETAINED", by_name["skillbox_up"]["description"])
+
+    def test_deprecation_markers_never_call_the_retained_cluster_read_only(self) -> None:
+        """``skillbox_snap`` is ``local_write``; the cluster must not claim read-only."""
+        for marker in (MODULE._RETAINED_MARKER, MODULE._FROZEN_MARKER):  # noqa: SLF001
+            self.assertNotIn("READ-ONLY", marker.upper(), marker)
+        instructions = MODULE.handle_initialize({})["instructions"]
+        self.assertNotIn("Retained read-only", instructions)
+        by_name = {tool["name"]: tool for tool in MODULE.TOOLS}
+        self.assertNotIn("read-only", by_name["skillbox_snap"]["description"].lower())
+
+    def test_tool_descriptions_stay_cheap_because_every_agent_pays_on_connect(self) -> None:
+        """The long migration text belongs in initialize, not 41 tool descriptions."""
+        for marker in (MODULE._RETAINED_MARKER, MODULE._FROZEN_MARKER):  # noqa: SLF001
+            self.assertLessEqual(len(marker), 130, marker)
 
     def test_deprecation_marker_is_stamped_once_and_is_idempotent(self) -> None:
         before = [dict(tool) for tool in MODULE.TOOLS]
@@ -80,6 +94,28 @@ class SkillboxMcpServerTests(unittest.TestCase):
                          [tool["description"] for tool in before])
         for tool in MODULE.TOOLS:
             self.assertEqual(tool["description"].count("[DEPRECATED"), 1, tool["name"])
+
+    def test_restamping_after_a_tool_changes_cluster_does_not_double_mark(self) -> None:
+        """A name moving between frozen and retained must not accumulate markers."""
+        tools = [dict(tool) for tool in MODULE.TOOLS]
+        by_name = {tool["name"]: tool for tool in tools}
+        original = MODULE.RETAINED_TOOLS
+        try:
+            MODULE.RETAINED_TOOLS = original | {"skillbox_up"}
+            MODULE._stamp_deprecation_markers(tools)  # noqa: SLF001
+        finally:
+            MODULE.RETAINED_TOOLS = original
+        self.assertEqual(by_name["skillbox_up"]["description"].count("[DEPRECATED"), 1)
+        self.assertIn("RETAINED", by_name["skillbox_up"]["description"])
+
+    def test_retained_set_matches_the_command_registry(self) -> None:
+        """Two hardcoded copies of the same cluster must not drift apart."""
+        sys.path.insert(0, str(ROOT_DIR / ".env-manager"))
+        try:
+            from runtime_manager import command_registry
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(MODULE.RETAINED_TOOLS, command_registry.MCP_RETAINED_TOOLS)
 
     def test_handle_logging_set_level_updates_threshold_and_rejects_invalid_values(self) -> None:
         result = MODULE.handle_logging_set_level({"level": "debug"})

@@ -81,7 +81,7 @@ What it does each cycle:
   dev-server signatures when `SKILLBOX_PORT_SENTINEL=enforce`
 - runs declared checks and detects failures and recoveries
 - writes every state change to the plain-text runtime log at `logs/runtime/runtime.log`
-- persists a state snapshot at `logs/runtime/pulse.state.json` for the MCP tool to read
+- persists a state snapshot at `logs/runtime/pulse.state.json` for `pulse.py status` to read
 
 For durable, work-specific notes, use `manage.py session-start` /
 `session-event` / `session-end` (with `--format json`) for client-scoped session
@@ -274,7 +274,7 @@ Use `--no-adapters` when you need deterministic local output without invoking
 optional `br`, `bv`, `sbp`, or NTM probes. These six commands also have MCP
 mirrors — `skillbox_capabilities`, `skillbox_next`, `skillbox_graph`,
 `skillbox_explain`, `skillbox_search`, `skillbox_snap` — with the same
-read-only/default-write behavior. Those mirrors are the read-only cluster
+read-only/default-write behavior. Those mirrors are the orientation cluster
 retained through the [MCP deprecation](#mcp-integration); the CLI above is the
 canonical path.
 
@@ -624,19 +624,23 @@ deprecated; the operator one is retained.
 > migrate. The canonical agent path is the robot CLI plus skills:
 >
 > ```bash
-> python3 .env-manager/manage.py <command> --format json   # or: sbp <command> --format json
+> python3 .env-manager/manage.py <command> --format json   # every command
 > python3 .env-manager/manage.py robot-docs guide          # the workflow
 > python3 .env-manager/manage.py capabilities --json       # machine-readable contract
 > ```
 >
-> The CLI covers every command with real exit codes; the MCP tool list only ever
-> covered what someone remembered to mirror. See
+> `manage.py` covers every command with real exit codes; the MCP tool list only
+> ever covered what someone remembered to mirror. The `sbp` wrapper is a
+> convenience front-end over a curated subset (`sbp capabilities --json` lists
+> it), not a general passthrough — it rejects commands it does not dispatch, so
+> reach for `manage.py` for the rest. See
 > [ARCHITECTURE.md §9](ARCHITECTURE.md#9-deprecations) for the record.
 >
-> **Retained read-only for one more release** so orientation keeps working
-> mid-migration: `skillbox_capabilities`, `skillbox_next`, `skillbox_graph`,
-> `skillbox_explain`, `skillbox_search`, `skillbox_snap`. Everything else in the
-> table below is frozen — reach for the CLI equivalent instead.
+> **Orientation tools retained for one more release** so agents can still get
+> their bearings mid-migration: `skillbox_capabilities`, `skillbox_next`,
+> `skillbox_graph`, `skillbox_explain`, `skillbox_search`, `skillbox_snap` (the
+> first five are side-effect free; `snap` writes only when asked). Everything
+> else in the table below is frozen — reach for the CLI equivalent instead.
 
 The frozen inventory, for callers that still need it:
 

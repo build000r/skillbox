@@ -415,7 +415,8 @@ agent path is the **robot CLI plus skills**:
 
 | Need | Canonical path |
 |---|---|
-| Run any command, machine-readable | `python3 .env-manager/manage.py <command> --format json` (or `sbp <command> --format json`) — real exit codes |
+| Run any command, machine-readable | `python3 .env-manager/manage.py <command> --format json` — real exit codes, every command |
+| Shortcut for the curated subset | `sbp <command>` — a convenience wrapper over selected commands only (`sbp capabilities --json` lists them); use `manage.py` for anything it does not dispatch |
 | Learn the workflow | `python3 .env-manager/manage.py robot-docs guide` |
 | Machine-readable contract | `python3 .env-manager/manage.py capabilities --json` (see the `registry.mcp_surface` block) |
 | Task-level guidance | skills |
@@ -441,11 +442,13 @@ to agents as a real surface.
   `initialize` instructions lead with it, every `tools/list` description carries
   it, and `capabilities --json` reports it under `registry.mcp_surface`.
 
-**Retained read-only cluster (one more release).** Orientation still works over
-MCP while callers migrate: `skillbox_capabilities`, `skillbox_next`,
+**Retained orientation cluster (one more release).** Orientation still works
+over MCP while callers migrate: `skillbox_capabilities`, `skillbox_next`,
 `skillbox_graph`, `skillbox_explain`, `skillbox_search`, `skillbox_snap`. These
-are the tier-1 brain mirrors, all read-only. Everything else is frozen — reach
-for the CLI.
+are the tier-1 mirrors (`runtime.capabilities` plus the five `brain.*`
+commands). The first five declare `side_effect: none`; `skillbox_snap` is
+`local_write` — it writes only when asked — so this cluster is *not* read-only.
+Everything else is frozen — reach for the CLI.
 
 **If you are adding a command:** see [§8 Add a Command](#add-a-command). Step 4
 is now "do not add a mirror".

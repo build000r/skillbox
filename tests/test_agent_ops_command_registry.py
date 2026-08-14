@@ -126,12 +126,32 @@ class DefaultRegistryTests(unittest.TestCase):
             "update the inventory deliberately and say so in CHANGELOG.md.",
         )
 
-    def test_retained_read_only_cluster_is_part_of_the_frozen_inventory(self) -> None:
+    def test_retained_orientation_cluster_is_part_of_the_frozen_inventory(self) -> None:
         self.assertTrue(REG.MCP_RETAINED_TOOLS <= REG.MCP_FROZEN_TOOLS)
         for spec_id in ("runtime.capabilities", "brain.next", "brain.graph",
                         "brain.explain", "brain.search", "brain.snap"):
             spec = REG.load_default_registry()[spec_id]
             self.assertIn(spec.mcp_tool, REG.MCP_RETAINED_TOOLS, spec_id)
+
+    def test_retained_cluster_is_not_advertised_as_read_only(self) -> None:
+        """``brain.snap`` is ``local_write``; calling the cluster read-only is a lie."""
+        registry = REG.load_default_registry()
+        writers = sorted(
+            spec.mcp_tool
+            for spec in registry.values()
+            if spec.mcp_tool in REG.MCP_RETAINED_TOOLS and spec.side_effect != "none"
+        )
+        self.assertEqual(writers, ["skillbox_snap"])
+        payload = REG.registry_payload()["mcp_surface"]
+        self.assertIn("retained_orientation", payload)
+        self.assertNotIn("retained_read_only", payload)
+
+    def test_deprecation_notice_does_not_overpromise_sbp_coverage(self) -> None:
+        """``sbp`` dispatches a curated subset — it is not a manage.py passthrough."""
+        notice = REG.MCP_DEPRECATION_NOTICE
+        self.assertIn("manage.py <command> --format json", notice)
+        self.assertNotIn("sbp <command>", notice)
+        self.assertIn("subset", notice)
 
     def test_new_mcp_tools_are_rejected_because_the_surface_is_frozen(self) -> None:
         issues = REG.validate_spec(_valid_spec(mcp_tool="skillbox_brand_new_idea"))

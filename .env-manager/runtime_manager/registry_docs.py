@@ -144,7 +144,7 @@ def _mcp_mirror_line(spec: CommandSpec) -> str:
     if not spec.mcp_tool:
         return "- MCP mirror: None"
     if spec.mcp_tool in MCP_RETAINED_TOOLS:
-        status = "deprecated surface; retained read-only for one more release"
+        status = "deprecated surface; orientation tool retained for one more release"
     else:
         status = "deprecated and frozen — prefer the CLI entrypoint above"
     return f"- MCP mirror: `{spec.mcp_tool}` ({status})"

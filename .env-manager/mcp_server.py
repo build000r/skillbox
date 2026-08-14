@@ -6,14 +6,19 @@ This surface is no longer the agent front door. It mirrors a lagging subset of
 manage.py, and keeping that mirror in parity is pure tax the CLI does not pay.
 The canonical agent path is:
 
-    python3 .env-manager/manage.py <command> --format json   (or `sbp ...`)
+    python3 .env-manager/manage.py <command> --format json   (every command)
     python3 .env-manager/manage.py robot-docs guide          (workflow)
     python3 .env-manager/manage.py capabilities --json       (machine contract)
 
+The ``sbp`` wrapper is a convenience front-end over a curated subset of those
+commands (``sbp capabilities --json`` lists it), not a general passthrough — use
+manage.py for anything it does not dispatch.
+
 plus skills for task-level guidance. The server is NOT being deleted and no
 existing tool is being removed — it is frozen: no new tools, and callers should
-migrate. The six read-only orientation tools in ``RETAINED_TOOLS`` are kept for
-one more release. See docs/ARCHITECTURE.md §9 for the deprecation record and
+migrate. The six orientation tools in ``RETAINED_TOOLS`` are kept for one more
+release; five are side-effect free and ``skillbox_snap`` writes only when asked.
+See docs/ARCHITECTURE.md §9 for the deprecation record and
 runtime_manager/command_registry.py for the enforced frozen inventory.
 
 Exposes manage.py commands as MCP tools over stdio (JSON-RPC 2.0, MCP 2024-11-05).
@@ -1381,14 +1386,14 @@ TOOLS: list[dict] = [
 # that only ever calls tools/list still learns where to go.
 
 MCP_DEPRECATION_STATUS = "deprecated"
-_CLI_POINTER = (
-    "use `python3 .env-manager/manage.py <command> --format json` "
-    "(or `sbp <command> --format json`); "
-    "`manage.py robot-docs guide` for the workflow, "
-    "`manage.py capabilities --json` for the machine contract"
-)
-# The read-only orientation cluster stays one more release so agents can still
-# get their bearings over MCP mid-migration. Mirrors command_registry.MCP_RETAINED_TOOLS.
+# Kept short on purpose: this is stamped onto all 41 tool descriptions, which an
+# agent pays for on every connect. The full migration text lives in the
+# ``initialize`` instructions, which every client reads once.
+_CLI_POINTER = "use `manage.py <command> --format json`"
+# The orientation cluster stays one more release so agents can still get their
+# bearings over MCP mid-migration. Mirrors command_registry.MCP_RETAINED_TOOLS
+# (pinned by a test). Note: five are side-effect free but ``skillbox_snap`` is
+# ``local_write``, so this cluster is NOT "read-only" — do not call it that.
 RETAINED_TOOLS = frozenset(
     {
         "skillbox_capabilities",
@@ -1400,15 +1405,10 @@ RETAINED_TOOLS = frozenset(
     }
 )
 _RETAINED_MARKER = (
-    "[DEPRECATED SURFACE — RETAINED READ-ONLY THIS RELEASE] "
-    "The in-box MCP is frozen; this read-only tool is kept for one more release "
-    f"so orientation keeps working while callers migrate. For everything else, {_CLI_POINTER}."
+    f"[DEPRECATED SURFACE — ORIENTATION TOOL RETAINED THIS RELEASE] {_CLI_POINTER}."
 )
-_FROZEN_MARKER = (
-    "[DEPRECATED — FROZEN] "
-    "The in-box MCP surface is deprecated and closed to new tools. "
-    f"Prefer the canonical agent path: {_CLI_POINTER}."
-)
+_FROZEN_MARKER = f"[DEPRECATED — FROZEN, NO NEW TOOLS] {_CLI_POINTER}."
+_ALL_MARKERS = (_RETAINED_MARKER, _FROZEN_MARKER)
 
 
 def deprecation_marker(tool_name: str) -> str:
@@ -1417,12 +1417,17 @@ def deprecation_marker(tool_name: str) -> str:
 
 
 def _stamp_deprecation_markers(tools: list[dict]) -> None:
-    """Append the deprecation marker to every tool description, in place."""
+    """Append the deprecation marker to every tool description, in place.
+
+    Idempotent even if a tool moves between the frozen and retained sets: any
+    previously stamped marker is stripped before the current one is appended, so
+    a re-run can never leave two markers on one description.
+    """
     for tool in tools:
         marker = deprecation_marker(tool.get("name", ""))
         description = (tool.get("description") or "").rstrip()
-        if marker in description:
-            continue
+        for stale in _ALL_MARKERS:
+            description = description.replace(stale, "").rstrip()
         tool["description"] = f"{description} {marker}".strip()
 
 
@@ -2745,12 +2750,15 @@ def handle_initialize(_params: dict, _request_id: Any = None) -> dict:
             "skillbox runtime manager — THIS MCP SURFACE IS DEPRECATED AND FROZEN. "
             "It is a lagging subset of the CLI and takes no new tools. "
             "Canonical agent path: python3 .env-manager/manage.py <command> --format json "
-            "(or `sbp <command> --format json`) — real exit codes, full command coverage. "
+            "— real exit codes, full command coverage. The `sbp` wrapper front-ends "
+            "only a curated subset (`sbp capabilities --json` lists it), so use "
+            "manage.py for anything sbp does not dispatch. "
             "Start with `manage.py robot-docs guide` for the workflow and "
             "`manage.py capabilities --json` for the machine-readable contract; "
             "skills carry the task-level guidance. "
-            "Retained read-only this release: skillbox_capabilities, skillbox_next, "
-            "skillbox_graph, skillbox_explain, skillbox_search, skillbox_snap. "
+            "Orientation tools retained this release: skillbox_capabilities, skillbox_next, "
+            "skillbox_graph, skillbox_explain, skillbox_search, skillbox_snap "
+            "(the first five are side-effect free; skillbox_snap writes only when asked). "
             "Everything else is frozen — prefer the CLI. "
             "If you are still calling this surface, the discipline below still applies. "
             "Discipline: assess → scope → dry-run → act → verify. "
