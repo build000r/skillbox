@@ -127,6 +127,9 @@ class OutputSchemaDocDriftTests(unittest.TestCase):
 
     def test_recalibrate_example_includes_machine_actionable_fixes(self) -> None:
         example = GEN.example_recalibrate()
+        self.assertIn("effective", example)
+        self.assertTrue(example["effective"])
+        self.assertTrue(all(row.get("name") for row in example["effective"]))
         self.assertIn("fixes", example)
         self.assertTrue(example["fixes"])
         fix = example["fixes"][0]

@@ -338,6 +338,7 @@ _MANAGE_READ = (
     ("explain", "cli.py:4406 _handle_explain -> agent_decisions.explain_payload"),
     ("fleet converge", "cli.py:4138 _handle_fleet_converge -> fleet_converge.py:740 build_fleet_converge_plan; zero write primitives in fleet_converge.py"),
     ("forge status", "forge.py:407 forge_status"),
+    ("git-status", "cli.py:546 git_status_parser (read-only estate git status via the sbp git front door; cli.py:3603 'never fetches')"),
     ("graph", "cli.py:4355 -> agent_graph_engine.graph_command_payload"),
     ("logs", "cli.py:7158 -> runtime_ops.py:5987 collect_service_logs (tail only)"),
     ("mcp-audit", "cli.py:4107 -> mcp_visibility.py:220 collect_mcp_audit; only os.readlink (mcp_visibility.py:80)"),
@@ -1661,6 +1662,7 @@ def _make_read_delegate(target: str, delegate: str) -> Boundary:
 
 _MAKE_BOUNDARIES: tuple[Boundary, ...] = (
     _read(SURFACE_MAKE, "help", "Makefile:44 help — printf block only"),
+    _make_read_delegate("git-estate-e2e", "manage.git-status"),
     _read(
         SURFACE_MAKE, "render",
         "Makefile render -> `python3 scripts/04-reconcile.py render` (outer reconcile, read-only)",

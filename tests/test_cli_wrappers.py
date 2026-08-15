@@ -28,6 +28,8 @@ class CliWrapperTests(unittest.TestCase):
         self.assertIn("sbp candidates", result.stdout)
         self.assertIn("sbp recalibrate", result.stdout)
         self.assertIn("sbp mcp", result.stdout)
+        self.assertIn("sbp family health", result.stdout)
+        self.assertIn("sbp family dashboard", result.stdout)
         self.assertIn("sbp beads", result.stdout)
         self.assertIn("sbp launch", result.stdout)
         self.assertIn("Alias for launch", result.stdout)
@@ -62,6 +64,7 @@ class CliWrapperTests(unittest.TestCase):
         self.assertEqual(payload["mode"], "host")
         self.assertIn("stdout_stderr_contract", payload)
         self.assertTrue(any(command["name"] == "candidates" for command in payload["commands"]))
+        self.assertTrue(any(command["name"] == "family" for command in payload["commands"]))
         verbs = payload["skill_verbs"]
         expected_verb_fields = {
             "purpose",
@@ -1391,6 +1394,34 @@ class CliWrapperTests(unittest.TestCase):
             encoding="utf-8",
         )
         return root
+
+    def test_family_command_dispatches_to_config_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_root = self._make_fake_skillbox(root / "skillbox")
+            config = root / "skillbox-config"
+            helper = config / "scripts" / "amp_family_health.py"
+            helper.parent.mkdir(parents=True)
+            helper.write_text(
+                "import json, sys\nprint(json.dumps({'argv': sys.argv[1:]}))\n",
+                encoding="utf-8",
+            )
+            result = self._run_wrapper(
+                SBP,
+                "family",
+                "health",
+                "--family",
+                "htma",
+                "--json",
+                fake_root=fake_root,
+                extra_env={"SKILLBOX_CONFIG_ROOT": str(config)},
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout)["argv"],
+            ["health", "--family", "htma", "--json"],
+        )
 
     def _make_fake_skillbox_with_missing_skills(self, root: Path) -> Path:
         env_dir = root / ".env-manager"

@@ -144,6 +144,8 @@ def atlas(w: str) -> list[Group]:
             Cmd(f"{w} cron status|apply", "declared crontab + script links from skillbox-config", ("mut",)),
         ]),
         Group("NETWORK & FLEET", "tailnet + human operator", [
+            Cmd(f"{w} family health", "read-only Amp family health contract (--family ID, --criteria)", ("json",)),
+            Cmd(f"{w} family dashboard", "print the family dashboard URL on port 6969"),
             Cmd(f"{w} conference1 urls|status|helper", "tailnet Serve endpoints + heavy-build lane (conf1, tailnet); expose/remove need --yes", ("remote", "yes")),
             Cmd(f"{w} hire times", "show configured human-operator availability", ("remote",)),
             Cmd(f"{w} hire book [...]", "send magic-link/signup email and create x402 hold", ("remote", "mut")),
