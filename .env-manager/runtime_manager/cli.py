@@ -656,6 +656,20 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     git_status_parser.add_argument(
+        "--amp",
+        action="store_true",
+        help=(
+            "After the normal local scan, add Amp Orb lease/campaign "
+            "verdicts delegated to the reconcile skill's "
+            "amp_campaign_guard.sh (may SSH to the d3 lease authority; "
+            "still read-only). Additive JSON fields only (amp.campaign + "
+            "per-row amp_verdict/amp_reasons). The purely local capsule "
+            "guard join is NOT gated on this flag — it runs on every scan "
+            "when skills-private is present. Guard or authority "
+            "unavailable degrades to one note with exit 0."
+        ),
+    )
+    git_status_parser.add_argument(
         "--cached",
         action="store_true",
         help=(
@@ -4121,6 +4135,7 @@ def _handle_git_status(args: argparse.Namespace, root_dir: Path) -> int:
             cwd=cwd,
             only=list(getattr(args, "only", []) or []),
             live=bool(getattr(args, "live", False)),
+            amp=bool(getattr(args, "amp", False)),
         )
     except ValueError as exc:
         print(f"git-status: {exc}", file=sys.stderr)

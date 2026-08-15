@@ -176,19 +176,31 @@ payload = {
         {"id": "c-ahead", "path": f"{estate}/c-ahead"},
         {"id": "e-midop", "path": f"{estate}/e-midop"},
         {"id": "gone", "path": f"{estate}/gone-checkout"},
+        {
+            "id": "sand",
+            "path": f"{estate}/sand",
+            "located": "d3c",
+            "note": "important on d3c",
+        },
     ],
     "ignore": [{"path": f"{estate}/z-ignored", "reason": "e2e fixture"}],
 }
 with open(f"{config}/registry/repos.yaml", "w", encoding="utf-8") as handle:
     json.dump(payload, handle)
 EOF
-assert_ok "fixture estate built (5 scannable repos, 1 ignored, 1 stale entry)"
+assert_ok "fixture estate built (5 scannable repos, 1 ignored, 2 stale entries)"
 
 run_sbp() {
+  # Receipts store and amp guard scripts are pinned at nonexistent paths:
+  # absent stores/scripts add NOTHING, keeping the run hermetic on hosts
+  # that carry a real reconcile state dir or skills-private checkout.
   env \
     SKILLBOX_ROOT="${ROOT_DIR}" \
     SKILLBOX_INVOKE_CWD="${ESTATE}" \
     SKILLBOX_CONFIG_ROOT="${CONFIG}" \
+    SKILLBOX_RECONCILE_RECEIPTS_DIR="${WORK}/no-receipts" \
+    SKILLBOX_AMP_CAPSULE_GUARD="${WORK}/no-capsule-guard" \
+    SKILLBOX_AMP_CAMPAIGN_GUARD="${WORK}/no-campaign-guard" \
     "${SBP}" "$@" < /dev/null
 }
 
@@ -231,9 +243,12 @@ assert_ok "dirty repo row present"
 grep -q "${ESTATE}/g-unregistered  \[unregistered\]" "${TEXT_OUT}" \
   || { cat "${TEXT_OUT}"; fail "unregistered marker missing"; }
 assert_ok "unregistered marker present"
-grep -q "stale-registered: 1 registry entries" "${TEXT_OUT}" \
-  || { cat "${TEXT_OUT}"; fail "stale-registered section missing"; }
-assert_ok "stale-registered section present"
+grep -q "stale-registered: 2 registry entries with no repo on disk (1 located elsewhere, 1 unaccounted)" "${TEXT_OUT}" \
+  || { cat "${TEXT_OUT}"; fail "stale-registered section (with located breakdown) missing"; }
+assert_ok "stale-registered section present with located breakdown"
+grep -q "${ESTATE}/sand  \[located: d3c\]  -> lives on d3c" "${TEXT_OUT}" \
+  || { cat "${TEXT_OUT}"; fail "located stale entry must render verify-there advice"; }
+assert_ok "located stale entry renders verify-there advice"
 if grep -q $'\033\[' "${TEXT_OUT}"; then
   cat -v "${TEXT_OUT}"
   fail "piped output must be plain (no ANSI escapes)"
@@ -256,10 +271,15 @@ json_assert "${JSON_OUT}" "envelope schema is sbp-git/v1" \
 json_assert "${JSON_OUT}" "repo_count is 5" 'payload["repo_count"] == 5'
 json_assert "${JSON_OUT}" "ignored_count is 1" 'payload["ignored_count"] == 1'
 json_assert "${JSON_OUT}" "registry join applied" 'payload["registry_applied"] is True'
-json_assert "${JSON_OUT}" "registration summary counts 4 registered / 1 unregistered / 1 stale" \
-  'payload["registration_summary"] == {"registered": 4, "unregistered": 1, "unknown": 0, "stale_registered": 1}'
-json_assert "${JSON_OUT}" "stale entry names the gone checkout" \
-  '[e["id"] for e in payload["stale_registered"]] == ["gone"]'
+json_assert "${JSON_OUT}" "registration summary counts 4 registered / 1 unregistered / 2 stale" \
+  'payload["registration_summary"] == {"registered": 4, "unregistered": 1, "unknown": 0, "stale_registered": 2}'
+json_assert "${JSON_OUT}" "stale entries name the gone checkout and sand" \
+  '[e["id"] for e in payload["stale_registered"]] == ["gone", "sand"]'
+json_assert "${JSON_OUT}" "located stale entry carries located/note and verify-there fix" \
+  'payload["stale_registered"][1]["located"] == "d3c" and payload["stale_registered"][1]["note"] == "important on d3c" and payload["stale_registered"][1]["fix"][0].startswith("lives on d3c")'
+json_assert "${JSON_OUT}" "unannotated stale entry keeps remove-or-repoint and no located field" \
+  '"located" not in payload["stale_registered"][0] and payload["stale_registered"][0]["fix"][0].startswith("remove or repoint")'
+json_assert "${JSON_OUT}" "amp guard absent adds nothing" '"amp" not in payload'
 json_assert "${JSON_OUT}" "rows are risk-sorted (mid-op first, clean last)" \
   '[r["risk_band"] for r in payload["repos"]] == ["mid-op", "dirty", "ahead", "no-remote", "clean"]'
 

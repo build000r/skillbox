@@ -485,6 +485,13 @@ class GitEstateFixtureCase(unittest.TestCase):
                 # Wrapper runs write-through the scan cache; keep it out of the
                 # real state root so tests never seed the live home view.
                 "SKILLBOX_STATE_ROOT": str(self.tmp / "state"),
+                # Hermetic joins: absent stores/scripts add NOTHING, so point
+                # every external-state join at nonexistent paths -- otherwise
+                # a real receipts store or reconcile-skill checkout on the
+                # host leaks into fixture envelopes.
+                "SKILLBOX_RECONCILE_RECEIPTS_DIR": str(self.tmp / "no-receipts"),
+                "SKILLBOX_AMP_CAPSULE_GUARD": str(self.tmp / "no-capsule-guard"),
+                "SKILLBOX_AMP_CAMPAIGN_GUARD": str(self.tmp / "no-campaign-guard"),
             },
         )
         patcher.start()
@@ -925,6 +932,65 @@ class TextRenderingTests(GitEstateFixtureCase):
         )
         narrowed_text = "\n".join(git_estate.report_text_lines(narrowed))
         self.assertNotIn("stale-registered: 1", narrowed_text)
+
+    def test_located_stale_entry_is_not_advised_away(self) -> None:
+        # A `located:` registry annotation means the checkout intentionally
+        # lives on another box / in an Amp Orb: the remove-or-repoint advice
+        # would be wrong (and for something like sand, dangerous), so the fix
+        # flips to verify-there and the fields pass through additively.
+        elsewhere = self.estate / "sand"
+        unaccounted = self.estate / "gone-checkout"
+        self.write_config_fixture(
+            repos=[
+                {
+                    "id": "sand",
+                    "path": str(elsewhere),
+                    "located": "d3c",
+                    "note": "important on d3c — do not remove; verify there first",
+                },
+                {"id": "gone", "path": str(unaccounted)},
+            ]
+        )
+
+        report = git_estate.build_report(roots=[str(self.estate)], depth=2)
+        by_id = {entry["id"]: entry for entry in report["stale_registered"]}
+        self.assertEqual(by_id["sand"]["located"], "d3c")
+        self.assertEqual(
+            by_id["sand"]["note"],
+            "important on d3c — do not remove; verify there first",
+        )
+        self.assertEqual(
+            by_id["sand"]["fix"],
+            [
+                "lives on d3c — verify there before touching; "
+                "do not remove or repoint from this machine"
+            ],
+        )
+        # Unannotated entries keep the classic advice and gain no fields.
+        self.assertNotIn("located", by_id["gone"])
+        self.assertNotIn("note", by_id["gone"])
+        self.assertEqual(
+            by_id["gone"]["fix"],
+            [f"remove or repoint the registry entry in {self.registry_yaml}"],
+        )
+
+        text = "\n".join(git_estate.report_text_lines(report))
+        self.assertIn(
+            "stale-registered: 2 registry entries with no repo on disk "
+            "(1 located elsewhere, 1 unaccounted)",
+            text,
+        )
+        self.assertIn(
+            f"  - {elsewhere}  [located: d3c]  -> lives on d3c — verify there "
+            "before touching; do not remove or repoint from this machine  "
+            "(important on d3c — do not remove; verify there first)",
+            text,
+        )
+        self.assertIn(
+            f"  - {unaccounted}  -> remove or repoint the registry entry in "
+            f"{self.registry_yaml}",
+            text,
+        )
 
     def test_cwd_detail_shows_unregistered_state(self) -> None:
         dirty = self.make_repo("a-dirty")

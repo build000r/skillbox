@@ -84,6 +84,42 @@ timestamp of the newest PASSED receipt, or null). The store being absent
 adds NOTHING (goldens pin the store-less envelope); an unreadable store is
 ONE note; a non-clean row with a receipt older than 30 days gets the
 ``[last safe sync Nd ago]`` glance marker. Never invokes git or the skill.
+
+Amp joins (capsule default-on, campaign behind ``--amp``)
+---------------------------------------------------------
+Amp Orb state is delegated, never reimplemented, to the reconcile skill's
+guard scripts. ``amp_capsule_guard.sh`` is purely local (file reads plus
+read-only git; repos without a capsule are near-free), so its verdicts join
+EVERY scan: rows whose sealed Orb capsule drifted gain the additive
+``amp_capsule`` field (``capsule-broken-published`` etc.), an inline table
+marker, and a reseal fix line. ``amp_campaign_guard.sh`` needs the d3
+amp-registry authority read (an SSH round-trip off d3), so its lease
+verdicts (``amp-leased`` / ``linked-worktree`` / ``amp-sync-mirror``) join
+only on ``--amp`` as the additive ``amp_verdict``/``amp_reasons`` fields.
+Both follow the receipts-join degrade contract: guard script absent -> the
+capsule join adds NOTHING (goldens pin the guard-less envelope; ``--amp``
+is opt-in so an absent campaign guard IS a loud note); a present guard
+that fails, times out, or emits garbage -> ONE ``amp ... unavailable``
+note. An authority error from the campaign guard is a note, never a
+row-spam of ``indeterminate``.
+
+Stale-registered ``located:`` annotation
+----------------------------------------
+A registry entry may carry ``located:`` (estate environment ids ``mac`` /
+``d3`` / ``d3c`` / ``aiops``, or ``amp-orb`` for checkouts living inside an
+Amp Orb) plus a free-text ``note:``. A stale-registered entry WITH
+``located`` is not junk -- the repo intentionally lives on another box --
+so its fix becomes "verify there before touching; do not remove or repoint
+from this machine" instead of the remove-or-repoint advice, and both fields
+pass through to the envelope's ``stale_registered`` rows.
+
+Paired with the reconcile skill
+-------------------------------
+``sbp git`` is the read-only estate front door; the reconcile skill is the
+mutation dispatcher that acts on what this surface shows (its Phase 0
+inventory leads with this command). When the issue backlog is large the
+footer says so and routes to reconcile + the divide-and-conquer skill
+instead of inviting serial hand-work.
 """
 
 from __future__ import annotations
@@ -109,6 +145,7 @@ from .git_inventory import (
 )
 
 __all__ = [
+    "DEFAULT_AMP_GUARD_TIMEOUT_S",
     "DEFAULT_LIVE_TIMEOUT_S",
     "FILTER_CLASSES",
     "JUNK_CANDIDATE_MIN",
@@ -118,6 +155,7 @@ __all__ = [
     "REGISTRATION_FILTER_CLASSES",
     "RISK_BAND_NAMES",
     "SCHEMA",
+    "apply_amp_campaign",
     "apply_live_comparison",
     "build_report",
     "compute_scan_delta",
@@ -214,6 +252,24 @@ RECEIPTS_DIR_ENV = "SKILLBOX_RECONCILE_RECEIPTS_DIR"
 RECEIPT_STALE_SECONDS = 30 * 86400
 #: Per-receipt file size cap: the join must stay a cheap glance read.
 _RECEIPT_MAX_BYTES = 1 << 20
+
+#: Firm overall wall-clock budget for the amp guard delegations, in seconds
+#: (shared across scan roots; the default capsule join must stay a glance).
+DEFAULT_AMP_GUARD_TIMEOUT_S = 20.0
+#: Env override for the amp guard budget (float seconds); tests use tiny values.
+_AMP_TIMEOUT_ENV = "SKILLBOX_AMP_GUARD_TIMEOUT_S"
+#: Env overrides for the guard script paths (tests point at fakes).
+_AMP_CAPSULE_ENV = "SKILLBOX_AMP_CAPSULE_GUARD"
+_AMP_CAMPAIGN_ENV = "SKILLBOX_AMP_CAMPAIGN_GUARD"
+#: Guard exits that still carry a verdict payload: 0 all-clear, 1 non-clear
+#: rows present. 2 = usage error / zero repos ("empty is not clear").
+_AMP_OK_EXITS = frozenset({0, 1})
+#: Capsule verdicts that are non-news (no field, no marker, no fix line).
+_AMP_CAPSULE_QUIET = frozenset({"capsule-clear", "capsule-absent"})
+
+#: Issue-row count at or above which the footer routes to the reconcile
+#: skill + divide-and-conquer instead of inviting serial hand-work.
+_BACKLOG_THRESHOLD = 10
 
 #: Untracked-entry floor at which a row earns the ``git-repo-janitor`` handoff.
 #: Matches that skill's own bar -- below five candidates its recovery-bundle
@@ -971,6 +1027,245 @@ def _apply_reconcile_receipts(report: dict[str, Any]) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Amp joins (delegated to the reconcile skill's guard scripts, never local)
+# --------------------------------------------------------------------------- #
+
+
+def _amp_guard_script(env_var: str, name: str) -> Path:
+    """Path to a reconcile-skill guard script (may not exist).
+
+    Same resolution ladder as :func:`_fleet_convergence_script`: env override
+    (tests / explicit installs), ``$SKILLBOX_MONOSERVER_ROOT`` mount, then
+    ``~/repos/skills-private/...``; the last candidate is returned even when
+    absent so degrade notes can name the path that was tried.
+    """
+    override = str(os.environ.get(env_var) or "").strip()
+    if override:
+        return Path(os.path.expandvars(os.path.expanduser(override)))
+    relative = Path("skills-private") / "reconcile" / "scripts" / name
+    candidates: list[Path] = []
+    mono = str(os.environ.get("SKILLBOX_MONOSERVER_ROOT") or "").strip()
+    if mono:
+        candidates.append(Path(os.path.expandvars(os.path.expanduser(mono))) / relative)
+    candidates.append(Path.home() / "repos" / relative)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[-1]
+
+
+def _amp_timeout_s() -> float:
+    raw = str(os.environ.get(_AMP_TIMEOUT_ENV) or "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return DEFAULT_AMP_GUARD_TIMEOUT_S
+
+
+def _run_amp_guard(
+    script: Path, roots: Sequence[str], budget_s: float
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
+    """Run one guard per root -> (rows, last payload, None) or ([], None, reason).
+
+    The guards emit ``{rows: [...]}`` JSON on exits 0/1 (0 all-clear, 1
+    non-clear rows -- both verdict data). Anything else -- exit 2 (usage /
+    zero repos), other exits with unparseable stdout, timeout, unrunnable
+    script -- degrades to a single reason string. Stdout that parses to a
+    rows payload is trusted over the exit code so a "zero repos under this
+    root" exit 2 with an empty rows list stays a non-event. The budget is
+    shared across roots (a glance surface must not hang per-root).
+    """
+    rows: list[dict[str, Any]] = []
+    payload: dict[str, Any] | None = None
+    deadline = time.monotonic() + budget_s
+    for root in roots:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return [], None, f"timed out after {budget_s:g}s"
+        argv = ["bash", str(script), "--json", "--root", str(root)]
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, timeout=remaining, check=False
+            )
+        except subprocess.TimeoutExpired:
+            return [], None, f"timed out after {budget_s:g}s"
+        except OSError as exc:
+            return [], None, f"could not run {script.name}: {exc}"
+        try:
+            payload = json.loads(proc.stdout)
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict) or not isinstance(payload.get("rows"), list):
+            if proc.returncode in _AMP_OK_EXITS:
+                return [], None, f"unparseable output from {script.name}"
+            detail = (proc.stderr or "").strip().splitlines()
+            suffix = f": {detail[0]}" if detail else ""
+            return [], None, f"{script.name} exited {proc.returncode}{suffix}"
+        rows.extend(row for row in payload["rows"] if isinstance(row, dict))
+    return rows, payload, None
+
+
+def _amp_row_index(rows: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Guard rows by path AND realpath (the capsule guard realpaths; the scan
+    may hand out unresolved paths). First entry wins on collision."""
+    index: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        path = row.get("path")
+        if not isinstance(path, str) or not path:
+            continue
+        index.setdefault(path, row)
+        index.setdefault(os.path.realpath(path), row)
+    return index
+
+
+def _amp_lookup(
+    row: dict[str, Any], index: dict[str, dict[str, Any]]
+) -> dict[str, Any] | None:
+    path = str(row.get("path") or "")
+    return index.get(path) or index.get(os.path.realpath(path))
+
+
+def _apply_amp_capsules(report: dict[str, Any]) -> None:
+    """Default-on capsule join: mutate ``report`` with additive fields only.
+
+    Guard script absent -> NOTHING is added (the default envelope stays
+    byte-identical on boxes without skills-private, which the goldens pin).
+    Guard present but failing -> ONE ``amp capsule guard unavailable`` note.
+    A drifted row gains ``amp_capsule`` (the verdict) and a reseal fix line
+    (``amp_capsule_reseal.py`` next to the guard -- repair is a reseal by the
+    owning Orb, never a hand-edit). Never raises.
+    """
+    script = _amp_guard_script(_AMP_CAPSULE_ENV, "amp_capsule_guard.sh")
+    if not script.is_file():
+        return
+    rows, _, reason = _run_amp_guard(
+        script, report.get("roots") or [], _amp_timeout_s()
+    )
+    if reason is not None:
+        report.setdefault("amp", {})["capsule"] = {"applied": False, "reason": reason}
+        report.setdefault("notes", []).append(
+            f"amp capsule guard unavailable: {reason}"
+        )
+        return
+    index = _amp_row_index(rows)
+    reseal = script.parent / "amp_capsule_reseal.py"
+    flagged = 0
+    targets = list(report.get("repos") or [])
+    cwd_repo = report.get("cwd_repo")
+    if isinstance(cwd_repo, dict):
+        targets.append(cwd_repo)
+    for row in targets:
+        if not isinstance(row, dict):
+            continue
+        info = _amp_lookup(row, index)
+        if info is None:
+            continue
+        verdict = info.get("verdict")
+        if not isinstance(verdict, str) or verdict in _AMP_CAPSULE_QUIET:
+            continue
+        row["amp_capsule"] = verdict
+        row.setdefault("fix", []).append(
+            f"python3 {reseal} --repo {row.get('path')}  "
+            f"# {verdict}: owning Orb reseals; reconcile skill"
+        )
+        flagged += 1
+    report.setdefault("amp", {})["capsule"] = {
+        "applied": True,
+        "source": str(script),
+        "flagged_rows": flagged,
+    }
+
+
+def apply_amp_campaign(report: dict[str, Any], *, timeout_s: float | None = None) -> None:
+    """``--amp`` opt-in: join the campaign guard's lease verdicts.
+
+    Strictly additive (``amp_verdict`` / ``amp_reasons`` per matched
+    non-clear row, an ``amp.campaign`` object). Because the flag was asked
+    for, an absent guard IS a loud note (unlike the default capsule join).
+    An authority error (the d3 registry read failed -- SSH down, snapshot
+    stale) degrades to ONE note WITHOUT stamping rows: the guard fails
+    closed to ``indeterminate`` everywhere, and repeating that per row would
+    bury the one actionable fact. Never raises.
+    """
+    script = _amp_guard_script(_AMP_CAMPAIGN_ENV, "amp_campaign_guard.sh")
+    if not script.is_file():
+        reason = f"amp_campaign_guard.sh not found at {script}"
+        report.setdefault("amp", {})["campaign"] = {"applied": False, "reason": reason}
+        report.setdefault("notes", []).append(f"amp campaign guard unavailable: {reason}")
+        return
+    budget = timeout_s if timeout_s is not None else _amp_timeout_s()
+    rows, payload, reason = _run_amp_guard(script, report.get("roots") or [], budget)
+    if reason is not None:
+        report.setdefault("amp", {})["campaign"] = {"applied": False, "reason": reason}
+        report.setdefault("notes", []).append(f"amp campaign guard unavailable: {reason}")
+        return
+    authority_error = (payload or {}).get("authority_error")
+    if isinstance(authority_error, dict) and authority_error:
+        code = authority_error.get("code") or "unknown"
+        detail = authority_error.get("detail") or ""
+        reason = f"{code}: {detail}".rstrip(": ")
+        report.setdefault("amp", {})["campaign"] = {"applied": False, "reason": reason}
+        report.setdefault("notes", []).append(f"amp authority unavailable: {reason}")
+        return
+    index = _amp_row_index(rows)
+    flagged = 0
+    targets = list(report.get("repos") or [])
+    cwd_repo = report.get("cwd_repo")
+    if isinstance(cwd_repo, dict):
+        targets.append(cwd_repo)
+    for row in targets:
+        if not isinstance(row, dict):
+            continue
+        info = _amp_lookup(row, index)
+        if info is None:
+            continue
+        verdict = info.get("verdict")
+        if not isinstance(verdict, str) or verdict == "clear":
+            continue
+        row["amp_verdict"] = verdict
+        reasons = info.get("reasons")
+        if isinstance(reasons, list):
+            row["amp_reasons"] = [str(item) for item in reasons]
+        if verdict == "amp-leased":
+            row.setdefault("fix", []).append(
+                "active amp lease — reconcile skill dws-closeout lane; "
+                "do not push over the Orb"
+            )
+        flagged += 1
+    campaign: dict[str, Any] = {
+        "applied": True,
+        "source": str(script),
+        "flagged_rows": flagged,
+    }
+    if isinstance(payload, dict):
+        if isinstance(payload.get("active_leases"), int):
+            campaign["active_leases"] = payload["active_leases"]
+        authority = payload.get("authority")
+        if isinstance(authority, dict):
+            campaign["authority"] = {
+                "environment": authority.get("authority_environment_id"),
+                "captured_at": authority.get("captured_at"),
+            }
+    report.setdefault("amp", {})["campaign"] = campaign
+
+
+def _is_issue_row(row: dict[str, Any]) -> bool:
+    """A row that earns footer next_actions: non-clean band, unpushed
+    branches (silent-loss class), or a non-quiet amp verdict on a clean HEAD
+    (an Orb problem hides behind a clean tree the same way)."""
+    return bool(
+        row.get("risk_band") != "clean"
+        or row.get("unpushed_branches")
+        or row.get("amp_capsule")
+        or row.get("amp_verdict")
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Report (the sbp-git/v1 envelope; text rendering reads it, JSON emits it)
 # --------------------------------------------------------------------------- #
 
@@ -996,6 +1291,7 @@ def build_report(
     timeout_s: float = DEFAULT_TIMEOUT_S,
     live: bool = False,
     live_timeout_s: float | None = None,
+    amp: bool = False,
 ) -> dict[str, Any]:
     """One read-only scan -> the full ``sbp-git/v1`` payload.
 
@@ -1005,6 +1301,10 @@ def build_report(
     ``live`` runs :func:`apply_live_comparison` AFTER the normal local scan
     (additive fields only; every failure degrades to a note). ``live=False``
     (the default) spawns nothing extra and the envelope is unchanged.
+
+    ``amp`` additionally runs :func:`apply_amp_campaign` (the lease-authority
+    read; may SSH to d3). The local capsule guard join is NOT gated on it --
+    that runs on every scan whenever the guard script exists.
     """
     active, registration_tokens = parse_only(only)
     resolved_roots = [
@@ -1050,15 +1350,33 @@ def build_report(
     for state in registration.values():
         registration_summary[state] += 1
 
-    stale_rows = [
-        {
+    stale_rows = []
+    for entry in stale_entries:
+        located = entry.get("located")
+        located = located if isinstance(located, str) and located else None
+        note = entry.get("note")
+        note = note if isinstance(note, str) and note else None
+        stale_row: dict[str, Any] = {
             "path": entry["path"],
             "id": entry.get("id"),
             "registration": "stale-registered",
-            "fix": [f"remove or repoint the registry entry in {registry_path}"],
         }
-        for entry in stale_entries
-    ]
+        if located:
+            # Annotated entries are not junk: the checkout intentionally
+            # lives on another box / inside an Amp Orb, so never advise
+            # removing the registry entry from here.
+            stale_row["located"] = located
+            stale_row["fix"] = [
+                f"lives on {located} — verify there before touching; "
+                "do not remove or repoint from this machine"
+            ]
+        else:
+            stale_row["fix"] = [
+                f"remove or repoint the registry entry in {registry_path}"
+            ]
+        if note:
+            stale_row["note"] = note
+        stale_rows.append(stale_row)
 
     elapsed = time.monotonic() - started
     report = {
@@ -1081,8 +1399,21 @@ def build_report(
         "elapsed_seconds": round(elapsed, 3),
     }
     _apply_reconcile_receipts(report)
+    _apply_amp_capsules(report)
     if live:
         apply_live_comparison(report, timeout_s=live_timeout_s)
+    if amp:
+        apply_amp_campaign(report)
+    # Backlog routing AFTER every join (an amp verdict can turn a clean row
+    # into an issue row). Below the threshold the key is absent, keeping the
+    # small-estate default envelope byte-identical.
+    issue_count = sum(1 for row in report["repos"] if _is_issue_row(row))
+    if issue_count >= _BACKLOG_THRESHOLD:
+        report["backlog"] = (
+            f"{issue_count} issue rows — run the reconcile skill (dispatcher) "
+            "and split lanes with the divide-and-conquer skill; "
+            "do not hand-work this table"
+        )
     return report
 
 
@@ -1223,6 +1554,12 @@ def _cwd_detail_lines(
         lines.append(f"  mid-op: {cwd_repo['mid_op']} in flight")
     if cwd_repo.get("origin_state") in LIVE_DRIFT_STATES:
         lines.append(f"  origin: {cwd_repo['origin_state']} (live)")
+    if cwd_repo.get("amp_capsule"):
+        lines.append(f"  amp capsule: {cwd_repo['amp_capsule']} (reseal, never hand-edit)")
+    if cwd_repo.get("amp_verdict"):
+        reasons = cwd_repo.get("amp_reasons") or []
+        suffix = f" — {reasons[0]}" if reasons else ""
+        lines.append(f"  amp: {cwd_repo['amp_verdict']}{suffix}")
     # Reconcile receipt join: the line exists only when a receipt exists (a
     # missing receipt -- or the whole store -- stays blank, never an error).
     if cwd_repo.get("last_reconcile"):
@@ -1256,6 +1593,13 @@ def _table_lines(
         # --live origin drift is a marker too (absent without --live).
         if row.get("origin_state") in LIVE_DRIFT_STATES:
             marker += f"  [{row['origin_state']}]"
+        # Amp joins: capsule drift (default join) and lease/campaign verdicts
+        # (--amp) are markers, not columns -- absent whenever the guards
+        # found nothing or did not run.
+        if row.get("amp_capsule"):
+            marker += f"  [{row['amp_capsule']}]"
+        if row.get("amp_verdict"):
+            marker += f"  [{row['amp_verdict']}]"
         # Unpushed non-HEAD branches: the silent-loss class. A marker, not a
         # column -- table widths stay unchanged; the fix line names branches.
         unpushed = row.get("unpushed_branches") or []
@@ -1312,6 +1656,21 @@ def report_text_lines(report: dict[str, Any], *, color: bool = False) -> list[st
             "  live: origin comparison applied via fleet_convergence "
             f"({live.get('matched_rows', 0)} rows matched)"
         )
+    amp = report.get("amp") or {}
+    capsule = amp.get("capsule") if isinstance(amp, dict) else None
+    if isinstance(capsule, dict) and capsule.get("applied"):
+        lines.append(
+            "  amp: capsule guard joined "
+            f"({capsule.get('flagged_rows', 0)} rows flagged)"
+        )
+    campaign = amp.get("campaign") if isinstance(amp, dict) else None
+    if isinstance(campaign, dict) and campaign.get("applied"):
+        leases = campaign.get("active_leases")
+        suffix = f", {leases} active leases" if isinstance(leases, int) else ""
+        lines.append(
+            "  amp: campaign guard joined "
+            f"({campaign.get('flagged_rows', 0)} rows flagged{suffix})"
+        )
     if report.get("registry_applied"):
         lines.append(f"  {report.get('ignored_count', 0)} ignored by registry rules")
         reg = report.get("registration_summary") or {}
@@ -1329,9 +1688,10 @@ def report_text_lines(report: dict[str, Any], *, color: bool = False) -> list[st
         lines.extend(_delta_lines(delta, now))
 
     # Clean rows collapse to one count line unless clean-current was asked
-    # for -- except a locally-clean row whose live origin has newer commits
-    # or that carries unpushed non-HEAD branches: that IS the news (the
-    # silent-loss class hides behind a clean HEAD), so it stays visible.
+    # for -- except a locally-clean row whose live origin has newer commits,
+    # that carries unpushed non-HEAD branches, or that an amp guard flagged:
+    # that IS the news (the silent-loss class hides behind a clean HEAD), so
+    # it stays visible.
     show_clean = "clean-current" in filters
     visible = [
         r
@@ -1340,6 +1700,8 @@ def report_text_lines(report: dict[str, Any], *, color: bool = False) -> list[st
         or r["risk_band"] != "clean"
         or r.get("origin_state") in LIVE_DRIFT_STATES
         or r.get("unpushed_branches")
+        or r.get("amp_capsule")
+        or r.get("amp_verdict")
     ]
     clean_hidden = len(rows) - len(visible)
     if visible:
@@ -1356,32 +1718,56 @@ def report_text_lines(report: dict[str, Any], *, color: bool = False) -> list[st
     # for, but not when --only narrows to unrelated classes.
     stale_rows = list(report.get("stale_registered") or [])
     if stale_rows and (not filters or "stale-registered" in filters):
+        located_count = sum(1 for stale in stale_rows if stale.get("located"))
+        breakdown = ""
+        if located_count:
+            unaccounted = len(stale_rows) - located_count
+            breakdown = (
+                f" ({located_count} located elsewhere, {unaccounted} unaccounted)"
+                if unaccounted
+                else f" ({located_count} located elsewhere)"
+            )
         lines.append("")
         lines.append(
-            f"stale-registered: {len(stale_rows)} registry entries with no repo on disk"
+            f"stale-registered: {len(stale_rows)} registry entries "
+            f"with no repo on disk{breakdown}"
         )
         for stale in stale_rows:
-            lines.append(f"  - {stale['path']}  -> {stale['fix'][0]}")
+            located = f"  [located: {stale['located']}]" if stale.get("located") else ""
+            note = f"  ({stale['note']})" if stale.get("note") else ""
+            lines.append(f"  - {stale['path']}{located}  -> {stale['fix'][0]}{note}")
 
-    # Clean rows with unpushed branches carry a real next_action (the branch
-    # listing) without being an issue band, so they join the footer's action
-    # rows but never the band counts.
-    issue_rows = [
-        r for r in rows if r["risk_band"] != "clean" or r.get("unpushed_branches")
-    ]
+    # Clean rows with unpushed branches or amp verdicts carry a real
+    # next_action without being an issue band, so they join the footer's
+    # action rows but never the band counts (amp gets its own count lines).
+    issue_rows = [r for r in rows if _is_issue_row(r)]
     if issue_rows:
         counts: dict[str, int] = {}
         for row in issue_rows:
             if row["risk_band"] != "clean":
                 counts[row["risk_band"]] = counts.get(row["risk_band"], 0) + 1
+        amp_capsule_count = sum(1 for r in rows if r.get("amp_capsule"))
+        amp_campaign_count = sum(1 for r in rows if r.get("amp_verdict"))
         lines.append("")
-        if counts:
+        if counts or amp_capsule_count or amp_campaign_count:
             lines.append("issues:")
             for band in RISK_BAND_NAMES:
                 if band in counts:
                     lines.append(f"  - {band}: {counts[band]}")
+            if amp_capsule_count:
+                lines.append(f"  - amp-capsule: {amp_capsule_count}")
+            if amp_campaign_count:
+                lines.append(f"  - amp-campaign: {amp_campaign_count}")
         lines.append("next_actions:")
         for row in issue_rows[:_NEXT_ACTION_ROW_CAP]:
             for fix in row["fix"]:
                 lines.append(f"  - {fix}")
+        hidden_rows = len(issue_rows) - _NEXT_ACTION_ROW_CAP
+        if hidden_rows > 0:
+            lines.append(
+                f"  (… {hidden_rows} more issue rows — "
+                "sbp git --json for the full set)"
+            )
+    if report.get("backlog"):
+        lines.append(f"backlog: {report['backlog']}")
     return lines

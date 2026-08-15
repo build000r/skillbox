@@ -39,3 +39,4 @@ next_actions:
   - add a remote or register intent
   - register in /GOLDEN_TMP/config/registry/repos.yaml or add an ignore rule there
   - add a remote or register intent
+  (… 2 more issue rows — sbp git --json for the full set)

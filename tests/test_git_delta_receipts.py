@@ -203,7 +203,13 @@ class DeltaHandlerCase(unittest.TestCase):
         self.tmp = Path(self._tmp.name).resolve()
         self.state_root = self.tmp / "state"
         patcher = mock.patch.dict(
-            os.environ, {"SKILLBOX_STATE_ROOT": str(self.state_root)}
+            os.environ,
+            {
+                "SKILLBOX_STATE_ROOT": str(self.state_root),
+                "SKILLBOX_RECONCILE_RECEIPTS_DIR": str(self.tmp / "no-receipts"),
+                "SKILLBOX_AMP_CAPSULE_GUARD": str(self.tmp / "no-capsule-guard"),
+                "SKILLBOX_AMP_CAMPAIGN_GUARD": str(self.tmp / "no-campaign-guard"),
+            },
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -352,6 +358,8 @@ class ReceiptsCase(unittest.TestCase):
                 "SKILLBOX_STATE_ROOT": str(self.tmp / "state"),
                 "SKILLBOX_CONFIG_ROOT": str(self.tmp / "config"),  # registry degrades
                 "SKILLBOX_RECONCILE_RECEIPTS_DIR": str(self.receipts),
+                "SKILLBOX_AMP_CAPSULE_GUARD": str(self.tmp / "no-capsule-guard"),
+                "SKILLBOX_AMP_CAMPAIGN_GUARD": str(self.tmp / "no-campaign-guard"),
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_CONFIG_GLOBAL": str(gitconfig),
                 "GIT_TERMINAL_PROMPT": "0",

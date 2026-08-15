@@ -209,6 +209,12 @@ class GitEstateGoldenTests(unittest.TestCase):
                 "GIT_TERMINAL_PROMPT": "0",
                 "GIT_OPTIONAL_LOCKS": "0",
                 "SKILLBOX_CONFIG_ROOT": str(cls.config_root),
+                # Hermetic joins: the goldens pin the store-less/guard-less
+                # envelope, so a real receipts store or reconcile-skill
+                # checkout on the host must never leak into the scan.
+                "SKILLBOX_RECONCILE_RECEIPTS_DIR": str(cls.tmp / "no-receipts"),
+                "SKILLBOX_AMP_CAPSULE_GUARD": str(cls.tmp / "no-capsule-guard"),
+                "SKILLBOX_AMP_CAMPAIGN_GUARD": str(cls.tmp / "no-campaign-guard"),
             },
         )
         env_patcher.start()

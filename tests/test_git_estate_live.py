@@ -136,6 +136,9 @@ class LiveFixtureCase(unittest.TestCase):
                 # Never let a test accidentally reach the real reconcile
                 # checkout; every live test overrides this deliberately.
                 SCRIPT_ENV: str(self.tmp / "no-such-fleet-convergence.py"),
+                "SKILLBOX_RECONCILE_RECEIPTS_DIR": str(self.tmp / "no-receipts"),
+                "SKILLBOX_AMP_CAPSULE_GUARD": str(self.tmp / "no-capsule-guard"),
+                "SKILLBOX_AMP_CAMPAIGN_GUARD": str(self.tmp / "no-campaign-guard"),
             },
         )
         patcher.start()

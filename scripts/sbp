@@ -932,7 +932,7 @@ case "${1:-}" in
       shift
     elif [[ -n "${1:-}" && "${1}" != -* ]]; then
       echo "${wrapper_name} git: read-only status viewer; refusing to proxy 'git ${1}'" >&2
-      echo "Usage: ${wrapper_name} git [status] [--only CLASS[,CLASS]] [--root PATH] [--depth N] [--cached] [--live] [--delta] [--json]" >&2
+      echo "Usage: ${wrapper_name} git [status] [--only CLASS[,CLASS]] [--root PATH] [--depth N] [--cached] [--live] [--amp] [--delta] [--json]" >&2
       echo "Run real git directly: git ${1} ..." >&2
       exit 2
     fi
