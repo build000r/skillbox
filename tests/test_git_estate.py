@@ -242,6 +242,61 @@ class FixCommandTests(unittest.TestCase):
             ],
         )
 
+    def test_junk_pile_earns_the_repo_janitor_handoff(self) -> None:
+        record = _record(
+            "/r/junk",
+            classes=frozenset({"dirty"}),
+            primary_class="dirty",
+            untracked=6,
+        )
+        self.assertEqual(
+            git_estate.fix_commands(record),
+            [
+                "git -C /r/junk add -p && git -C /r/junk commit",
+                "git -C /r/junk status --short  # git-repo-janitor pass (6 untracked)",
+            ],
+        )
+
+    def test_junk_handoff_stays_quiet_below_the_floor(self) -> None:
+        record = _record(
+            "/r/tidy",
+            classes=frozenset({"dirty"}),
+            primary_class="dirty",
+            untracked=git_estate.JUNK_CANDIDATE_MIN - 1,
+        )
+        self.assertEqual(
+            git_estate.fix_commands(record),
+            ["git -C /r/tidy add -p && git -C /r/tidy commit"],
+        )
+
+    def test_junk_handoff_lands_between_commit_and_stash(self) -> None:
+        record = _record(
+            "/r/both",
+            classes=frozenset({"dirty", "stash"}),
+            primary_class="dirty",
+            untracked=5,
+            stash_count=2,
+        )
+        self.assertEqual(
+            git_estate.fix_commands(record),
+            [
+                "git -C /r/both add -p && git -C /r/both commit",
+                "git -C /r/both status --short  # git-repo-janitor pass (5 untracked)",
+                "git -C /r/both stash list  # git-stash-janitor pass",
+            ],
+        )
+
+    def test_blocked_row_skips_the_junk_handoff_entirely(self) -> None:
+        record = _record(
+            "/r/blkjunk",
+            classes=frozenset({"blocked"}),
+            primary_class="blocked",
+            upstream=None,
+            untracked=99,
+            error="probe failed",
+        )
+        self.assertEqual(git_estate.fix_commands(record), ["inspect: probe failed"])
+
     def test_blocked_carries_error_and_nothing_else(self) -> None:
         record = _record(
             "/r/blk", classes=frozenset({"blocked"}), primary_class="blocked", upstream=None, error="probe died"

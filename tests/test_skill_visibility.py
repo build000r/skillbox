@@ -2028,5 +2028,43 @@ class SkillEvidenceAnnotationTests(unittest.TestCase):
         self.assertEqual(compact_demo["evidence"]["fleet_wide_count"], 9)
 
 
+class SourceBucketTests(unittest.TestCase):
+    """The archive must never outrank a maintained clone of the same skill."""
+
+    def _bucket(self, path: str) -> str:
+        from runtime_manager._skill_common import _source_bucket
+
+        return _source_bucket(path)
+
+    def test_live_jsm_archive_is_bucketed_as_archive(self) -> None:
+        home = str(Path.home())
+        self.assertEqual(
+            self._bucket(f"{home}/.jsm-archive/claude/skills/demo"), "archive"
+        )
+
+    def test_superseded_archive_locations_still_bucket_as_archive(self) -> None:
+        home = str(Path.home())
+        self.assertEqual(
+            self._bucket(f"{home}/projects/jsm-skill-archive-20260327-190501/demo"),
+            "archive",
+        )
+
+    def test_skills_private_clone_stays_local(self) -> None:
+        home = str(Path.home())
+        self.assertEqual(self._bucket(f"{home}/repos/skills-private/demo"), "local")
+
+    def test_clone_outranks_archive_for_the_same_skill(self) -> None:
+        from runtime_manager.inventory import SOURCE_BUCKET_ORDER
+
+        home = str(Path.home())
+        clone = self._bucket(f"{home}/repos/skills-private/demo")
+        archive = self._bucket(f"{home}/.jsm-archive/claude/skills/demo")
+        self.assertLess(
+            SOURCE_BUCKET_ORDER[clone],
+            SOURCE_BUCKET_ORDER[archive],
+            "a skills-private clone must resolve ahead of the read-only archive",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

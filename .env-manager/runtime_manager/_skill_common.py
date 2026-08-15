@@ -92,6 +92,13 @@ def _source_bucket(path: str) -> str:
     home = str(Path.home())
     buckets = [
         (f"{home}/repos/opensource/skills", "opensource/skills"),
+        # The live JSM archive root. Without this the path falls through to
+        # "local" and ties with a skills-private clone of the same skill, and
+        # the tie breaks on raw string order -- where a leading dot sorts ahead
+        # of "repos/", so the read-only archive copy silently beat the clone
+        # the operator actually maintains.
+        (f"{home}/.jsm-archive", "archive"),
+        # Superseded archive locations, kept so older layouts still rank right.
         (f"{home}/projects/jsm-skill-archive", "archive"),
         (f"{home}/projects/jsm-skill-archive-", "archive"),
     ]

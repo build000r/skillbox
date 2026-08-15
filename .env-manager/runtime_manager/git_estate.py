@@ -111,6 +111,7 @@ from .git_inventory import (
 __all__ = [
     "DEFAULT_LIVE_TIMEOUT_S",
     "FILTER_CLASSES",
+    "JUNK_CANDIDATE_MIN",
     "LIVE_DRIFT_STATES",
     "RECEIPTS_DIR_ENV",
     "RECEIPT_STALE_SECONDS",
@@ -214,6 +215,12 @@ RECEIPT_STALE_SECONDS = 30 * 86400
 #: Per-receipt file size cap: the join must stay a cheap glance read.
 _RECEIPT_MAX_BYTES = 1 << 20
 
+#: Untracked-entry floor at which a row earns the ``git-repo-janitor`` handoff.
+#: Matches that skill's own bar -- below five candidates its recovery-bundle
+#: overhead does not pay off, so naming it sooner would be noise. Counts are
+#: directory-collapsed (``--untracked-files=normal``), same as the scan.
+JUNK_CANDIDATE_MIN = 5
+
 
 # --------------------------------------------------------------------------- #
 # Risk sort
@@ -282,6 +289,12 @@ def fix_commands(
     ignore, with the exact registry file path) AFTER the work-securing fixes.
     Blocked rows stay inspect-only: an unprobeable path gets triaged before
     it gets registered.
+
+    Rows carrying at least :data:`JUNK_CANDIDATE_MIN` untracked entries get the
+    ``git-repo-janitor`` handoff, mirroring the ``git-stash-janitor`` one: it
+    lands after the commit fix (secure the work first, then clean the junk).
+    Both name a skill rather than a destructive command -- this function still
+    only ever hands back something to read.
     """
     path = record.path
     fixes: list[str] = []
@@ -298,6 +311,11 @@ def fix_commands(
         fixes.append(f"git -C {path} push")
     if "dirty" in record.classes:
         fixes.append(f"git -C {path} add -p && git -C {path} commit")
+    if record.untracked >= JUNK_CANDIDATE_MIN:
+        fixes.append(
+            f"git -C {path} status --short  "
+            f"# git-repo-janitor pass ({record.untracked} untracked)"
+        )
     if record.stash_count >= 1:
         fixes.append(f"git -C {path} stash list  # git-stash-janitor pass")
     if record.unpushed_branches:
