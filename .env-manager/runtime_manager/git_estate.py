@@ -120,6 +120,14 @@ mutation dispatcher that acts on what this surface shows (its Phase 0
 inventory leads with this command). When the issue backlog is large the
 footer says so and routes to reconcile + the divide-and-conquer skill
 instead of inviting serial hand-work.
+
+Reconciled means CONVERGED (the reconcile skill's Convergence Contract,
+operator-directed 2026-08-15): the acted-on end state for this surface is
+origin parity everywhere, not catalogued divergence. Every ``fix`` string
+this module emits must therefore be executable by someone tonight — advice
+that structurally cannot succeed on this box (e.g. a pull blocked by
+amp-owned debris) misroutes the run and is a defect to fix here, not a
+state to report politely (see the era-program beads).
 """
 
 from __future__ import annotations
