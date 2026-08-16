@@ -446,6 +446,98 @@ class EnrichmentProbeTests(GitFixtureCase):
             )
 
 
+class StoreIdentityTests(GitFixtureCase):
+    """``git_dir`` / ``common_dir``: the shared-ref-store identity that lets
+    git_estate attribute stashes to one row per physical store."""
+
+    def test_plain_repo_owns_its_own_store(self) -> None:
+        repo = self.make_repo("solo")
+        record = git_inventory.probe_repo(repo)
+        expected = str((repo / ".git").resolve())
+        self.assertEqual(record.git_dir, expected)
+        self.assertEqual(record.common_dir, expected)
+        # A repo that owns its store is its own primary.
+        self.assertEqual(record.git_dir, record.common_dir)
+
+    def test_linked_worktree_names_the_main_store(self) -> None:
+        repo = self.make_repo("wt-store-main")
+        worktree = self.tmp / "wt-store-linked"
+        self.git(repo, "worktree", "add", "-q", str(worktree), "-b", "linked")
+        main = git_inventory.probe_repo(repo)
+        linked = git_inventory.probe_repo(worktree)
+        # Same physical store...
+        self.assertEqual(linked.common_dir, main.common_dir)
+        # ...but the worktree has its own per-worktree git dir, so only the
+        # main checkout satisfies the primary rule (git_dir == common_dir).
+        self.assertNotEqual(linked.git_dir, linked.common_dir)
+        self.assertEqual(main.git_dir, main.common_dir)
+        self.assertIn("worktrees", str(linked.git_dir))
+
+    def test_symlink_alias_resolves_to_the_same_store_key(self) -> None:
+        repo = self.make_repo("alias-target")
+        alias = self.tmp / "alias-view"
+        alias.symlink_to(repo)
+        record = git_inventory.probe_repo(repo)
+        aliased = git_inventory.probe_repo(alias)
+        # The alias reports its own path but must NOT look like a second
+        # store: symlink resolution is what collapses the two into one key.
+        self.assertEqual(aliased.path, str(alias))
+        self.assertEqual(aliased.common_dir, record.common_dir)
+        self.assertEqual(aliased.git_dir, record.git_dir)
+
+    def test_bare_repo_reports_its_store(self) -> None:
+        bare = self.tmp / "bare-store.git"
+        self.git(self.tmp, "init", "-q", "--bare", "-b", "main", str(bare))
+        record = git_inventory.probe_repo(bare)
+        self.assertTrue(record.bare)
+        self.assertEqual(record.common_dir, str(bare.resolve()))
+        self.assertEqual(record.git_dir, record.common_dir)
+
+    def test_blocked_probe_has_no_store_key(self) -> None:
+        # An unknown key must never group with another unknown key.
+        not_a_repo = self.tmp / "not-a-repo"
+        not_a_repo.mkdir()
+        record = git_inventory.probe_repo(not_a_repo)
+        self.assertEqual(record.primary_class, "blocked")
+        self.assertIsNone(record.git_dir)
+        self.assertIsNone(record.common_dir)
+
+    def test_store_identity_costs_no_extra_subprocess(self) -> None:
+        repo = self.make_repo("store-batch")
+        calls: list[list[str]] = []
+        real_run_git = git_inventory._run_git
+
+        def spy(path: str, args, timeout_s: float):
+            calls.append(list(args))
+            return real_run_git(path, args, timeout_s)
+
+        with mock.patch.object(git_inventory, "_run_git", side_effect=spy):
+            record = git_inventory.probe_repo(repo)
+        self.assertIsNotNone(record.common_dir)
+        rev_parse = [args for args in calls if args and args[0] == "rev-parse"]
+        # --git-common-dir rides the ONE identity batch: the consolidated path
+        # spawns exactly one rev-parse, exactly as it did before the field.
+        self.assertEqual(1, len(rev_parse), f"rev-parse calls: {rev_parse}")
+        self.assertIn("--git-common-dir", rev_parse[0])
+        self.assertIn("--absolute-git-dir", rev_parse[0])
+
+    def test_old_git_without_the_query_degrades_to_no_key(self) -> None:
+        # `git rev-parse` echoes an option it does not know back verbatim and
+        # still exits 0. That must read as "unknown store", never as a key
+        # every ancient-git repo would share.
+        self.assertIsNone(git_inventory._resolve_git_path("/repo", "--git-common-dir"))
+        self.assertIsNone(git_inventory._resolve_git_path("/repo", ""))
+        self.assertIsNone(git_inventory._resolve_git_path("/repo", "   "))
+
+    def test_relative_answer_is_joined_onto_the_repo(self) -> None:
+        # --git-common-dir answers ".git" from a main worktree.
+        repo = self.make_repo("relative-answer")
+        self.assertEqual(
+            str((repo / ".git").resolve()),
+            git_inventory._resolve_git_path(str(repo), ".git"),
+        )
+
+
 class ReadOnlyContractTests(GitFixtureCase):
     def test_probe_never_fetches_and_sets_readonly_env(self) -> None:
         repo = self.make_repo("readonly")
@@ -487,7 +579,8 @@ class RecordSerializationTests(GitFixtureCase):
                 "path", "classes", "primary_class", "branch", "upstream",
                 "ahead", "behind", "stash_count", "stash_newest",
                 "stash_oldest", "staged", "unstaged", "untracked", "mid_op",
-                "unpushed_branches", "branch_scan_note", "bare", "error",
+                "unpushed_branches", "branch_scan_note", "bare", "git_dir",
+                "common_dir", "error",
             ],
         )
         self.assertEqual(payload["classes"], sorted(payload["classes"]))

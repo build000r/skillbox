@@ -41,7 +41,15 @@ call whose subgraph is walked in Python for exact per-branch counts. Past
 **Worktree-aware.** Mid-operation markers (``rebase-merge``, ``MERGE_HEAD``,
 ``CHERRY_PICK_HEAD``, ...) are looked up under ``git rev-parse
 --absolute-git-dir`` so linked worktrees are classified against their real
-per-worktree git dir -- the same trick as the shell script.
+per-worktree git dir -- the same trick as the shell script. Both that
+per-worktree dir (``git_dir``) and the SHARED store behind it
+(``common_dir``, from ``--git-common-dir``, absolute and symlink-resolved)
+ride the same identity ``rev-parse`` batch -- no extra subprocess. They are
+raw facts, not policy: a linked worktree has ``git_dir != common_dir``, a
+main worktree has them equal, and two symlink aliases of one checkout share
+both. :mod:`runtime_manager.git_estate` uses them to attribute ref-store
+counts (stashes live in the shared store, so per-checkout rows would
+otherwise multiply-count the same entries).
 
 Classification
 --------------
@@ -247,6 +255,12 @@ class GitRepoRecord:
     * ``branch_scan_note``: non-``None`` when the unpushed-branch scan was
       skipped (e.g. ``"branch scan skipped: 73 local branches"`` past
       :data:`BRANCH_SCAN_LIMIT`); doubles as the skipped flag.
+    * ``git_dir`` / ``common_dir``: this checkout's own git dir and the
+      physical store it shares (both absolute and symlink-resolved, so
+      aliases collapse to one key); ``None`` on a blocked probe or a git too
+      old for ``--git-common-dir``. ``git_dir == common_dir`` identifies a
+      main worktree; a linked worktree points at ``<common>/worktrees/<name>``
+      while naming the same ``common_dir``.
     """
 
     path: str
@@ -266,6 +280,8 @@ class GitRepoRecord:
     unpushed_branches: tuple[tuple[str, int], ...] = ()
     branch_scan_note: str | None = None
     bare: bool = False
+    git_dir: str | None = None
+    common_dir: str | None = None
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -291,6 +307,8 @@ class GitRepoRecord:
             ],
             "branch_scan_note": self.branch_scan_note,
             "bare": self.bare,
+            "git_dir": self.git_dir,
+            "common_dir": self.common_dir,
             "error": self.error,
         }
 
@@ -410,6 +428,31 @@ def _blocked(path: str, error: str) -> GitRepoRecord:
         primary_class="blocked",
         error=error,
     )
+
+
+def _resolve_git_path(repo: str, raw: str) -> str | None:
+    """Absolute, symlink-resolved form of a ``rev-parse`` path answer.
+
+    ``--git-common-dir`` answers relatively (plain ``.git``) from a main
+    worktree, so it is joined onto ``repo`` first. Both answers are then
+    ``realpath``-ed: two symlink aliases of one checkout (``opensource/x`` ->
+    ``repos/x``) must collapse to ONE store key, otherwise the alias
+    double-counts the very entries this resolution exists to dedupe.
+
+    ``git rev-parse`` echoes an option it does not recognise back verbatim and
+    still exits 0, so a git too old for ``--git-common-dir`` yields the flag
+    itself rather than a path: that (and an empty answer) reads as "unknown",
+    never as a store key.
+    """
+    value = raw.strip()
+    if not value or value.startswith("-"):
+        return None
+    if not os.path.isabs(value):
+        value = os.path.join(repo, value)
+    try:
+        return os.path.realpath(value)
+    except OSError:
+        return None
 
 
 def _probe_branch(repo: str, clock: _ProbeClock) -> str:
@@ -781,6 +824,7 @@ def _probe(repo: str, clock: _ProbeClock) -> GitRepoRecord:
             "--is-inside-work-tree",
             "--is-bare-repository",
             "--absolute-git-dir",
+            "--git-common-dir",
         ],
         clock.call_timeout(),
     )
@@ -792,6 +836,9 @@ def _probe(repo: str, clock: _ProbeClock) -> GitRepoRecord:
     inside_work_tree = lines[0].strip() == "true"
     is_bare = lines[1].strip() == "true"
     git_dir = lines[2].strip()
+    # A missing fourth line means an old git dropped the query, not a broken
+    # repo: the store key degrades to None and the repo probes as before.
+    common_dir = _resolve_git_path(repo, lines[3] if len(lines) > 3 else "")
     if not inside_work_tree and not is_bare:
         return _blocked(repo, "not a git work tree")
     bare = not inside_work_tree
@@ -866,6 +913,8 @@ def _probe(repo: str, clock: _ProbeClock) -> GitRepoRecord:
         unpushed_branches=unpushed_branches,
         branch_scan_note=branch_scan_note,
         bare=bare,
+        git_dir=_resolve_git_path(repo, git_dir),
+        common_dir=common_dir,
         error=None,
     )
 

@@ -24,12 +24,15 @@
     "unpushed_branches": [],
     "branch_scan_note": null,
     "bare": false,
+    "git_dir": "/GOLDEN_TMP/estate/b-dirty/.git",
+    "common_dir": "/GOLDEN_TMP/estate/b-dirty/.git",
     "error": null,
     "risk_band": "dirty",
     "registration": "registered",
     "fix": [
       "git -C /GOLDEN_TMP/estate/b-dirty add -p && git -C /GOLDEN_TMP/estate/b-dirty commit"
-    ]
+    ],
+    "stash_attributed": 0
   },
   "filters": [],
   "notes": [],
@@ -63,6 +66,8 @@
       ],
       "branch_scan_note": null,
       "bare": false,
+      "git_dir": "/GOLDEN_TMP/estate/e-midop/.git",
+      "common_dir": "/GOLDEN_TMP/estate/e-midop/.git",
       "error": null,
       "risk_band": "mid-op",
       "registration": "registered",
@@ -71,7 +76,8 @@
         "git -C /GOLDEN_TMP/estate/e-midop add -p && git -C /GOLDEN_TMP/estate/e-midop commit",
         "git -C /GOLDEN_TMP/estate/e-midop branch -vv  # 1 unpushed branch: feature(+2)",
         "add a remote or register intent"
-      ]
+      ],
+      "stash_attributed": 0
     },
     {
       "path": "/GOLDEN_TMP/estate/b-dirty",
@@ -93,12 +99,15 @@
       "unpushed_branches": [],
       "branch_scan_note": null,
       "bare": false,
+      "git_dir": "/GOLDEN_TMP/estate/b-dirty/.git",
+      "common_dir": "/GOLDEN_TMP/estate/b-dirty/.git",
       "error": null,
       "risk_band": "dirty",
       "registration": "registered",
       "fix": [
         "git -C /GOLDEN_TMP/estate/b-dirty add -p && git -C /GOLDEN_TMP/estate/b-dirty commit"
-      ]
+      ],
+      "stash_attributed": 0
     },
     {
       "path": "/GOLDEN_TMP/estate/c-ahead",
@@ -120,12 +129,15 @@
       "unpushed_branches": [],
       "branch_scan_note": null,
       "bare": false,
+      "git_dir": "/GOLDEN_TMP/estate/c-ahead/.git",
+      "common_dir": "/GOLDEN_TMP/estate/c-ahead/.git",
       "error": null,
       "risk_band": "ahead",
       "registration": "registered",
       "fix": [
         "git -C /GOLDEN_TMP/estate/c-ahead push"
-      ]
+      ],
+      "stash_attributed": 0
     },
     {
       "path": "/GOLDEN_TMP/estate/g-unregistered",
@@ -147,13 +159,16 @@
       "unpushed_branches": [],
       "branch_scan_note": null,
       "bare": false,
+      "git_dir": "/GOLDEN_TMP/estate/g-unregistered/.git",
+      "common_dir": "/GOLDEN_TMP/estate/g-unregistered/.git",
       "error": null,
       "risk_band": "no-remote",
       "registration": "unregistered",
       "fix": [
         "add a remote or register intent",
         "register in /GOLDEN_TMP/config/registry/repos.yaml or add an ignore rule there"
-      ]
+      ],
+      "stash_attributed": 0
     },
     {
       "path": "/GOLDEN_TMP/estate/f-noremote",
@@ -175,12 +190,15 @@
       "unpushed_branches": [],
       "branch_scan_note": null,
       "bare": false,
+      "git_dir": "/GOLDEN_TMP/estate/f-noremote/.git",
+      "common_dir": "/GOLDEN_TMP/estate/f-noremote/.git",
       "error": null,
       "risk_band": "no-remote",
       "registration": "registered",
       "fix": [
         "add a remote or register intent"
-      ]
+      ],
+      "stash_attributed": 0
     },
     {
       "path": "/GOLDEN_TMP/estate/d-stash",
@@ -202,12 +220,15 @@
       "unpushed_branches": [],
       "branch_scan_note": null,
       "bare": false,
+      "git_dir": "/GOLDEN_TMP/estate/d-stash/.git",
+      "common_dir": "/GOLDEN_TMP/estate/d-stash/.git",
       "error": null,
       "risk_band": "stash-only",
       "registration": "registered",
       "fix": [
         "git -C /GOLDEN_TMP/estate/d-stash stash list  # git-stash-janitor pass"
-      ]
+      ],
+      "stash_attributed": 2
     },
     {
       "path": "/GOLDEN_TMP/estate/a-clean",
@@ -229,10 +250,13 @@
       "unpushed_branches": [],
       "branch_scan_note": null,
       "bare": false,
+      "git_dir": "/GOLDEN_TMP/estate/a-clean/.git",
+      "common_dir": "/GOLDEN_TMP/estate/a-clean/.git",
       "error": null,
       "risk_band": "clean",
       "registration": "registered",
-      "fix": []
+      "fix": [],
+      "stash_attributed": 0
     },
     {
       "path": "/GOLDEN_TMP/estate/i-unpushed",
@@ -259,12 +283,15 @@
       ],
       "branch_scan_note": null,
       "bare": false,
+      "git_dir": "/GOLDEN_TMP/estate/i-unpushed/.git",
+      "common_dir": "/GOLDEN_TMP/estate/i-unpushed/.git",
       "error": null,
       "risk_band": "clean",
       "registration": "registered",
       "fix": [
         "git -C /GOLDEN_TMP/estate/i-unpushed branch -vv  # 1 unpushed branch: parked-work(+1)"
-      ]
+      ],
+      "stash_attributed": 0
     }
   ],
   "summary": {
@@ -279,6 +306,13 @@
     "unregistered": 1,
     "unknown": 0,
     "stale_registered": 1
+  },
+  "stash_summary": {
+    "total": 2,
+    "row_total": 2,
+    "counted_rows": 1,
+    "shared_rows": 0,
+    "shared_stores": 0
   },
   "stale_registered": [
     {

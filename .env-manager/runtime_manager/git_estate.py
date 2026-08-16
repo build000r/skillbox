@@ -36,6 +36,24 @@ clean HEAD) and joins the next_actions footer without joining the issue band
 counts. JSON carries the raw fields (``stash_newest``/``stash_oldest``,
 ``unpushed_branches``, ``branch_scan_note``) untransformed.
 
+Shared ref stores (stash attribution by git-common-dir)
+-------------------------------------------------------
+Stashes live in the *shared* ref store, not in a checkout, so linked
+worktrees and symlink aliases of one repo each report the SAME entries and
+naive row math multiplies them (six ``jame--*`` worktrees once showed five
+stash rows for two real entries). Rows are therefore grouped by the engine's
+``common_dir`` and each physical store's count is attributed to exactly ONE
+row: the main worktree (``git_dir == common_dir``) when it was scanned, else
+the first-sorted member. Every row keeps its own ``stash_count`` (the truth
+that checkout observes) and gains ``stash_attributed`` (0 on rows whose store
+another row owns) plus ``stash_store_primary`` (present only on rows sharing
+a store); ``stash_summary`` carries the estate's true distinct total, counted
+over the ignore-filtered scan like ``registration_summary``. In the tty the
+owning row prints its count as before and sharers print ``-`` with a
+``[shared store: <primary>]`` marker, so the STASH column sums to the truth
+while every checkout stays visible. Repos with a store of their own -- the
+overwhelming majority -- are attributed to themselves and render unchanged.
+
 Registry join (ignore rules + registration states)
 --------------------------------------------------
 Never reimplemented: ``skillbox-config/scripts/registry_doctor.py`` is loaded
@@ -173,6 +191,8 @@ __all__ = [
     "resolve_cwd_repo_root",
     "risk_band",
     "risk_sorted",
+    "stash_store_owners",
+    "stash_summary",
 ]
 
 #: JSON envelope version. Bump ONLY on a breaking change to the contract.
@@ -1274,6 +1294,107 @@ def _is_issue_row(row: dict[str, Any]) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Shared ref stores -- stash attribution by git-common-dir
+# --------------------------------------------------------------------------- #
+
+
+def stash_store_owners(records: Sequence[GitRepoRecord]) -> dict[str, str]:
+    """Map ``path -> owning path`` for every checkout on a SHARED ref store.
+
+    Rows are grouped by :attr:`GitRepoRecord.common_dir` (already absolute and
+    symlink-resolved by the engine, so an alias checkout lands in its target's
+    group). A store scanned exactly once is left out of the map entirely --
+    the overwhelming majority of repos, which therefore keep their existing
+    self-attributed behaviour with no marker and no extra fields.
+
+    Owner choice, in order:
+
+    1. the main worktree (``git_dir == common_dir``); the count then hangs off
+       the checkout that actually owns the store on disk;
+    2. failing that -- the main worktree lives outside the scan roots, or was
+       ignored by a registry rule -- the first-sorted member, so the estate
+       still counts the store's entries exactly once and the choice is stable
+       across runs.
+
+    A record with no ``common_dir`` (blocked probe, or a git too old for
+    ``--git-common-dir``) is never grouped: an unknown key must not be treated
+    as "same store as every other unknown". Duplicate paths collapse to one
+    member, so scanning a path twice cannot make it share a store with itself.
+    """
+    groups: dict[str, dict[str, GitRepoRecord]] = {}
+    for record in records:
+        key = record.common_dir
+        if not key:
+            continue
+        groups.setdefault(key, {})[record.path] = record
+
+    owners: dict[str, str] = {}
+    for key, members in groups.items():
+        if len(members) < 2:
+            continue
+        primaries = sorted(
+            path for path, member in members.items() if member.git_dir == key
+        )
+        owner = primaries[0] if primaries else sorted(members)[0]
+        for path in members:
+            owners[path] = owner
+    return owners
+
+
+def _attribute_stash(row: dict[str, Any], owner: str | None) -> None:
+    """Stamp one row's stash attribution in place (additive fields only).
+
+    ``owner`` is the path that owns this row's physical store, or ``None``
+    when the store is not shared with any other scanned row. ``stash_count``
+    is never rewritten -- it stays the honest per-checkout observation, and
+    the risk band, ``--only stash`` matching and fix handoff keep reading it,
+    so a worktree parked on a shared stash stays just as visible as before.
+    """
+    count = int(row.get("stash_count") or 0)
+    if owner is None:
+        row["stash_attributed"] = count
+        return
+    row["stash_store_primary"] = owner
+    row["stash_attributed"] = 0 if owner != row.get("path") else count
+
+
+def stash_summary(records: Sequence[GitRepoRecord]) -> dict[str, int]:
+    """Estate stash truth: distinct entries, not row math.
+
+    ``total`` sums each physical store exactly once, so it equals the number
+    of stash entries that really exist across ``records`` even when a repo is
+    checked out several times. Like ``ignored_count`` and
+    ``registration_summary`` this is counted over the ignore-filtered scan and
+    NOT over the ``--only`` view, so a narrowed report still tells the whole
+    truth.
+    """
+    owners = stash_store_owners(records)
+    seen: set[str] = set()
+    total = row_total = counted_rows = shared_rows = 0
+    for record in records:
+        if record.path in seen:
+            continue
+        seen.add(record.path)
+        row_total += record.stash_count
+        if owners.get(record.path, record.path) != record.path:
+            shared_rows += 1
+            continue
+        total += record.stash_count
+        if record.stash_count >= 1:
+            counted_rows += 1
+    return {
+        "total": total,
+        # What naive per-checkout row math yields; equal to ``total`` unless a
+        # store is scanned more than once. Not derivable from the emitted rows
+        # under ``--only``, which is why it ships.
+        "row_total": row_total,
+        "counted_rows": counted_rows,
+        "shared_rows": shared_rows,
+        "shared_stores": len(set(owners.values())),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Report (the sbp-git/v1 envelope; text rendering reads it, JSON emits it)
 # --------------------------------------------------------------------------- #
 
@@ -1282,11 +1403,13 @@ def _row(
     record: GitRepoRecord,
     registration: str = "unknown",
     registry_path: str | None = None,
+    stash_owner: str | None = None,
 ) -> dict[str, Any]:
     row = record.to_dict()
     row["risk_band"] = RISK_BAND_NAMES[risk_band(record)]
     row["registration"] = registration
     row["fix"] = fix_commands(record, registration, registry_path)
+    _attribute_stash(row, stash_owner)
     return row
 
 
@@ -1340,12 +1463,27 @@ def build_report(
     tokens = tuple(active) + tuple(registration_tokens)
     filtered = risk_sorted(_apply_only(kept, tokens, registration), registration)
 
+    # Attribution is decided over the ignore-filtered scan, never over the
+    # --only view: which checkout owns a physical store is a fact about the
+    # estate, so narrowing the table must not promote a linked worktree to
+    # owner and change what the very same row says.
+    stash_owners = stash_store_owners(kept)
+
     cwd_root = resolve_cwd_repo_root(cwd)
     cwd_repo = None
     if cwd_root:
         cwd_record = probe_repo(cwd_root, timeout_s=timeout_s)
         cwd_states = _registration_states([cwd_record], module, repo_entries)
-        cwd_repo = _row(cwd_record, cwd_states[cwd_record.path], registry_path)
+        # Only an owner drawn from the scanned rows is meaningful here. A cwd
+        # outside the scan roots has no scanned sibling to defer to, so it
+        # keeps ordinary self-attribution rather than pointing at a row the
+        # report does not contain.
+        cwd_repo = _row(
+            cwd_record,
+            cwd_states[cwd_record.path],
+            registry_path,
+            stash_owners.get(cwd_record.path),
+        )
 
     # Estate-level like ignored_count: counted over the ignore-filtered scan,
     # NOT the --only view, so a filtered report still tells the whole truth.
@@ -1397,11 +1535,17 @@ def build_report(
         "ignored_count": ignored_count,
         "registry_applied": registry_reason is None,
         "repos": [
-            _row(record, registration.get(record.path, "unknown"), registry_path)
+            _row(
+                record,
+                registration.get(record.path, "unknown"),
+                registry_path,
+                stash_owners.get(record.path),
+            )
             for record in filtered
         ],
         "summary": primary_class_counts(filtered),
         "registration_summary": registration_summary,
+        "stash_summary": stash_summary(kept),
         "stale_registered": stale_rows,
         "repo_count": len(filtered),
         "elapsed_seconds": round(elapsed, 3),
@@ -1523,6 +1667,21 @@ def _delta_lines(delta: dict[str, Any], now: str | None) -> list[str]:
     return lines
 
 
+def _shared_store_marker(row: dict[str, Any]) -> str | None:
+    """``[shared store: <primary>]`` for a row another checkout counts for.
+
+    ``None`` for an owning row, an unshared store, and for a shared store
+    holding no stash at all: with nothing to double-count, the marker would be
+    pure noise on every linked worktree in the estate.
+    """
+    primary = row.get("stash_store_primary")
+    if not isinstance(primary, str) or primary == row.get("path"):
+        return None
+    if int(row.get("stash_count") or 0) < 1:
+        return None
+    return f"[shared store: {primary}]"
+
+
 def _unpushed_listing(row: dict[str, Any]) -> str:
     return ", ".join(
         f"{entry['name']} (+{entry['ahead']})"
@@ -1553,6 +1712,12 @@ def _cwd_detail_lines(
     oldest = _relative_age(cwd_repo.get("stash_oldest"), now)
     if newest and oldest:
         stash_line += f" (newest {newest}, oldest {oldest})"
+    # The count stays -- from here those entries really are reachable -- but a
+    # sharer says where the estate counts them, so the detail block and the
+    # table below it never look like they disagree.
+    shared = _shared_store_marker(cwd_repo)
+    if shared:
+        stash_line += f"  {shared}"
     lines.append(stash_line)
     if cwd_repo.get("unpushed_branches"):
         lines.append(f"  unpushed branches: {_unpushed_listing(cwd_repo)}")
@@ -1614,10 +1779,18 @@ def _table_lines(
         if unpushed:
             noun = "branch" if len(unpushed) == 1 else "branches"
             marker += f"  [+{len(unpushed)} unpushed {noun}]"
+        # Shared ref store: the count belongs to ONE row, so a sharer prints
+        # "-" instead of a copy of its primary's number -- the STASH column
+        # stays summable -- and names the row that carries it. The stash ages
+        # are that same store's ages, so they render there too, not twice.
+        shared = _shared_store_marker(row)
+        stash_cell = f"{'-':>5s}" if shared else f"{row['stash_count']:>5d}"
+        if shared:
+            marker += f"  {shared}"
         # Stash age matters most where the stash IS the story (stash-only
         # band); elsewhere the band's own signal leads and the cwd detail /
         # JSON fields carry the ages.
-        if band == "stash-only":
+        elif band == "stash-only":
             newest = _relative_age(row.get("stash_newest"), now)
             oldest = _relative_age(row.get("stash_oldest"), now)
             if newest and oldest:
@@ -1632,7 +1805,7 @@ def _table_lines(
         lines.append(
             f"  {_paint(f'{band:{band_w}s}', band, color)}  "
             f"{ab:>5s}  {counts:>7s}  "
-            f"{row['stash_count']:>5d}  {str(row['branch']):{branch_w}s}  "
+            f"{stash_cell}  {str(row['branch']):{branch_w}s}  "
             f"{row['path']}{marker}"
         )
     return lines
@@ -1686,6 +1859,20 @@ def report_text_lines(report: dict[str, Any], *, color: bool = False) -> list[st
             f"  registration: {reg.get('registered', 0)} registered, "
             f"{reg.get('unregistered', 0)} unregistered, "
             f"{reg.get('stale_registered', 0)} stale-registered"
+        )
+
+    # The estate's true distinct stash total, stated ONLY where row math would
+    # have lied (a shared store actually holding stashes). Estates without one
+    # render exactly as before -- the per-row column already sums to the truth.
+    stash = report.get("stash_summary") or {}
+    shared_rows = int(stash.get("shared_rows") or 0)
+    if shared_rows and int(stash.get("total") or 0):
+        single = shared_rows == 1
+        row_noun = "row" if single else "rows"
+        pronoun = "its" if single else "their"
+        lines.append(
+            f"  stash: {stash['total']} distinct entries "
+            f"({shared_rows} {row_noun} counted at {pronoun} primary store)"
         )
 
     # --delta section (additive: the key only exists on --delta runs), shown

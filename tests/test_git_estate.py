@@ -1089,6 +1089,339 @@ class TextRenderingTests(GitEstateFixtureCase):
         self.assertNotIn("(newest", text)
 
 
+class StashStoreOwnerTests(unittest.TestCase):
+    """Attribution keys, owner choice and the estate total -- the correctness
+    core, exercised on synthetic records so every edge is reachable."""
+
+    @staticmethod
+    def _store(path: str, store: str, *, linked: bool = False, stash: int = 0):
+        git_dir = f"{store}/worktrees/{Path(path).name}" if linked else store
+        return _record(
+            path,
+            git_dir=git_dir,
+            common_dir=store,
+            stash_count=stash,
+            classes=frozenset({"stash"}) if stash else frozenset({"clean-current"}),
+        )
+
+    def test_unshared_stores_are_absent_from_the_map(self) -> None:
+        records = [
+            self._store("/r/a", "/r/a/.git", stash=3),
+            self._store("/r/b", "/r/b/.git", stash=1),
+        ]
+        # Every ordinary repo owns its store: no entry, no marker, no change.
+        self.assertEqual({}, git_estate.stash_store_owners(records))
+        self.assertEqual(
+            {
+                "total": 4,
+                "row_total": 4,
+                "counted_rows": 2,
+                "shared_rows": 0,
+                "shared_stores": 0,
+            },
+            git_estate.stash_summary(records),
+        )
+
+    def test_main_worktree_owns_the_store_over_its_linked_worktrees(self) -> None:
+        store = "/r/main/.git"
+        records = [
+            self._store("/r/wt-a", store, linked=True, stash=2),
+            self._store("/r/main", store, stash=2),
+            self._store("/r/wt-b", store, linked=True, stash=2),
+        ]
+        owners = git_estate.stash_store_owners(records)
+        self.assertEqual({"/r/main", "/r/wt-a", "/r/wt-b"}, set(owners))
+        self.assertEqual({"/r/main"}, set(owners.values()))
+        # Row math says six; the store holds two.
+        summary = git_estate.stash_summary(records)
+        self.assertEqual(2, summary["total"])
+        self.assertEqual(6, summary["row_total"])
+        self.assertEqual(1, summary["counted_rows"])
+        self.assertEqual(2, summary["shared_rows"])
+        self.assertEqual(1, summary["shared_stores"])
+
+    def test_missing_primary_falls_back_to_first_sorted_member(self) -> None:
+        # The main worktree lives outside the scan roots (or a registry rule
+        # ignored it): the estate must still count the store exactly once, and
+        # pick the same row on every run.
+        store = "/elsewhere/main/.git"
+        records = [
+            self._store("/r/wt-z", store, linked=True, stash=5),
+            self._store("/r/wt-a", store, linked=True, stash=5),
+        ]
+        owners = git_estate.stash_store_owners(records)
+        self.assertEqual({"/r/wt-a", "/r/wt-z"}, set(owners))
+        self.assertEqual({"/r/wt-a"}, set(owners.values()))
+        self.assertEqual(5, git_estate.stash_summary(records)["total"])
+        # Stable regardless of input order.
+        self.assertEqual(
+            owners, git_estate.stash_store_owners(list(reversed(records)))
+        )
+
+    def test_symlink_alias_of_one_checkout_is_not_a_second_store(self) -> None:
+        # Both rows resolve to the same store and both look like a main
+        # worktree; the tiebreak keeps exactly one of them counted.
+        store = "/r/real/.git"
+        records = [
+            self._store("/r/alias", store, stash=4),
+            self._store("/r/real", store, stash=4),
+        ]
+        summary = git_estate.stash_summary(records)
+        self.assertEqual(4, summary["total"])
+        self.assertEqual(1, summary["counted_rows"])
+        self.assertEqual(1, summary["shared_rows"])
+
+    def test_unknown_store_keys_never_group_together(self) -> None:
+        # Blocked probes (and a git too old for --git-common-dir) have no key.
+        # Treating "unknown" as one shared store would silently drop counts.
+        records = [
+            _record("/r/blocked-a", common_dir=None, git_dir=None, stash_count=1),
+            _record("/r/blocked-b", common_dir=None, git_dir=None, stash_count=2),
+        ]
+        self.assertEqual({}, git_estate.stash_store_owners(records))
+        self.assertEqual(3, git_estate.stash_summary(records)["total"])
+
+    def test_a_path_scanned_twice_does_not_share_a_store_with_itself(self) -> None:
+        record = self._store("/r/solo", "/r/solo/.git", stash=2)
+        self.assertEqual({}, git_estate.stash_store_owners([record, record]))
+        self.assertEqual(2, git_estate.stash_summary([record, record])["total"])
+
+    def test_renderer_tolerates_a_pre_attribution_envelope(self) -> None:
+        # `sbp git --cached` replays envelopes written before this field
+        # existed: no stash_summary, no stash_store_primary. Those must render
+        # exactly as they always did rather than KeyError on a stale cache.
+        legacy = {
+            "generated_at": "2026-08-09T12:00:00+00:00",
+            "roots": ["/r"],
+            "repo_count": 1,
+            "filters": [],
+            "repos": [
+                {
+                    "path": "/r/solo",
+                    "risk_band": "stash-only",
+                    "branch": "main",
+                    "ahead": 0,
+                    "behind": 0,
+                    "staged": 0,
+                    "unstaged": 0,
+                    "untracked": 0,
+                    "stash_count": 3,
+                    "fix": [],
+                }
+            ],
+        }
+        text = "\n".join(git_estate.report_text_lines(legacy, color=False))
+        self.assertIn("      3  main    /r/solo", text)
+        self.assertNotIn("[shared store:", text)
+        self.assertNotIn("distinct entries", text)
+
+    def test_attribution_never_rewrites_the_observed_count(self) -> None:
+        row = {"path": "/r/wt", "stash_count": 2}
+        git_estate._attribute_stash(row, "/r/main")
+        # The checkout really can reach those two entries -- band, --only
+        # stash and the fix handoff keep reading stash_count.
+        self.assertEqual(2, row["stash_count"])
+        self.assertEqual(0, row["stash_attributed"])
+        self.assertEqual("/r/main", row["stash_store_primary"])
+
+        owner = {"path": "/r/main", "stash_count": 2}
+        git_estate._attribute_stash(owner, "/r/main")
+        self.assertEqual(2, owner["stash_attributed"])
+        self.assertEqual("/r/main", owner["stash_store_primary"])
+
+        solo = {"path": "/r/solo", "stash_count": 7}
+        git_estate._attribute_stash(solo, None)
+        self.assertEqual(7, solo["stash_attributed"])
+        self.assertNotIn("stash_store_primary", solo)
+
+
+class SharedStoreFixtureTests(GitEstateFixtureCase):
+    """Real linked worktrees / symlink aliases through ``build_report``."""
+
+    def stash_twice(self, repo: Path) -> None:
+        for i in range(2):
+            (repo / "tracked.txt").write_text(f"stash {i}\n", encoding="utf-8")
+            self.git(repo, "stash", "push", "-q", "-m", f"stash {i}")
+
+    def add_worktree(self, repo: Path, name: str) -> Path:
+        worktree = self.estate / name
+        self.git(repo, "worktree", "add", "-q", str(worktree), "-b", name)
+        return worktree
+
+    def table_row(self, lines: list[str], path: Path) -> str:
+        """The one table line whose PATH column is ``path`` (row markers and
+        footer fix lines both mention paths; only a row indents its own)."""
+        needle = f"  {path}"
+        rows = [
+            line
+            for line in lines
+            if line.endswith(needle) or f"{needle}  " in line
+        ]
+        self.assertEqual(1, len(rows), f"one table row for {path}: {rows}")
+        return rows[0]
+
+    def test_two_linked_worktrees_count_their_two_stashes_once(self) -> None:
+        main = self.make_repo("a-main")
+        self.stash_twice(main)
+        wt_one = self.add_worktree(main, "b-wt-one")
+        wt_two = self.add_worktree(main, "c-wt-two")
+        self.write_config_fixture()
+
+        report = git_estate.build_report(roots=[str(self.estate)], depth=2)
+        rows = {row["path"]: row for row in report["repos"]}
+        self.assertEqual({str(main), str(wt_one), str(wt_two)}, set(rows))
+
+        # Every checkout observes the same two entries...
+        for path in rows:
+            self.assertEqual(2, rows[path]["stash_count"], path)
+        # ...one physical store behind all three...
+        self.assertEqual(
+            1, len({row["common_dir"] for row in rows.values()})
+        )
+        # ...counted exactly once, at the main worktree.
+        self.assertEqual(2, rows[str(main)]["stash_attributed"])
+        self.assertEqual(0, rows[str(wt_one)]["stash_attributed"])
+        self.assertEqual(0, rows[str(wt_two)]["stash_attributed"])
+        for row in rows.values():
+            self.assertEqual(str(main), row["stash_store_primary"])
+
+        self.assertEqual(
+            {
+                "total": 2,
+                "row_total": 6,
+                "counted_rows": 1,
+                "shared_rows": 2,
+                "shared_stores": 1,
+            },
+            report["stash_summary"],
+        )
+
+    def test_text_table_shows_one_count_and_two_shared_markers(self) -> None:
+        main = self.make_repo("a-main")
+        self.stash_twice(main)
+        wt_one = self.add_worktree(main, "b-wt-one")
+        wt_two = self.add_worktree(main, "c-wt-two")
+        self.write_config_fixture()
+
+        report = git_estate.build_report(roots=[str(self.estate)], depth=2)
+        lines = git_estate.report_text_lines(report, color=False)
+        text = "\n".join(lines)
+
+        marker = f"[shared store: {main}]"
+        self.assertEqual(2, text.count(marker))
+        for worktree in (wt_one, wt_two):
+            row = self.table_row(lines, worktree)
+            # The count is NOT duplicated into the sharer's STASH column.
+            self.assertIn(marker, row)
+            self.assertIn("    -  ", row)
+            self.assertNotIn("    2  ", row)
+        main_row = self.table_row(lines, main)
+        self.assertIn("    2  ", main_row)
+        self.assertNotIn(marker, main_row)
+
+        # The STASH column now sums to the truth, and the estate header says
+        # so outright so nobody has to sum it.
+        self.assertIn(
+            "  stash: 2 distinct entries (2 rows counted at their primary store)",
+            lines,
+        )
+
+    def test_symlink_alias_root_adds_no_second_counted_row(self) -> None:
+        real = self.make_repo("real-checkout")
+        self.stash_twice(real)
+        alias = self.tmp / "alias-checkout"
+        alias.symlink_to(real)
+        self.write_config_fixture()
+
+        report = git_estate.build_report(
+            roots=[str(self.estate), str(alias)], depth=2
+        )
+        rows = {row["path"]: row for row in report["repos"]}
+        # Both views are reported (per-checkout visibility survives)...
+        self.assertEqual({str(real), str(alias)}, set(rows))
+        self.assertEqual(
+            rows[str(real)]["common_dir"], rows[str(alias)]["common_dir"]
+        )
+        # ...but the alias is not a second store: two entries, counted once.
+        self.assertEqual(2, report["stash_summary"]["total"])
+        self.assertEqual(4, report["stash_summary"]["row_total"])
+        self.assertEqual(1, report["stash_summary"]["counted_rows"])
+        counted = [p for p, row in rows.items() if row["stash_attributed"]]
+        self.assertEqual(1, len(counted))
+
+    def test_ordinary_estate_is_untouched_by_attribution(self) -> None:
+        stashed = self.make_repo("a-stashed")
+        self.stash_twice(stashed)
+        other = self.make_repo("b-other")
+        (other / "loose.txt").write_text("loose\n", encoding="utf-8")
+        self.write_config_fixture()
+
+        report = git_estate.build_report(roots=[str(self.estate)], depth=2)
+        rows = {row["path"]: row for row in report["repos"]}
+        for path, row in rows.items():
+            self.assertEqual(row["stash_count"], row["stash_attributed"], path)
+            self.assertNotIn("stash_store_primary", row)
+        self.assertEqual(2, report["stash_summary"]["total"])
+        self.assertEqual(0, report["stash_summary"]["shared_rows"])
+
+        text = "\n".join(git_estate.report_text_lines(report, color=False))
+        # No shared store -> no marker, and no summary line either: the column
+        # already sums to the truth.
+        self.assertNotIn("[shared store:", text)
+        self.assertNotIn("distinct entries", text)
+
+    def test_shared_store_without_stashes_stays_quiet(self) -> None:
+        main = self.make_repo("a-main")
+        worktree = self.add_worktree(main, "b-wt")
+        self.write_config_fixture()
+
+        report = git_estate.build_report(roots=[str(self.estate)], depth=2)
+        rows = {row["path"]: row for row in report["repos"]}
+        # The structural fact still ships for machines...
+        self.assertEqual(str(main), rows[str(worktree)]["stash_store_primary"])
+        text = "\n".join(git_estate.report_text_lines(report, color=False))
+        # ...but with nothing to double-count, the tty stays silent.
+        self.assertNotIn("[shared store:", text)
+        self.assertNotIn("distinct entries", text)
+
+    def test_only_filter_does_not_move_the_attribution(self) -> None:
+        main = self.make_repo("a-main")
+        self.stash_twice(main)
+        worktree = self.add_worktree(main, "b-wt")
+        self.write_config_fixture()
+
+        full = git_estate.build_report(roots=[str(self.estate)], depth=2)
+        # --only stash keeps both rows; the worktree must NOT be promoted to
+        # owner just because the view narrowed, and the estate total is still
+        # counted over the whole ignore-filtered scan.
+        filtered = git_estate.build_report(
+            roots=[str(self.estate)], depth=2, only=["stash"]
+        )
+        for report in (full, filtered):
+            rows = {row["path"]: row for row in report["repos"]}
+            self.assertEqual(2, rows[str(main)]["stash_attributed"])
+            self.assertEqual(0, rows[str(worktree)]["stash_attributed"])
+            self.assertEqual(2, report["stash_summary"]["total"])
+
+    def test_cwd_detail_names_the_primary_when_cwd_is_a_worktree(self) -> None:
+        main = self.make_repo("a-main")
+        self.stash_twice(main)
+        worktree = self.add_worktree(main, "b-wt")
+        self.write_config_fixture()
+
+        report = git_estate.build_report(
+            roots=[str(self.estate)], depth=2, cwd=str(worktree)
+        )
+        self.assertEqual(str(main), report["cwd_repo"]["stash_store_primary"])
+        self.assertEqual(0, report["cwd_repo"]["stash_attributed"])
+        lines = git_estate.report_text_lines(report, color=False)
+        # The detail block keeps the reachable count -- from here those two
+        # entries really are reachable -- and says where it is counted.
+        detail = next(line for line in lines if line.startswith("  stash: "))
+        self.assertTrue(detail.startswith("  stash: 2 (newest "), detail)
+        self.assertTrue(detail.endswith(f"  [shared store: {main}]"), detail)
+
+
 class WrapperAliasTests(GitEstateFixtureCase):
     """`sbp git` / `sbp gs` / `sbp git status` through the real wrapper."""
 
