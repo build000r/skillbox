@@ -1,0 +1,18 @@
+{
+  "findings": [
+    {
+      "code": "missing_default_group",
+      "location": "groups",
+      "message": "`groups.default` is required; a manifest never means 'everything I happened to find'"
+    }
+  ],
+  "groups": {
+    "full": [
+      "a"
+    ]
+  },
+  "manifest_parsed": true,
+  "unit_ids": [
+    "a"
+  ]
+}

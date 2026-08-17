@@ -1,0 +1,30 @@
+{
+  "findings": [
+    {
+      "code": "unknown_key",
+      "location": "surprise",
+      "message": "unknown top-level key 'surprise'; allowed: ['groups', 'schema_version', 'units']"
+    },
+    {
+      "code": "unknown_key",
+      "location": "retries",
+      "message": "unknown unit key 'retries'; allowed: ['artifacts', 'cache', 'command', 'cwd', 'depends_on', 'env', 'exclusivity', 'requires', 'resource_group', 'services', 'timeout_s']",
+      "unit": "typo"
+    },
+    {
+      "code": "unknown_key",
+      "location": "timeout",
+      "message": "unknown unit key 'timeout'; allowed: ['artifacts', 'cache', 'command', 'cwd', 'depends_on', 'env', 'exclusivity', 'requires', 'resource_group', 'services', 'timeout_s']",
+      "unit": "typo"
+    }
+  ],
+  "groups": {
+    "default": [
+      "typo"
+    ]
+  },
+  "manifest_parsed": true,
+  "unit_ids": [
+    "typo"
+  ]
+}

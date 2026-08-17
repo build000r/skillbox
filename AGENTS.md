@@ -39,7 +39,7 @@ Main entry points:
 - Start/stop shell: `make up`, `make shell`, `make down`
 - Optional surfaces: `make up-surfaces`
 - Runtime services: `make runtime-up CLIENT=<id> PROFILE=<name>`, `make runtime-down CLIENT=<id> PROFILE=<name>`, `make runtime-status`
-- Box lifecycle: `make box-up BOX=<id>`, `make box-down BOX=<id>`, `make box-status`, `make box-list`, `make box-ssh BOX=<id>`
+- Box lifecycle: `make box-up BOX=<id>`, `make box-down BOX=<id> DRY_RUN=1` (preview) / `make box-down BOX=<id> CONFIRM=<id>` (real, identity-bound), `make box-status`, `make box-list`, `make box-ssh BOX=<id>`
 - Release/upgrade scripts: `install.sh`, `scripts/06-upgrade-release.sh`, `scripts/07-build-and-push-binary.sh`; verify arguments before use.
 - Clipboard bootstrap (explicit manual step; not run by `install.sh`/`box.py`): `scripts/clipboard-bootstrap --profile local|d3|sweet|jeremy|conference1 [--dry-run|--apply-remote]` — remote profiles print a plan by default and only write with `--apply-remote`. Canonical flow: "New-host clipboard adoption" in `docs/operations.md`; bundle in `scripts/clipboard/`; closeout `scripts/clipboard-closeout.sh`; design `docs/clipboard-bootstrap.md`.
 - Canonical local CI gate: `make self-test` (or `./scripts/self-test.sh --rev <rev>`) runs Ruff, ShellCheck, compose config validation, `scripts/04-reconcile.py render`, and the pinned 3.11/3.12/3.13 unittest matrix with 3.12 coverage against an isolated checkout of an exact SHA, then writes a receipt under `.skillbox-state/self-test/receipts/`. `.githooks/pre-push` runs it and blocks the push on failure (`make install-hooks`).
@@ -160,7 +160,7 @@ the operator's private hosts registry (`SKILLBOX_CLIPBOARD_HOSTS`); the tracked
   pins are repo-local; global defaults must go through
   `sbp skill default on|off <name> --global --dry-run` and apply with `--yes`.
   `off`/`default off` cannot disable dispatcher floor skills.
-- Treat `make box-down`, `scripts/box.py down`, droplet destroy paths, Tailscale removal, and upgrade rollback paths as destructive; use dry-run or confirmation where supported.
+- Treat `make box-down`, `scripts/box.py down`, droplet destroy paths, Tailscale removal, and upgrade rollback paths as destructive; use dry-run or confirmation where supported. Teardown confirmation is identity-bound: `--confirm <box-id>` / `CONFIRM=<box-id>` must equal the box id, and a real run also refuses on an uncommitted tree (`dirty_tree_refused`). There is no blanket `YES=1` on the Make surface.
 - The `operator_box_exec` MCP tool is gated server-side
   (`scripts/operator_mcp_server.py`): a short read-only allowlist
   (status/journalctl/df/`docker ps`/`docker logs`/`git status`/`cat` of

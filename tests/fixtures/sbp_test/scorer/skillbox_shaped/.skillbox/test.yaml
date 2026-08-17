@@ -1,0 +1,13 @@
+schema_version: 1
+units:
+  contract:
+    command: [python3, scripts/contract_check.py]
+    artifacts: [reports/contract.xml]
+  render:
+    command: [python3, scripts/render_check.py]
+    artifacts: [reports/render.xml]
+  unittest:
+    command: [python3, -m, unittest, discover, -s, tests]
+groups:
+  default: [contract, render]
+  full: [contract, render, unittest]

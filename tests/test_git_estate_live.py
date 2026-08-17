@@ -38,6 +38,8 @@ if str(ENV_MANAGER_DIR) not in sys.path:
 
 from runtime_manager import git_estate  # noqa: E402
 
+from tests import helpers  # noqa: E402
+
 SCRIPT_ENV = "SKILLBOX_FLEET_CONVERGENCE"
 TIMEOUT_ENV = "SKILLBOX_FLEET_CONVERGENCE_TIMEOUT_S"
 
@@ -136,9 +138,7 @@ class LiveFixtureCase(unittest.TestCase):
                 # Never let a test accidentally reach the real reconcile
                 # checkout; every live test overrides this deliberately.
                 SCRIPT_ENV: str(self.tmp / "no-such-fleet-convergence.py"),
-                "SKILLBOX_RECONCILE_RECEIPTS_DIR": str(self.tmp / "no-receipts"),
-                "SKILLBOX_AMP_CAPSULE_GUARD": str(self.tmp / "no-capsule-guard"),
-                "SKILLBOX_AMP_CAMPAIGN_GUARD": str(self.tmp / "no-campaign-guard"),
+                **helpers.hermetic_join_env(self.tmp),
             },
         )
         patcher.start()

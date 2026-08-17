@@ -21,6 +21,7 @@ Status: python3 .env-manager/pulse.py [status]  (bare invocation is read-only)
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -268,21 +269,95 @@ def log(level: str, message: str, **extra: Any) -> None:
 # PID management
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Single-writer windows
+# ---------------------------------------------------------------------------
+#
+# pulse is a DAEMON. Holding the state-root lease for its lifetime would make it
+# the permanent single writer and starve every other surface, so the lease is
+# taken per mutation window and released before the sleep: one bounded span
+# around the reconcile tick, and short spans around the PID writes. Status and
+# the sleep never take it.
+#
+# The wait is bounded and short on purpose (an unbounded wait is an explicit
+# non-goal). When the window cannot be entered the tick is SKIPPED -- not
+# forced, not spun on -- and the contention is logged with its boundary and
+# holder. Skipping is safe precisely because nothing has been mutated yet: the
+# body never ran, so the next tick simply tries again.
+
+PULSE_LEASE_TIMEOUT_SECONDS = 5.0
+
+
+class PulseLeaseContention(RuntimeError):
+    """The state root was busy for the whole bounded wait. Not a failure state.
+
+    Carries the forensics the lease collected, so a skipped tick can name WHO
+    held the root instead of reporting an anonymous stall.
+    """
+
+    def __init__(self, boundary_id: str, cause: Exception) -> None:
+        super().__init__(f"state root busy for {boundary_id}")
+        self.boundary_id = boundary_id
+        self.code = str(getattr(cause, "code", "STATE_LEASE_TIMEOUT"))
+        self.holder = getattr(cause, "holder", None)
+        self.lock_path = str(getattr(cause, "lock_path", "") or "")
+        self.waited_seconds = getattr(cause, "waited_seconds", None)
+
+
+@contextlib.contextmanager
+def pulse_mutation_window(
+    boundary_id: str,
+    root_dir: Path,
+    *,
+    timeout: float = PULSE_LEASE_TIMEOUT_SECONDS,
+) -> Any:
+    """Hold the single-writer lease for one bounded pulse mutation window."""
+    from runtime_manager import state_mutation as _sm  # noqa: PLC0415
+
+    try:
+        with _sm.runtime_mutation_lease(
+            boundary_id,
+            root_dir=root_dir,
+            timeout=timeout,
+            annotations={"surface": "pulse"},
+        ) as held:
+            yield held
+    except _sm.StateMutationLeaseTimeout as exc:
+        raise PulseLeaseContention(boundary_id, exc) from exc
+
+
+def log_lease_contention(what: str, exc: PulseLeaseContention) -> None:
+    """One structured line per skipped window. Contention is never swallowed."""
+    holder = exc.holder if isinstance(exc.holder, dict) else {}
+    advisory = holder.get("advisory") if isinstance(holder, dict) else None
+    log(
+        "warn",
+        f"{what} skipped: state root busy",
+        boundary=exc.boundary_id,
+        code=exc.code,
+        waited_seconds=exc.waited_seconds,
+        holder_boundary=str((advisory or {}).get("boundary_id", "") or ""),
+        holder_pid=holder.get("pid") if isinstance(holder, dict) else None,
+    )
+
+
 def write_pid(root_dir: Path) -> Path:
     pid_path = pulse_pid_path(root_dir)
-    pid_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = pid_path.with_suffix(pid_path.suffix + ".tmp")
-    tmp_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
-    os.replace(tmp_path, pid_path)
+    with pulse_mutation_window("pulse.start", root_dir):
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = pid_path.with_suffix(pid_path.suffix + ".tmp")
+        tmp_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+        os.replace(tmp_path, pid_path)
     return pid_path
 
 
 def remove_pid(root_dir: Path) -> None:
-    for pid_path in pulse_pid_candidates(root_dir):
-        try:
-            pid_path.unlink()
-        except FileNotFoundError:
-            pass
+    with pulse_mutation_window("pulse.stop", root_dir):
+        for pid_path in pulse_pid_candidates(root_dir):
+            try:
+                pid_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def existing_pid(root_dir: Path) -> int | None:
@@ -295,11 +370,23 @@ def existing_pid(root_dir: Path) -> int | None:
             continue
         if process_is_running(pid):
             return pid
-        # Stale PID file — clean up.
+        # Stale PID file — clean up. This is the ONE write `pulse status`
+        # can perform (state_mutation.py classifies pulse.status
+        # conditional_mutation for exactly this line), so the WINDOW is taken
+        # here rather than around the whole status command: status has to stay
+        # answerable while a writer holds the root.
+        #
+        # On contention the cleanup is DEFERRED, never forced. The return
+        # value is identical either way, so a busy root delays a tidy-up and
+        # changes nothing an operator reads.
         try:
-            pid_path.unlink()
-        except FileNotFoundError:
-            pass
+            with pulse_mutation_window("pulse.status", root_dir):
+                try:
+                    pid_path.unlink()
+                except FileNotFoundError:
+                    pass
+        except PulseLeaseContention as exc:
+            log_lease_contention("stale pid cleanup", exc)
     return None
 
 
@@ -952,6 +1039,10 @@ class PulseState:
         self.cycle_count: int = 0
         self.heals: int = 0
         self.events_emitted: int = 0
+        #: Ticks skipped because another writer held the state root. Surfaced in
+        #: the snapshot so contention is visible to `pulse status`, not only in
+        #: the log.
+        self.lease_contentions: int = 0
 
     def to_dict(self, *, now: float | None = None) -> dict[str, Any]:
         unhealthy_for = {}
@@ -964,6 +1055,7 @@ class PulseState:
             "cycle_count": self.cycle_count,
             "heals": self.heals,
             "events_emitted": self.events_emitted,
+            "lease_contentions": self.lease_contentions,
             "config_hash": self.config_hash,
             "service_states": dict(self.service_states),
             "check_states": dict(self.check_states),
@@ -1559,15 +1651,24 @@ def run_daemon(
     try:
         while not _shutdown:
             try:
-                reconcile_once(
-                    root_dir,
-                    state,
-                    auto_restart=auto_restart,
-                    auto_sync=auto_sync,
-                    active_clients=active_clients,
-                    active_profiles=active_profiles,
-                    unhealthy_grace_seconds=unhealthy_grace_seconds,
-                )
+                # One bounded window per tick, around the whole mutating body
+                # (sync, restart, cleanup, telemetry, snapshot) and released
+                # before the sleep below. The sleep is never held.
+                with pulse_mutation_window("pulse.run", root_dir):
+                    reconcile_once(
+                        root_dir,
+                        state,
+                        auto_restart=auto_restart,
+                        auto_sync=auto_sync,
+                        active_clients=active_clients,
+                        active_profiles=active_profiles,
+                        unhealthy_grace_seconds=unhealthy_grace_seconds,
+                    )
+            except PulseLeaseContention as exc:
+                # Nothing was mutated: the body never ran. Report and take the
+                # next tick, rather than forcing the lock or spinning on it.
+                state.lease_contentions += 1
+                log_lease_contention("cycle", exc)
             except Exception as exc:
                 log("error", f"cycle failed: {exc}")
 

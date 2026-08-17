@@ -27,8 +27,19 @@ from runtime_manager.state_backup import (  # noqa: E402
     restore_state_backup,
     verify_state_backup,
 )
+from runtime_manager import state_mutation as SM  # noqa: E402
 from runtime_manager import workflows as WORKFLOWS  # noqa: E402
 
+
+
+def _leased(state_root):
+    """Hold the single-writer lease for ``state_root`` the way dispatch does.
+
+    ``restore`` replaces an entire root, so it refuses unless the caller already
+    holds the lease for exactly that root. Every restore test therefore runs
+    inside this.
+    """
+    return SM.state_mutation_lease(state_root, "manage.state-backup.restore")
 
 class StateBackupTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -158,29 +169,36 @@ class StateBackupTests(unittest.TestCase):
         original = (self.state_root / "logs" / "runtime.log").read_text(encoding="utf-8")
         (self.state_root / "logs" / "runtime.log").write_text("changed\n", encoding="utf-8")
 
-        with self.assertRaises(StateBackupError) as raised:
-            restore_state_backup(manifest, state_root=self.state_root, backup_root=self.backup_root)
-        self.assertEqual(raised.exception.code, "STATE_BACKUP_RESTORE_CONFIRMATION_REQUIRED")
+        with _leased(self.state_root):
+            with self.assertRaises(StateBackupError) as raised:
+                restore_state_backup(
+                    manifest, state_root=self.state_root, backup_root=self.backup_root
+                )
+            self.assertEqual(
+                raised.exception.code, "STATE_BACKUP_RESTORE_CONFIRMATION_REQUIRED"
+            )
 
         pulse_pid = self.state_root / "logs" / "runtime" / "pulse.pid"
         pulse_pid.parent.mkdir(parents=True)
         pulse_pid.write_text(f"{os.getpid()}\n", encoding="utf-8")
-        with self.assertRaises(StateBackupError) as raised:
-            restore_state_backup(
+        with _leased(self.state_root):
+            with self.assertRaises(StateBackupError) as raised:
+                restore_state_backup(
+                    manifest,
+                    state_root=self.state_root,
+                    backup_root=self.backup_root,
+                    i_understand_data_loss=True,
+                )
+            self.assertEqual(raised.exception.code, "STATE_BACKUP_PULSE_RUNNING")
+        pulse_pid.unlink()
+
+        with _leased(self.state_root):
+            restore = restore_state_backup(
                 manifest,
                 state_root=self.state_root,
                 backup_root=self.backup_root,
                 i_understand_data_loss=True,
             )
-        self.assertEqual(raised.exception.code, "STATE_BACKUP_PULSE_RUNNING")
-        pulse_pid.unlink()
-
-        restore = restore_state_backup(
-            manifest,
-            state_root=self.state_root,
-            backup_root=self.backup_root,
-            i_understand_data_loss=True,
-        )
 
         self.assertTrue(restore["ok"])
         self.assertEqual((self.state_root / "logs" / "runtime.log").read_text(encoding="utf-8"), original)
@@ -197,13 +215,14 @@ class StateBackupTests(unittest.TestCase):
             handle.seek(10)
             handle.write(bytes([original[0] ^ 0xFF]))
 
-        with self.assertRaises(StateBackupError) as raised:
-            restore_state_backup(
-                manifest,
-                state_root=self.state_root,
-                backup_root=self.backup_root,
-                i_understand_data_loss=True,
-            )
+        with _leased(self.state_root):
+            with self.assertRaises(StateBackupError) as raised:
+                restore_state_backup(
+                    manifest,
+                    state_root=self.state_root,
+                    backup_root=self.backup_root,
+                    i_understand_data_loss=True,
+                )
 
         self.assertEqual(raised.exception.code, "STATE_BACKUP_SHA256_MISMATCH")
 
@@ -261,6 +280,102 @@ class StateBackupTests(unittest.TestCase):
         )
         self.assertEqual(verify.returncode, 0, verify.stderr)
         self.assertTrue(json.loads(verify.stdout)["ok"])
+
+
+class RestoreLeaseGateTests(unittest.TestCase):
+    """Restore replaces a whole root; it must do that under one held lease."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name).resolve()
+        self.state_root = root / "state"
+        self.backup_root = root / "backups"
+        (self.state_root / "logs").mkdir(parents=True)
+        (self.state_root / "logs" / "runtime.log").write_text("one\n", encoding="utf-8")
+        self.backup_root.mkdir(parents=True)
+        self.addCleanup(setattr, SM, "_ACTIVE_RUNTIME_LEASE", None)
+
+    def _manifest(self) -> Path:
+        created = create_state_backup(
+            state_root=self.state_root, backup_root=self.backup_root
+        )
+        return Path(created["backup"]["manifest"])
+
+    def test_an_ungated_restore_is_refused(self) -> None:
+        """An ungated root swap is never the degrade path."""
+        manifest = self._manifest()
+        with self.assertRaises(StateBackupError) as raised:
+            restore_state_backup(
+                manifest,
+                state_root=self.state_root,
+                backup_root=self.backup_root,
+                i_understand_data_loss=True,
+            )
+        self.assertEqual(raised.exception.code, "STATE_BACKUP_RESTORE_UNGATED")
+
+    def test_a_lease_on_a_different_root_is_refused(self) -> None:
+        """Holding a lock over a root nothing is touching is not protection."""
+        manifest = self._manifest()
+        other = Path(self._tmp.name).resolve() / "other-state"
+        other.mkdir()
+        with SM.state_mutation_lease(other, "manage.state-backup.restore"):
+            with self.assertRaises(StateBackupError) as raised:
+                restore_state_backup(
+                    manifest,
+                    state_root=self.state_root,
+                    backup_root=self.backup_root,
+                    i_understand_data_loss=True,
+                )
+        self.assertEqual(raised.exception.code, "STATE_BACKUP_RESTORE_ROOT_MISMATCH")
+        self.assertIn("other-state", str(raised.exception))
+
+    def test_the_lock_is_a_stable_sibling_that_survives_the_root_swap(self) -> None:
+        """The property that makes a one-lease restore possible at all.
+
+        The lock lives beside the root, not inside it, so renaming the root away
+        and deleting it cannot move the inode the holder is flocked to.
+        """
+        lock_path = SM.lease_lock_path(self.state_root)
+        self.assertEqual(lock_path.parent, self.state_root.parent)
+        self.assertFalse(
+            str(lock_path).startswith(str(self.state_root) + "/"),
+            "the lock must not live inside the root being replaced",
+        )
+
+        manifest = self._manifest()
+        (self.state_root / "logs" / "runtime.log").write_text("two\n", encoding="utf-8")
+
+        with SM.state_mutation_lease(
+            self.state_root, "manage.state-backup.restore"
+        ) as held:
+            before = lock_path.stat().st_ino
+            result = restore_state_backup(
+                manifest,
+                state_root=self.state_root,
+                backup_root=self.backup_root,
+                i_understand_data_loss=True,
+            )
+            # One lease, one lock inode, across a rename of the whole root.
+            self.assertTrue(held.held)
+            self.assertEqual(lock_path.stat().st_ino, before)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            (self.state_root / "logs" / "runtime.log").read_text(encoding="utf-8"),
+            "one\n",
+        )
+
+    def test_create_list_and_verify_stay_readers(self) -> None:
+        """Only restore is gated; the scan paths take no lock (an explicit non-goal)."""
+        self.assertIsNone(SM.active_runtime_lease())
+        created = create_state_backup(
+            state_root=self.state_root, backup_root=self.backup_root
+        )
+        manifest = Path(created["backup"]["manifest"])
+        self.assertTrue(verify_state_backup(manifest)["ok"])
+        self.assertTrue(list_state_backups(backup_root=self.backup_root)["ok"])
+        self.assertIsNone(SM.active_runtime_lease())
 
 
 if __name__ == "__main__":

@@ -206,8 +206,13 @@ class OperatorMcpServerTests(unittest.TestCase):
                 self.assertEqual(MODULE.dispatch_tool("known", {"ok": True}), {"content": [{"ok": True}]})
 
             with mock.patch.object(MODULE, "REPO_ROOT", root):
-                MODULE._stamp_dryrun_marker("operator_test", "alpha")
-                marker = root / ".skillbox-state" / "dryrun-markers" / ".skillbox-dryrun-operator_test-alpha"
+                # A real tool name: the marker write is gated by the boundary
+                # declared for that tool, and an undeclared one is refused.
+                MODULE._stamp_dryrun_marker("operator_provision", "alpha")
+                marker = (
+                    root / ".skillbox-state" / "dryrun-markers"
+                    / ".skillbox-dryrun-operator_provision-alpha"
+                )
                 self.assertIn("dry-run completed", marker.read_text(encoding="utf-8"))
 
             with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
@@ -595,6 +600,58 @@ class OperatorMcpServerTests(unittest.TestCase):
             blocked = _content_payload(MODULE.handle_operator_teardown({"box_id": "alpha"}))
         self.assertEqual(blocked["error"]["type"], "dry_run_required")
         self.assertIn("operator_teardown(box_id='<id>', dry_run=true)", blocked["error"]["next_actions"])
+        run_script.assert_not_called()
+
+    def test_teardown_argv_expresses_the_cli_confirmation_contract(self) -> None:
+        """The MCP wrapper must speak box.py's identity-bound teardown contract.
+
+        Preview is unconfirmed (--dry-run is the only unconfirmed path box.py
+        allows). A real run only happens behind a marker, and it must name the
+        box via --confirm so box.py's exact-match gate still decides -- a
+        wrapper that omitted it would advertise teardown and then always fail
+        confirmation_required.
+        """
+        with mock.patch.object(
+            MODULE,
+            "run_script",
+            return_value=(True, 0, {"box_id": "alpha"}),
+        ) as run_script, mock.patch.object(MODULE, "emit_event"), mock.patch.object(
+            MODULE,
+            "_stamp_dryrun_marker",
+        ):
+            MODULE.handle_operator_teardown({"box_id": "alpha", "dry_run": True})
+
+        preview_args = run_script.call_args.args[1]
+        self.assertEqual(["down", "alpha", "--format", "json", "--dry-run"], preview_args)
+        self.assertNotIn("--confirm", preview_args)
+        self.assertNotIn("--yes", preview_args)
+
+        with mock.patch.object(
+            MODULE, "_has_dryrun_marker", return_value=True
+        ), mock.patch.object(
+            MODULE,
+            "run_script",
+            return_value=(True, 0, {"box_id": "alpha"}),
+        ) as run_script, mock.patch.object(MODULE, "emit_event"), mock.patch.object(
+            MODULE,
+            "_clear_dryrun_marker",
+        ):
+            MODULE.handle_operator_teardown({"box_id": "alpha"})
+
+        real_args = run_script.call_args.args[1]
+        self.assertEqual(
+            ["down", "alpha", "--format", "json", "--confirm", "alpha"], real_args
+        )
+        # --yes would confirm any box; the contract is identity-bound.
+        self.assertNotIn("--yes", real_args)
+
+        # Without a marker the wrapper must refuse before it can build or run
+        # a confirmed argv at all.
+        with mock.patch.object(
+            MODULE, "_has_dryrun_marker", return_value=False
+        ), mock.patch.object(MODULE, "run_script") as run_script:
+            blocked = _content_payload(MODULE.handle_operator_teardown({"box_id": "alpha"}))
+        self.assertEqual("dry_run_required", blocked["error"]["type"])
         run_script.assert_not_called()
 
     def test_handle_operator_box_exec_covers_validation_and_success(self) -> None:
@@ -1771,6 +1828,99 @@ class DcgAdapterTests(unittest.TestCase):
         self.assertEqual(deny["verdict"], "deny", deny)
         self.assertTrue(deny["rule_id"])
         # tearDown proves the payload was inspected, never executed.
+
+
+class OperatorMcpMutationLeaseTests(unittest.TestCase):
+    """The wrapper is not the final mutation owner; box.py is.
+
+    The server's only direct writes are the dry-run markers that authorize a
+    destructive run. Those are gated. Everything else is delegated, and the
+    lease must NOT be held across that delegation -- a subprocess child cannot
+    reuse a parent's flock, so holding it would be a self-deadlock that only
+    ever surfaces as a timeout.
+    """
+
+    def setUp(self) -> None:
+        sys.path.insert(0, str(ROOT_DIR / "scripts"))
+        from lib import opslib
+
+        self.opslib = opslib
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name).resolve()
+        (self.repo / ".skillbox-state").mkdir(parents=True)
+        self.addCleanup(setattr, self.opslib, "_ACTIVE_STATE_LEASE", None)
+
+    def _spy(self):
+        seen: list[str] = []
+        real = self.opslib.state_root_lease
+
+        def spy(boundary, **kwargs):
+            seen.append(boundary)
+            return real(boundary, **kwargs)
+
+        return seen, spy
+
+    def test_every_marker_tool_maps_to_a_declared_mutation_boundary(self) -> None:
+        sys.path.insert(0, str(ROOT_DIR / ".env-manager"))
+        from runtime_manager import state_mutation as SM
+
+        self.assertTrue(MODULE._MARKER_BOUNDARIES)
+        for tool, boundary in MODULE._MARKER_BOUNDARIES.items():
+            with self.subTest(tool=tool):
+                self.assertTrue(SM.boundary(boundary).is_mutation)
+
+    def test_an_undeclared_marker_tool_is_refused_not_written_ungated(self) -> None:
+        with self.assertRaises(self.opslib.StateLeaseUnavailable):
+            MODULE._marker_boundary("operator_not_declared")
+
+    def test_stamping_a_marker_holds_the_lease_and_releases_it(self) -> None:
+        seen, spy = self._spy()
+        with mock.patch.object(MODULE, "REPO_ROOT", self.repo):
+            with mock.patch.object(MODULE, "state_root_lease", spy):
+                MODULE._stamp_dryrun_marker("operator_provision", "alpha")
+        self.assertEqual(seen, ["operator_mcp.operator_provision"])
+        # Released: the marker write is brief by construction.
+        self.assertIsNone(self.opslib.active_state_lease())
+        marker = (
+            self.repo / ".skillbox-state" / "dryrun-markers"
+            / ".skillbox-dryrun-operator_provision-alpha"
+        )
+        self.assertTrue(marker.is_file())
+
+    def test_clearing_a_marker_is_gated_too(self) -> None:
+        seen, spy = self._spy()
+        with mock.patch.object(MODULE, "REPO_ROOT", self.repo):
+            with mock.patch.object(MODULE, "state_root_lease", spy):
+                MODULE._stamp_dryrun_marker("operator_teardown", "alpha")
+                MODULE._clear_dryrun_marker("operator_teardown", "alpha")
+        self.assertEqual(
+            seen,
+            ["operator_mcp.operator_teardown", "operator_mcp.operator_teardown"],
+        )
+
+    def test_spawning_box_py_while_holding_the_lease_is_refused(self) -> None:
+        """The self-deadlock this contract exists to make impossible."""
+        with mock.patch.object(MODULE, "REPO_ROOT", self.repo):
+            with self.opslib.state_root_lease("box.register", repo_root=self.repo):
+                with mock.patch.object(MODULE, "run_checked") as runner:
+                    ok, code, payload = MODULE.run_script(
+                        MODULE.BOX_PY, ["unregister", "alpha", "--format", "json"]
+                    )
+        self.assertFalse(ok)
+        self.assertEqual(code, -1)
+        self.assertEqual(payload["error"]["type"], "state_lease_held_across_child")
+        runner.assert_not_called()
+
+    def test_delegation_proceeds_normally_when_no_lease_is_held(self) -> None:
+        self.assertIsNone(self.opslib.active_state_lease())
+        with mock.patch.object(MODULE, "run_checked") as runner:
+            runner.return_value = {"rc": 0, "stdout": "{}", "stderr_redacted": ""}
+            ok, _code, _payload = MODULE.run_script(
+                MODULE.BOX_PY, ["unregister", "alpha", "--format", "json"]
+            )
+        self.assertTrue(ok)
+        runner.assert_called_once()
 
 
 if __name__ == "__main__":

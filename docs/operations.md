@@ -202,6 +202,48 @@ AUTH_MODE=token AUTH_TOKEN=replace-me \
 SWIMMERS_TUI_URL=http://<tailnet-ip>:3210 \
 cargo run --bin swimmers-tui
 ```
+
+## Environment inventory contract
+
+Skillbox owns machine, client and repo *intent* — `machines.yaml`,
+`registry/repos.yaml`, `clients/*/overlay.yaml` — plus the root translation that
+turns `~/repos/foo` into wherever that repo actually lives on this box.
+`manage.py env-inventory` publishes that as a versioned, sanitized contract so a
+consumer (Swimmers today) reads one payload instead of parsing Skillbox-private
+YAML itself. The payload carries a `supersedes` block naming the exact field each
+private parser can now delete.
+
+```bash
+python3 .env-manager/manage.py env-inventory show --format json          # build
+python3 .env-manager/manage.py env-inventory show --observe --format json # + presence
+python3 .env-manager/manage.py env-inventory show --cached --format json  # hot path
+python3 .env-manager/manage.py env-inventory refresh --format json        # rebuild cache
+```
+
+`show` never writes. `refresh` is the only writer, and it holds the
+[single-writer state-root lease](#single-writer-state-root) across build and
+write; `MANIFEST` classifies the two leaves separately (`manage.env-inventory.show`
+is a read, `manage.env-inventory.refresh` an unconditional mutation), so the read
+cannot become a write by acquiring a flag.
+
+**Reading it fast.** Only `--cached` is hot-path safe: one file read, no YAML, no
+probing. Building costs a read of every config document, and `--observe` adds one
+`lstat` per declared repo. A picker should read the cache, render `stale: true`
+as "stale" rather than blocking on a rebuild, and treat `ok: false` (exit 4) as
+"not built yet".
+
+**Keeping it fresh.** `manage.py sync` refreshes the cache on its way out — sync
+is the moment declared intent becomes filesystem reality, so it is exactly when
+the cached projection stops being true, and it is off every hot path. The hook
+forwards sync's `--dry-run`, and a failed refresh is reported as one more sync
+action rather than failing the converge. Anything else that wants to schedule a
+refresh should call `env-inventory refresh`, not write the file itself.
+
+**One caveat.** The cache path is repo-relative (`.skillbox-state/inventory/`) and
+does not follow `$SKILLBOX_STATE_ROOT`. When those two disagree the refresh
+refuses with `state_root_mismatch` instead of dropping the file into a root whose
+lease it is not holding.
+
 ## Agent Context
 
 The runtime graph describes the inside of the box. The `context` command makes
@@ -312,8 +354,19 @@ make box-up BOX=acme-prod PROFILE=dev-large DEPLOY_MANIFEST=clients/acme-prod/de
 make box-status BOX=acme-prod
 make box-list
 make box-ssh BOX=acme-prod
-make box-down BOX=acme-prod
+
+# teardown is identity-bound: preview first, then name the box you are destroying
+make box-down BOX=acme-prod DRY_RUN=1
+make box-down BOX=acme-prod CONFIRM=acme-prod
 ```
+
+`make box-down` with neither `DRY_RUN` nor `CONFIRM` refuses with
+`confirmation_required`, and a `CONFIRM` that does not equal `BOX` refuses the
+same way rather than being repaired for you. A real teardown additionally
+requires a clean repository (`dirty_tree_refused`). The Make target is a
+pass-through — `scripts/box.py` owns both gates. See
+[docs/tailnet-only-lifecycle.md](tailnet-only-lifecycle.md#real-teardown-is-identity-bound)
+for the teardown truth invariant and the `destroy-pending` recovery contract.
 
 Place work and inspect the machine union without provisioning. `box place`
 is read-only: it lazy-imports `placement.decide` and prints `Selected <id>`,
@@ -343,7 +396,7 @@ Available MCP tools:
 | `operator_profiles` | List available box profiles (region, size, image) |
 | `operator_box_status` | Deep health probe for a specific box |
 | `operator_provision` | Full zero-to-running provision flow |
-| `operator_teardown` | Full teardown: drain, remove from Tailnet, destroy droplet — **gated** (dry-run + clean repos) |
+| `operator_teardown` | Full teardown: drain, remove from Tailnet, destroy droplet — **gated** (dry-run marker bound to `box_id`, then `--confirm <box_id>` at the CLI, plus clean repos). Deprecated in favour of `scripts/box.py down` |
 | `operator_box_exec` | Run a command on a remote box over Tailscale SSH — **gated** (read-only allowlist runs free; mutating/unknown commands need a per-command `dry_run=true` preview) |
 | `operator_compose_up` | Build and start local containers |
 | `operator_compose_down` | Stop all local containers — **gated** (dry-run + clean repos) |
@@ -377,6 +430,13 @@ unless:
 3. A dry-run was already executed this session
 
 This prevents accidental infrastructure destruction with uncommitted work.
+
+The hook is the outer ring, not the only one. `operator_teardown`'s marker is
+bound to the exact `box_id` previewed, and a real call forwards
+`--confirm <box_id>` so `scripts/box.py` re-checks the identity itself — a
+marker for one box can never authorize destroying another. The same clean-tree
+rule is enforced inside the CLI (`dirty_tree_refused`), so it holds for direct
+CLI and Make callers who never touch the hook at all.
 
 ### operator_box_exec command gate
 
@@ -425,6 +485,241 @@ Three surfaces split estate git work; keep them in their lanes:
 runs one. Do not hand-push or hand-pull to "fix" drift the glance surfaces —
 `/reconcile` owns the no-loss flow, and `fleet_convergence.py` proves the
 estate converged afterwards.
+
+## DCG (Destructive Command Guard)
+
+DCG is a PreToolUse hook: before an agent runs a shell command, the pinned `dcg`
+binary judges it and can refuse. Skillbox owns the *convergence* of that setup —
+binary, policy, and the Claude/Codex/Grok hook documents — through one lifecycle
+contract. The shell never re-implements convergence.
+
+### What DCG does and does not cover
+
+Read this before the setup steps, because the guard's value depends entirely on
+knowing where it does not reach:
+
+| Surface | Covered? |
+| --- | --- |
+| Agent shell tool calls matching the `Bash` PreToolUse matcher | **Yes** — allowed or denied by the pinned binary |
+| A command you type into a **direct shell** yourself | **No** — it never passes through an agent hook |
+| Codex `unified_exec` sessions | **No** — the hook sees the session invocation, not each command typed inside it |
+| A Codex hook the operator has not trusted | **No** — Codex will not run an untrusted hook at all |
+
+These are not hypothetical caveats. The protocol proof
+(`scripts/dcg-protocol-e2e.py`) records `unified_exec` with `guarded=false`, and
+`manage.py doctor` prints the same limitations on **every** run, including a
+healthy one, so "healthy" can never be read as "nothing runs unguarded".
+
+### Canonical setup
+
+```bash
+make dcg-reconcile          # converge binary + policy + hooks (idempotent)
+make dcg-verify             # read-only: report convergence without changing it
+```
+
+Both delegate to the lifecycle module; the agent-facing form is:
+
+```bash
+python3 .env-manager/manage.py dcg-reconcile --action apply  --format json
+python3 .env-manager/manage.py dcg-reconcile --action verify --format json
+```
+
+Setup is idempotent: a second `apply` on a converged host reports `unchanged`,
+not an error. The binary is **version-pinned**; convergence verifies the
+installed version against the pin and refuses a mismatch rather than accepting
+whatever happens to be installed.
+
+### Verify and status semantics
+
+`--action verify` is read-only. It answers one question — *is this host
+converged?* — and reports one of five states:
+
+| State | Meaning | Exit |
+| --- | --- | --- |
+| `healthy` | binary, policy and every hook are converged and trusted | 0 |
+| `changed` | `apply` altered something (apply only) | 0 |
+| `needs-operator-action` | convergence is blocked on a human step, almost always Codex trust | 3 |
+| `unsupported` | this host/agent cannot support the contract | 5 |
+| `failed` | convergence itself failed | 1 |
+
+`manage.py doctor` carries the same verdict as a `dcg` check. Note the doctor
+family's `status` vocabulary is `pass|warn|inco|fail`; the DCG-native verdict
+rides alongside as `dcg_status`, so read that field for the five states above.
+
+### CODEX_HOOK_TRUST_REQUIRED
+
+This is the operator-facing name for the most common blocked state: **exit 3**
+with `codex_trust` reporting `absent` or `stale`. It is a condition, not a code
+in the source — grep the exit code and the trust state, not a constant.
+
+Codex refuses to run a hook it has not trusted, and it persists the trusted hash
+itself. So Skillbox *prepares* `~/.codex/hooks.json` and *detects* trust; it
+never writes a trust hash and never edits `~/.codex/config.toml`.
+
+To clear it:
+
+> Start Codex in this home and trust the `dcg` hook from its hook review modal.
+
+Do **not** pass `--dangerously-bypass-hook-trust`. It is named that way for a
+reason: it produces a host that reports a hook while nothing enforces it, which
+is worse than an obviously missing one.
+
+### Upgrade
+
+DCG is part of the upgrade transaction (`scripts/06-upgrade-release.sh`), not a
+step beside it:
+
+1. managed DCG state is captured **only after** the release archive verifies;
+2. DCG is converged against the new release, then **re-validated** before the
+   upgrade may report success;
+3. any failure restores the prior binary, policy, user config and hooks.
+
+The success receipt records `before_version`, `after_version`, `binary_sha256`,
+`policy_sha256`, `hook_state_sha256` and `rollback_bundle_sha256`. A same-version
+rerun reports `unchanged`.
+
+### Rollback
+
+Two distinct rollback paths, for two distinct situations:
+
+| Situation | Path |
+| --- | --- |
+| An upgrade failed | automatic — the upgrade restores its own tar bundle before touching anything else |
+| A converge made a change you want to undo | `runtime_manager.dcg_reconcile.rollback()`, which restores the bytes recorded by the last mutating run |
+
+The upgrade's bundle is deliberately independent of the new release's own
+rollback code: if the upgrade is what broke DCG, that code is exactly what you
+cannot trust to undo it.
+
+### Uninstall and opt-out
+
+```bash
+make dcg-relinquish                                        # remove DCG-owned hooks + policy
+python3 .env-manager/manage.py dcg-reconcile --remove      # identical; --remove is an alias
+python3 .env-manager/manage.py dcg-reconcile --remove --purge   # also drop ledger + backups
+```
+
+Relinquish removes **only** DCG-owned hook entries and marker-stamped policy —
+your unrelated `PreToolUse` hooks are preserved. It is safe to run twice; the
+second run reports `unchanged`, not an error. Use `--dry-run` first to see the
+plan without changing anything.
+
+`--purge` also drops the reconcile ledger and backup sets, which is what makes
+`rollback()` possible — so purge last, and only when you mean it.
+
+## Single-writer state root
+
+One state root, one writer. Every surface that mutates state-root state — the
+runtime CLI, `pulse`, `box`, the operator MCP, `04-reconcile --fix` — takes the
+same lease before it writes, so two of them can never interleave a multi-step
+mutation. Reads and true dry-runs never take it: there is no read lock, on
+purpose, so `status` and any `--dry-run` stay answerable while a writer holds.
+
+The lock is a **stable sibling** of the root:
+
+```
+<parent>/<name>.mutation-lease.lock      e.g. .skillbox-state.mutation-lease.lock
+```
+
+Outside the root by construction, which is what lets `state-backup restore`
+rename the entire root away and delete it while a single lease spans the whole
+swap.
+
+### What contention looks like
+
+A command that cannot get the lease within its bounded wait fails with
+`STATE_LEASE_TIMEOUT` and mutates **nothing**. These fields are stable — tooling
+and docs may rely on them:
+
+| Field | Meaning |
+| --- | --- |
+| `code` | always `STATE_LEASE_TIMEOUT` for contention |
+| `boundary_id` | the boundary that was *waiting* (e.g. `manage.sync`) |
+| `operation_id` | that attempt's unique id, `<boundary>@<pid>.<seq>` |
+| `state_root` | the canonical root, after symlink and alias resolution |
+| `lock_path` | the sibling lock file |
+| `timeout_seconds` | the bound that was requested |
+| `waited_seconds` | how long it actually waited |
+| `holder` | best-effort evidence about who holds it |
+
+`holder` carries the holder's `pid`, `host`, and its `advisory.boundary_id` — so
+a timeout tells you *which operation* is in flight, not merely that something
+is. It carries no credential: the lease redacts command text before anything
+reaches disk.
+
+Read `holder` as evidence, never as truth. It says so itself:
+
+> best effort; absence of a holder here never means the lock is free
+
+The advisory record is written beside the lock and can outlive a crashed
+process. The kernel's flock is the only authority on whether the root is held.
+
+### Retrying safely
+
+**Wait, then re-run the same command.** That is the whole recovery procedure.
+
+- A contended command wrote nothing, so a retry is a fresh attempt, not a
+  resume. There is no partial state to reconcile.
+- A holder that crashes — including `SIGKILL` — releases the flock immediately,
+  because the kernel drops it when the file description closes. The next
+  acquirer succeeds with no operator action.
+- Stale advisory metadata may linger after a crash. It is ignored; it never
+  blocks acquisition.
+- `pulse` handles this on its own: a contended tick is *skipped*, logged with
+  the boundary and holder, counted in `lease_contentions` in its snapshot, and
+  retried on the next tick. It never forces the lock and never spins on it.
+
+If contention persists, find the live holder rather than removing anything:
+
+```bash
+ps -p "$(python3 - <<'PY'
+import json,sys; sys.path.insert(0,'.env-manager')
+from runtime_manager import state_mutation as sm
+print(sm.read_lease_metadata('.skillbox-state').get('advisory',{}).get('pid',''))
+PY
+)"
+```
+
+### There is no force-clear
+
+The lease exposes no `clear`, `steal`, `break`, or `--force` entry point, and
+adding one would be a mistake rather than a convenience. Deleting a lock file
+while a writer holds it does not stop that writer — it removes the *name*, not
+the open file description — so the next command creates a fresh lock, acquires
+it immediately, and now two processes are mutating one state root while both
+believe they are the single writer. That is precisely the failure this contract
+exists to prevent, and it would be invisible until the state was already
+corrupt.
+
+So: **never delete `*.mutation-lease.lock`.** If a holder is genuinely wedged,
+kill the holding *process* (its pid is in the timeout payload). The kernel
+releases the lock as the process dies, which is safe in a way that removing the
+file is not.
+
+### Adoption status
+
+Every surface is adopted. Each mutating boundary in
+`runtime_manager.state_mutation.MANIFEST` either acquires the lease through a
+gate, or writes somewhere the lease has no jurisdiction over — and the inventory
+itself is what decides which, through each row's `state_root_source`:
+
+| Surface | How it is gated |
+| --- | --- |
+| `manage` | dispatch resolves the boundary *from* the manifest, so a classified mutation is a gated mutation |
+| `box` | `BOX_COMMAND_BOUNDARIES` at the CLI dispatch |
+| `operator_mcp` | the dry-run marker writes, under the tool's declared boundary |
+| `pulse` | bounded per-window leases (tick, PID, stale-PID cleanup) |
+| `04-reconcile --fix` | `doctor_fix.mutation_gate` |
+| `make bootstrap-env` | delegates to `scripts/bootstrap-operator-env.py`, which holds the lease across the decide-then-seed span |
+
+A Makefile recipe cannot hold a lease. The one Make target that writes
+state-root state therefore delegates to a script that can; the rest either
+delegate to a gated CLI or write outside every state root ( `$HOME`, the repo
+tree, Docker, or a remote box ), which their rows record.
+
+`tests/test_state_mutation_integration.py` fails if a new mutating boundary
+appears in neither bucket, and its `KNOWN_BYPASSES` table is empty — that empty
+table is the machine-checked form of the claim on this page.
 
 ## Local CI gate
 
@@ -518,7 +813,7 @@ Details that matter:
 | `make swimmers-logs` | Tails swimmers server logs from inside the workspace container |
 | `make swimmers-runtime-status` | Shows the runtime-manager view of the swimmers overlay |
 | `make box-up` | Provision a new remote box (DO + Tailscale) with the SPAPS auth/RBAC blueprint by default, or resume a partial provision with `RESUME=1` |
-| `make box-down` | Tear down a remote box |
+| `make box-down` | Tear down a remote box. `DRY_RUN=1` previews; a real run needs `CONFIRM=<box-id>` matching `BOX`. There is deliberately no blanket `YES=1` |
 | `make box-status` | Health-check a remote box, including the phone URL, public SSH probe, Tailnet ping, MagicDNS, swimmers port reachability, and posture violations |
 | `make box-list` | List all boxes from inventory |
 | `make box-ssh` | SSH into a remote box |

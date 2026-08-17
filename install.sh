@@ -68,6 +68,7 @@ STATUS_FIRST_BOX="pending"
 STATUS_BUILD="skipped"
 STATUS_UP="skipped"
 STATUS_VERIFY="skipped"
+STATUS_DCG="skipped"
 STATUS_WRAPPERS="skipped"
 
 FIRST_BOX_OUTPUT_DIR=""
@@ -1210,6 +1211,56 @@ run_verify() {
   STATUS_VERIFY="ok"
 }
 
+# DCG convergence check. Deliberately the SAME contract first-box, onboard,
+# runtime-sync, and box deploy call -- install.sh does not re-implement any of
+# it, it just asks manage.py and reports the verdict. The command prints its own
+# DCG_HEALTHY / DCG_CHANGED / DCG_NEEDS_OPERATOR_ACTION marker, which is what
+# lands in the install log; nothing here synthesizes a marker of its own.
+#
+# A prepared-but-untrusted Codex hook exits nonzero, and --verify propagates
+# that: an install whose guard is not actually armed must not report success.
+run_dcg_lifecycle() {
+  local target_repo="$1"
+  local profile=""
+  local cmd=()
+  local rc=0
+
+  if [[ "${VERIFY}" -ne 1 ]]; then
+    return 0
+  fi
+  if [[ "${RUN_FIRST_BOX}" -ne 1 ]]; then
+    STATUS_DCG="skipped"
+    return 0
+  fi
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    STATUS_DCG="planned"
+    return 0
+  fi
+
+  cmd=(python3 ".env-manager/manage.py" "dcg-reconcile"
+       "--action" "verify" "--entrypoint" "install" "--scope" "host"
+       "--client" "${CLIENT_ID}")
+  for profile in "${PROFILE_ARGS[@]}"; do
+    cmd+=("--profile" "${profile}")
+  done
+
+  set +e
+  (
+    cd "${target_repo}"
+    "${cmd[@]}"
+  )
+  rc=$?
+  set -e
+
+  if [[ "${rc}" -eq 0 ]]; then
+    STATUS_DCG="ok"
+    return 0
+  fi
+  STATUS_DCG="needs-operator-action(${rc})"
+  err "DCG is not converged (manage.py dcg-reconcile exit ${rc}). See the operator actions above."
+  return "${rc}"
+}
+
 print_header() {
   [[ "${QUIET}" -eq 1 ]] && return 0
   if [[ "${HAS_GUM}" -eq 1 && "${NO_GUM}" -eq 0 ]]; then
@@ -1244,6 +1295,7 @@ print_summary() {
   lines+=("build: ${STATUS_BUILD}")
   lines+=("up: ${STATUS_UP}")
   lines+=("verify: ${STATUS_VERIFY}")
+  lines+=("dcg: ${STATUS_DCG}")
   lines+=("private source of truth lives under ${FIRST_BOX_PRIVATE_REPO:-${PRIVATE_PATH}}")
   lines+=("operator secrets live under ${REPO_DIR}/.skillbox-state/operator/ (out of the workspace mount)")
   lines+=("place box-provisioning secrets in ${REPO_DIR}/.skillbox-state/operator/.env.box")
@@ -1454,6 +1506,8 @@ if [[ "${RUN_UP}" -eq 1 ]]; then
 fi
 
 run_verify "${REPO_DIR}"
+
+run_dcg_lifecycle "${REPO_DIR}"
 
 if [[ "${STATUS_VERIFY}" == "pending" ]]; then
   STATUS_VERIFY="ok"

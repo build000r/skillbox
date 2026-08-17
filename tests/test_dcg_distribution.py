@@ -619,9 +619,13 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("DCG_DISTRIBUTION_OK", completed.stdout)
         self.assertIn("version=v0.6.7", completed.stdout)
-        self.assertIn(f"asset={LINUX_X86}", completed.stdout)
+        # The fixture resolves the asset for the real host platform, so the
+        # expectation must be host-derived to stay portable (Linux CI + Mac
+        # self-test gate).
+        host_asset = dist.resolve_asset()
+        self.assertIn(f"asset={host_asset}", completed.stdout)
         # The subprocess reads the real, unpatched pin.
-        self.assertIn(f"sha256={REAL_PINNED_SHA256[LINUX_X86]}", completed.stdout)
+        self.assertIn(f"sha256={REAL_PINNED_SHA256[host_asset]}", completed.stdout)
         self.assertIn(f"minisign_key_id={dist.DCG_MINISIGN_KEY_ID}", completed.stdout)
         self.assertIn("mcp_command=mcp-server", completed.stdout)
 

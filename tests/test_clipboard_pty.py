@@ -8,7 +8,9 @@ The harness in :class:`PtyPasteHarness` is shared by four groups:
 
 ``ClipboardPtyGoldenTests``
     The payload matrix (plain, multiline, shell metacharacters, file URLs,
-    unicode, huge text, secret-bearing text) over a directly attached pane.
+    unicode, huge text, secret-bearing text) over a directly attached pane,
+    plus the application-never-enabled-bracketed-paste row, which must degrade
+    to unmarked text rather than injecting literal marker bytes.
 ``ClipboardPtyTransportTests``
     The same kitchen-sink payload re-proved through every transport reachable
     without leaving this machine: nested tmux, mosh over loopback, ssh over
@@ -22,7 +24,10 @@ The harness in :class:`PtyPasteHarness` is shared by four groups:
 ``ClipboardPtyFallbackTests``
     Unsupported / native-owned / empty clipboard states run the full
     ``smart_paste`` orchestration against a real pane and must inject
-    **nothing** -- no junk, no partial bracket, no stray marker.
+    **nothing** -- no junk, no partial bracket, no stray marker. The
+    unsupported-image row is re-proved behind nested tmux and behind
+    ssh + remote tmux, each paired with its own control injection so an
+    empty recording cannot be mistaken for a transport that never started.
 """
 
 from __future__ import annotations
@@ -48,8 +53,22 @@ from scripts.lib.clipboard_snapshot import ClipboardSnapshot
 PASTE_START = b"\x1b[200~"
 PASTE_END = b"\x1b[201~"
 
+
+def remote_tmux_bin() -> str:
+    """``tmux`` for an argv that leaves this process's PATH behind.
+
+    A non-interactive ``ssh`` command runs with the login default PATH, which
+    on macOS excludes Homebrew. A bare ``tmux`` in a remote argv is then "command
+    not found" even though the class-level ``skipUnless`` proved tmux exists
+    here, which silently turns the far-side-tmux row into a listener timeout
+    instead of a paste-fidelity result.
+    """
+    return shutil.which("tmux") or "tmux"
+
+
 # A raw-PTY listener. It enables bracketed-paste mode the way a real
-# application does, then records the exact bytes the terminal delivered.
+# application does (argv[5]="0" makes it an application that never asked for
+# bracketed paste), then records the exact bytes the terminal delivered.
 # The recording is staged and ``os.replace``d so a reader can never observe a
 # torn file.
 CAPTURE_SOURCE = """
@@ -65,11 +84,13 @@ ready = Path(sys.argv[1])
 observed = Path(sys.argv[2])
 expected_size = int(sys.argv[3])
 dwell_seconds = float(sys.argv[4])
+bracketed = (sys.argv[5] if len(sys.argv) > 5 else "1") == "1"
 fd = sys.stdin.fileno()
 original = termios.tcgetattr(fd)
 try:
     tty.setraw(fd)
-    os.write(sys.stdout.fileno(), b"\\x1b[?2004h")
+    if bracketed:
+        os.write(sys.stdout.fileno(), b"\\x1b[?2004h")
     ready.write_text("ready\\n", encoding="utf-8")
     deadline = time.monotonic() + dwell_seconds
     captured = bytearray()
@@ -202,7 +223,9 @@ class PtyPasteHarness(unittest.TestCase):
 
     # -- listener plumbing -------------------------------------------------
 
-    def capture_command(self, expected_size: int, dwell: float = 8.0) -> list[str]:
+    def capture_command(
+        self, expected_size: int, dwell: float = 8.0, *, bracketed: bool = True
+    ) -> list[str]:
         return [
             sys.executable,
             str(self.capture_script),
@@ -210,6 +233,7 @@ class PtyPasteHarness(unittest.TestCase):
             str(self.observed),
             str(expected_size),
             str(dwell),
+            "1" if bracketed else "0",
         ]
 
     def wait_for(self, path: Path, timeout_seconds: float = 20.0) -> None:
@@ -236,14 +260,18 @@ class PtyPasteHarness(unittest.TestCase):
         label: str = "pty",
         dwell: float = 8.0,
         slack: int = 0,
+        bracketed: bool = True,
     ) -> bytes:
         """Paste *payload* into a pane and return the bytes the PTY received.
 
         ``wrap`` optionally nests the listener behind a transport: it takes the
         listener argv and returns the argv tmux should run in the pane.
+        ``bracketed=False`` models an application that never enabled DECSET
+        2004, so tmux delivers the payload with no paste markers at all.
         """
-        expected_size = len(expected_stream(payload)) + slack
-        listener = self.capture_command(expected_size, dwell=dwell)
+        expected = expected_stream(payload) if bracketed else terminal_form(payload)
+        expected_size = len(expected) + slack
+        listener = self.capture_command(expected_size, dwell=dwell, bracketed=bracketed)
         pane_command = list(wrap(listener)) if wrap is not None else listener
         server = IsolatedTmuxServer(self, label)
         pane = server.start_session(label, pane_command)
@@ -254,6 +282,98 @@ class PtyPasteHarness(unittest.TestCase):
         self.inject(server, pane, payload)
         self.wait_for(self.observed)
         return self.observed.read_bytes()
+
+    def _start_private_sshd(self) -> list[str]:
+        """Run a throwaway sshd on loopback and return an ssh argv for it.
+
+        This never touches the operator's ``~/.ssh`` material, the system
+        ``sshd``, or any remote host: the daemon has its own generated host
+        key, its own ``authorized_keys``, and an ephemeral 127.0.0.1 port.
+        """
+        sshd = shutil.which("sshd") or (
+            "/usr/sbin/sshd" if Path("/usr/sbin/sshd").exists() else None
+        )
+        if not (sshd and shutil.which("ssh") and shutil.which("ssh-keygen")):
+            self.skipTest("sshd/ssh/ssh-keygen are required for the ssh row")
+        lab = self.root / "sshd"
+        lab.mkdir(mode=0o700, exist_ok=True)
+        for name in ("hostkey", "userkey"):
+            subprocess.run(
+                ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(lab / name)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        authorized = lab / "authorized_keys"
+        authorized.write_bytes((lab / "userkey.pub").read_bytes())
+        authorized.chmod(0o600)
+        port = _free_loopback_port()
+        config = lab / "sshd_config"
+        config.write_text(
+            "\n".join(
+                [
+                    f"Port {port}",
+                    "ListenAddress 127.0.0.1",
+                    f"HostKey {lab / 'hostkey'}",
+                    f"AuthorizedKeysFile {authorized}",
+                    "StrictModes no",
+                    "UsePAM no",
+                    "PasswordAuthentication no",
+                    "KbdInteractiveAuthentication no",
+                    "PermitUserEnvironment no",
+                    f"PidFile {lab / 'sshd.pid'}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        started = subprocess.run(
+            [sshd, "-f", str(config), "-E", str(lab / "sshd.log")],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        def stop_sshd() -> None:
+            try:
+                pid = int((lab / "sshd.pid").read_text().strip())
+            except (OSError, ValueError):
+                return
+            try:
+                os.kill(pid, 15)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+        self.addCleanup(stop_sshd)
+        if started.returncode != 0:
+            self.skipTest(
+                "a private loopback sshd would not start: "
+                f"{started.stderr.decode('utf-8', 'replace')[:200]!r}"
+            )
+        options = [
+            "-p", str(port),
+            "-i", str(lab / "userkey"),
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "IdentitiesOnly=yes",
+            "-o", "LogLevel=ERROR",
+            "-o", "ConnectTimeout=5",
+        ]
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            probe = subprocess.run(
+                ["ssh", *options, "127.0.0.1", "true"],
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if probe.returncode == 0:
+                return ["ssh", "-tt", *options, "127.0.0.1"]
+            time.sleep(0.2)
+        self.skipTest("the private loopback sshd never accepted a connection")
+        raise AssertionError("unreachable")
 
     def assert_verbatim(self, payload: bytes, captured: bytes) -> None:
         expected = expected_stream(payload)
@@ -304,6 +424,30 @@ class ClipboardPtyGoldenTests(PtyPasteHarness):
         captured = self.paste_through_pane(payload, label="multiline")
         self.assert_verbatim(payload, captured)
         self.assertEqual(captured.count(b"\r"), payload.count(b"\n"))
+
+    def test_application_without_bracketed_paste_gets_text_and_no_marker_junk(
+        self,
+    ) -> None:
+        # Many real paste targets never enable DECSET 2004 (plain ``cat``, a
+        # shell with bracketed paste off, an editor in a raw mode). The router
+        # must degrade to exactly what a manual ``tmux paste-buffer`` would
+        # deliver: the payload in terminal form, with NO markers. If the router
+        # ever hand-rolled ESC[200~ instead of leaving the decision to tmux's
+        # ``-p``, this pane would receive literal escape junk it cannot parse.
+        payload = TRANSPORT_PAYLOAD
+        captured = self.paste_through_pane(
+            payload, label="no-bracketed", bracketed=False
+        )
+        self.assertEqual(captured, terminal_form(payload))
+        self.assertNotIn(PASTE_START, captured)
+        self.assertNotIn(PASTE_END, captured)
+        self.assertNotIn(b"\x1b[200", captured)
+        self.assertNotIn(b"\x1b[201", captured)
+        # Still no appended Return: a payload with no trailing newline must not
+        # grow one just because the markers are absent.
+        self.assertFalse(captured.endswith(b"\r"))
+        self.assertEqual(captured.count(b"\r"), payload.count(b"\n"))
+        self.assertNotIn(b"\n", captured)
 
     def test_file_urls_and_paths_with_spaces_are_not_quoted_or_escaped(self) -> None:
         payload = (
@@ -465,7 +609,7 @@ class ClipboardPtyTransportTests(PtyPasteHarness):
 
         def wrap(listener: list[str]) -> list[str]:
             remote = [
-                "tmux", "-L", remote_socket, "-f", "/dev/null",
+                remote_tmux_bin(), "-L", remote_socket, "-f", "/dev/null",
                 "new-session", "-s", "remote", "-x", "200", "-y", "50",
                 *listener,
             ]
@@ -508,98 +652,6 @@ class ClipboardPtyTransportTests(PtyPasteHarness):
             self.addCleanup(stop_mosh_server)
         return int(connect.group(1)), connect.group(2)
 
-    def _start_private_sshd(self) -> list[str]:
-        """Run a throwaway sshd on loopback and return an ssh argv for it.
-
-        This never touches the operator's ``~/.ssh`` material, the system
-        ``sshd``, or any remote host: the daemon has its own generated host
-        key, its own ``authorized_keys``, and an ephemeral 127.0.0.1 port.
-        """
-        sshd = shutil.which("sshd") or (
-            "/usr/sbin/sshd" if Path("/usr/sbin/sshd").exists() else None
-        )
-        if not (sshd and shutil.which("ssh") and shutil.which("ssh-keygen")):
-            self.skipTest("sshd/ssh/ssh-keygen are required for the ssh row")
-        lab = self.root / "sshd"
-        lab.mkdir(mode=0o700, exist_ok=True)
-        for name in ("hostkey", "userkey"):
-            subprocess.run(
-                ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(lab / name)],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        authorized = lab / "authorized_keys"
-        authorized.write_bytes((lab / "userkey.pub").read_bytes())
-        authorized.chmod(0o600)
-        port = _free_loopback_port()
-        config = lab / "sshd_config"
-        config.write_text(
-            "\n".join(
-                [
-                    f"Port {port}",
-                    "ListenAddress 127.0.0.1",
-                    f"HostKey {lab / 'hostkey'}",
-                    f"AuthorizedKeysFile {authorized}",
-                    "StrictModes no",
-                    "UsePAM no",
-                    "PasswordAuthentication no",
-                    "KbdInteractiveAuthentication no",
-                    "PermitUserEnvironment no",
-                    f"PidFile {lab / 'sshd.pid'}",
-                    "",
-                ]
-            ),
-            encoding="utf-8",
-        )
-        started = subprocess.run(
-            [sshd, "-f", str(config), "-E", str(lab / "sshd.log")],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-
-        def stop_sshd() -> None:
-            try:
-                pid = int((lab / "sshd.pid").read_text().strip())
-            except (OSError, ValueError):
-                return
-            try:
-                os.kill(pid, 15)
-            except (ProcessLookupError, PermissionError):
-                pass
-
-        self.addCleanup(stop_sshd)
-        if started.returncode != 0:
-            self.skipTest(
-                "a private loopback sshd would not start: "
-                f"{started.stderr.decode('utf-8', 'replace')[:200]!r}"
-            )
-        options = [
-            "-p", str(port),
-            "-i", str(lab / "userkey"),
-            "-o", "BatchMode=yes",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "IdentitiesOnly=yes",
-            "-o", "LogLevel=ERROR",
-            "-o", "ConnectTimeout=5",
-        ]
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline:
-            probe = subprocess.run(
-                ["ssh", *options, "127.0.0.1", "true"],
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            if probe.returncode == 0:
-                return ["ssh", "-tt", *options, "127.0.0.1"]
-            time.sleep(0.2)
-        self.skipTest("the private loopback sshd never accepted a connection")
-        raise AssertionError("unreachable")
-
 
 @unittest.skipUnless(shutil.which("bash"), "bash is required for the no-eval proof")
 class ClipboardPtyShellSafetyTests(PtyPasteHarness):
@@ -632,10 +684,24 @@ class ClipboardPtyShellSafetyTests(PtyPasteHarness):
 class ClipboardPtyFallbackTests(PtyPasteHarness):
     """Unsupported/native clipboard states must inject nothing at all."""
 
-    def _quiet_pane(self) -> tuple[IsolatedTmuxServer, str]:
-        server = IsolatedTmuxServer(self, "fallback")
+    def _quiet_pane(
+        self,
+        *,
+        wrap: object = None,
+        label: str = "fallback",
+        slot: str = "",
+        dwell: float = 1.5,
+    ) -> tuple[IsolatedTmuxServer, str]:
+        # ``slot`` repoints the ready/observed files so one test can stand up
+        # more than one pane (a transport row needs its own negative control).
+        if slot:
+            self.ready = self.root / f"ready-{slot}"
+            self.observed = self.root / f"observed-{slot}.bin"
         # Expect nothing; dwell briefly and then record whatever arrived.
-        pane = server.start_session("fallback", self.capture_command(4096, dwell=1.5))
+        listener = self.capture_command(4096, dwell=dwell)
+        pane_command = list(wrap(listener)) if wrap is not None else listener
+        server = IsolatedTmuxServer(self, label)
+        pane = server.start_session(label, pane_command)
         self.wait_for(self.ready)
         time.sleep(0.05)
         return server, pane
@@ -748,6 +814,93 @@ class ClipboardPtyFallbackTests(PtyPasteHarness):
         receipt = self._smart_paste(server, pane, capture_fn)
         self.assertEqual(receipt["outcome"], "text")
         self._assert_pty_saw_nothing()
+
+    # -- the same fallback, re-proved behind a transport --------------------
+
+    @staticmethod
+    def _unsupported_image_capture(
+        **_kwargs: object,
+    ) -> tuple[ClipboardSnapshot, None]:
+        return (
+            ClipboardSnapshot(
+                ok=False,
+                kind="image",
+                change_count=5,
+                error={"code": "unsupported_type", "message": "heic without codec"},
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _control_text_capture(**_kwargs: object) -> tuple[ClipboardSnapshot, str]:
+        return (
+            ClipboardSnapshot(
+                ok=True,
+                kind="text",
+                change_count=5,
+                byte_size=5,
+                mime="text/plain;charset=utf-8",
+                sha256=hashlib.sha256(b"junk?").hexdigest(),
+            ),
+            "junk?",
+        )
+
+    def _assert_transport_falls_back_without_junk(
+        self, wrap: object, label: str
+    ) -> None:
+        """Prove a *live* transport-backed pane still receives zero bytes.
+
+        The control run matters more than the assertion it guards: without it,
+        a transport that failed to start would record an empty file and the
+        "no junk" claim would pass for the wrong reason.
+        """
+        server, pane = self._quiet_pane(
+            wrap=wrap, label=f"{label}-control", slot=f"{label}-control", dwell=6.0
+        )
+        self._smart_paste(server, pane, self._control_text_capture)
+        self.wait_for(self.observed)
+        self.assertEqual(
+            self.observed.read_bytes(),
+            expected_stream(b"junk?"),
+            f"{label}: the control injection never reached the pane",
+        )
+
+        server, pane = self._quiet_pane(
+            wrap=wrap, label=f"{label}-image", slot=f"{label}-image", dwell=6.0
+        )
+        with self.assertRaises(sp.SmartPasteError) as raised:
+            self._smart_paste(server, pane, self._unsupported_image_capture)
+        self.assertEqual(sp.error_code(raised.exception), "unsupported_type")
+        self._assert_pty_saw_nothing()
+
+    def test_unsupported_image_injects_no_junk_through_nested_tmux(self) -> None:
+        def wrap(listener: list[str]) -> list[str]:
+            inner_socket = f"skillbox-clipboard-fb-inner-{uuid.uuid4().hex}"
+            self.addCleanup(kill_tmux_socket, inner_socket)
+            return [
+                "tmux", "-L", inner_socket, "-f", "/dev/null",
+                "new-session", "-s", "nested-fallback", "-x", "200", "-y", "50",
+                *listener,
+            ]
+
+        self._assert_transport_falls_back_without_junk(wrap, "nested-tmux")
+
+    def test_unsupported_image_injects_no_junk_through_ssh_and_remote_tmux(
+        self,
+    ) -> None:
+        ssh_command = self._start_private_sshd()
+
+        def wrap(listener: list[str]) -> list[str]:
+            remote_socket = f"skillbox-clipboard-fb-remote-{uuid.uuid4().hex}"
+            self.addCleanup(kill_tmux_socket, remote_socket)
+            remote = [
+                remote_tmux_bin(), "-L", remote_socket, "-f", "/dev/null",
+                "new-session", "-s", "remote-fallback", "-x", "200", "-y", "50",
+                *listener,
+            ]
+            return [*ssh_command, shlex.join(remote)]
+
+        self._assert_transport_falls_back_without_junk(wrap, "ssh-remote-tmux")
 
 
 if __name__ == "__main__":

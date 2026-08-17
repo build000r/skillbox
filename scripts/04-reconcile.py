@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Iterable, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass  # noqa: F401 - public helper surface
 from pathlib import Path
 from typing import Any
 
@@ -23,12 +23,12 @@ from lib.runtime_model import build_runtime_model
 from lib import doctor_fix
 from lib.doctor_contract import (
     DOCTOR_SCHEMA_VERSION,
-    EXIT_DRIFT as DOCTOR_EXIT_DRIFT,
+    EXIT_DRIFT as DOCTOR_EXIT_DRIFT,  # noqa: F401 - public helper surface
     EXIT_ERROR as DOCTOR_EXIT_ERROR,
     EXIT_NEEDS_INPUT as DOCTOR_EXIT_NEEDS_INPUT,
-    EXIT_OK as DOCTOR_EXIT_OK,
-    EXIT_USAGE as DOCTOR_EXIT_USAGE,
-    Finding,
+    EXIT_OK as DOCTOR_EXIT_OK,  # noqa: F401 - public helper surface
+    EXIT_USAGE as DOCTOR_EXIT_USAGE,  # noqa: F401 - public helper surface
+    Finding,  # noqa: F401 - public helper surface
     coverage_block,
     display_status,
     doctor_envelope,
@@ -420,6 +420,14 @@ def _operator_env_path() -> Path:
 def repo_rel(path: Path) -> str:
     try:
         return str(path.relative_to(ROOT_DIR))
+    except ValueError:
+        return str(path)
+
+
+def _rel_to(path: Path, root: Path) -> str:
+    """``repo_rel`` against an explicit root, so a walk can be pointed at a fixture."""
+    try:
+        return str(path.relative_to(root))
     except ValueError:
         return str(path)
 
@@ -1454,37 +1462,101 @@ def check_beads_state() -> CheckResult:
     )
 
 
-def check_reference_drift() -> CheckResult:
+#: Directories this check must not read, and why each one is here.
+#:
+#: The check searches for the literal name of a retired script, and its own
+#: FAIL message quotes that name. Anything that records this check's output
+#: therefore contains the literal, so scanning such a directory makes the check
+#: fail because it failed before — a hit count that only ever grows, and a
+#: `make doctor` that can never pass again on a machine that failed it once.
+#:
+#: Two distinct reasons, kept separate so the next person extends the right one:
+REFERENCE_DRIFT_GENERATED_PREFIXES = (
+    # Generated state. `.skillbox-state/doctor-runs/` stores a receipt per
+    # doctor run with the message verbatim; that is the self-poisoning loop.
+    ".skillbox-state",
+    ".cache",
+    "logs",
+    "refactor/artifacts",
+    # Not drift, and enormous: never worth walking.
+    ".git",
+)
+REFERENCE_DRIFT_DATASTORE_PREFIXES = (
+    # Tracked DATA STORES that legitimately quote the literal because someone
+    # filed or discussed a bug about it. `.beads/issues.jsonl` holds the bug
+    # report for this very defect, so filing it re-poisoned the check. An issue
+    # database is a record of what was said, not a reference to the script, and
+    # nobody fixes a stale reference by editing issue history.
+    ".beads",
+)
+
+
+def _reference_drift_prefixes() -> tuple[str, ...]:
+    """Repo-relative directories the drift walk prunes.
+
+    ``SKILLBOX_STATE_ROOT`` can relocate generated state; when it points inside
+    the repo, prune that too rather than only the default name.
+    """
+    prefixes = list(REFERENCE_DRIFT_GENERATED_PREFIXES)
+    prefixes.extend(REFERENCE_DRIFT_DATASTORE_PREFIXES)
+    configured = os.environ.get("SKILLBOX_STATE_ROOT", "").strip()
+    if configured:
+        candidate = Path(os.path.expanduser(configured))
+        if not candidate.is_absolute():
+            candidate = ROOT_DIR / candidate
+        try:
+            relative = candidate.resolve().relative_to(ROOT_DIR.resolve())
+        except (ValueError, OSError):
+            relative = None
+        if relative is not None and str(relative) not in {"", "."}:
+            prefixes.append(str(relative))
+    return tuple(dict.fromkeys(prefixes))
+
+
+def check_reference_drift(root_dir: Path | None = None) -> CheckResult:
+    root = ROOT_DIR if root_dir is None else Path(root_dir)
     hits: list[str] = []
-    ignored_prefixes = {
-        ".cache",
-        "logs",
-    }
+    ignored_prefixes = set(_reference_drift_prefixes())
     ignored_files = {
         "scripts/04-reconcile.py",
         # Captured demo transcript legitimately contains this check's own
         # PASS/FAIL message strings, not a stale script reference.
         "examples/first-box-demo.md",
     }
-    ignored_prefixes.add("refactor/artifacts")
 
-    for path in ROOT_DIR.rglob("*"):
-        if not path.is_file():
-            continue
-        rel = repo_rel(path)
-        if rel in ignored_files:
-            continue
-        if any(rel == prefix or rel.startswith(f"{prefix}/") for prefix in ignored_prefixes):
-            continue
-        if path.suffix == ".skill":
-            continue
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except UnicodeDecodeError:
-            continue
-        for index, line in enumerate(lines, start=1):
-            if "00-skill-sync.sh" in line:
-                hits.append(f"{rel}:{index}")
+    for current, dirnames, filenames in os.walk(root):
+        current_path = Path(current)
+        # Prune in place: `rglob` would still descend into every pruned tree
+        # and read each file only to discard it.
+        kept: list[str] = []
+        for dirname in dirnames:
+            rel_dir = _rel_to(current_path / dirname, root)
+            if rel_dir in ignored_prefixes:
+                continue
+            kept.append(dirname)
+        dirnames[:] = sorted(kept)
+
+        for filename in sorted(filenames):
+            path = current_path / filename
+            if not path.is_file():
+                continue
+            rel = _rel_to(path, root)
+            if rel in ignored_files:
+                continue
+            if any(
+                rel == prefix or rel.startswith(f"{prefix}/")
+                for prefix in ignored_prefixes
+            ):
+                continue
+            if path.suffix == ".skill":
+                continue
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except (UnicodeDecodeError, OSError):
+                continue
+            for index, line in enumerate(lines, start=1):
+                if "00-skill-sync.sh" in line:
+                    hits.append(f"{rel}:{index}")
 
     if hits:
         return CheckResult(

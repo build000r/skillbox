@@ -131,6 +131,29 @@ so its fix becomes "verify there before touching; do not remove or repoint
 from this machine" instead of the remove-or-repoint advice, and both fields
 pass through to the envelope's ``stale_registered`` rows.
 
+Lane plan (``lanes``, additive)
+-------------------------------
+The envelope hands over the division a coordinator used to hand-build. Each
+lane is ``{id, kind, repos, write_scope, rationale, suggested_concurrency}``
+and, for ``withheld``, a ``withheld: [{path, reason}]`` list. Kinds come from
+:data:`LANE_KINDS`; :data:`EMITTED_LANE_KINDS` is what a plan can actually
+contain (``doc-only`` is declared but never emitted -- see its note).
+
+Three properties are load-bearing:
+
+* **One lane per family.** A repo and its linked worktrees always share a
+  lane, keyed on ``worktree_of``. Directory-shaped partitioning is what let
+  one lane push another's branch through a shared git dir.
+* **write_scope ⊇ repos.** The scope covers every checkout on the family's
+  shared store, including clean siblings that are not themselves work: a
+  write through a shared git dir touches all of them.
+* **Parity or a typed withhold.** No kind's end state is a new side ref;
+  work that cannot reach origin parity from here lands in ``withheld`` with
+  its reason and ``suggested_concurrency: 0``, never silently dropped.
+
+The key is ABSENT when nothing needs a lane, and the tty spends exactly one
+line on it -- the plan is for machines.
+
 Paired with the reconcile skill
 -------------------------------
 ``sbp git`` is the read-only estate front door; the reconcile skill is the
@@ -158,13 +181,14 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from .git_inventory import (
     DEFAULT_DEPTH,
     DEFAULT_TIMEOUT_S,
     GitRepoRecord,
     default_scan_roots,
+    effective_ahead_behind,
     primary_class_counts,
     probe_repo,
     scan,
@@ -184,19 +208,94 @@ __all__ = [
     "apply_amp_campaign",
     "apply_live_comparison",
     "build_report",
+    "build_lane_plan",
     "compute_scan_delta",
+    "derive_ownership",
     "fix_commands",
+    "lane_kind_for_row",
     "parse_only",
+    "parse_remote_owner",
     "report_text_lines",
     "resolve_cwd_repo_root",
     "risk_band",
     "risk_sorted",
     "stash_store_owners",
     "stash_summary",
+    "worktree_primaries",
+    "worktree_primary",
 ]
 
 #: JSON envelope version. Bump ONLY on a breaking change to the contract.
 SCHEMA = "sbp-git/v1"
+
+# --------------------------------------------------------------------------- #
+# Ownership + push policy
+#
+# A coordinator's first act on the 2026-08-15 live run was re-deriving, by
+# hand, who may push where: build000r remotes are the operator's, tetsuo-ai and
+# choffmanebpm remotes are somebody else's, remoteless repos are neither. That
+# derivation is mechanical, and getting it wrong is expensive in one direction
+# only -- advising `git push` at an external upstream. On that run this surface
+# would have advised exactly that three times.
+#
+# So the vocabulary below is small and the default is timid: anything this
+# module cannot positively establish is `unknown` / `ask`, never `push`.
+# --------------------------------------------------------------------------- #
+
+OWNERSHIP_OPERATOR = "operator-owned"
+OWNERSHIP_EXTERNAL = "external-upstream"
+OWNERSHIP_LOCAL = "owned-local"
+OWNERSHIP_UNKNOWN = "unknown"
+
+OWNERSHIP_VALUES = (
+    OWNERSHIP_OPERATOR,
+    OWNERSHIP_EXTERNAL,
+    OWNERSHIP_LOCAL,
+    OWNERSHIP_UNKNOWN,
+)
+
+PUSH_POLICY_PUSH = "push"
+PUSH_POLICY_NO_PUSH = "no-push"
+PUSH_POLICY_SCRUB_GATE = "scrub-gate"
+PUSH_POLICY_ASK = "ask"
+
+PUSH_POLICY_VALUES = (
+    PUSH_POLICY_PUSH,
+    PUSH_POLICY_NO_PUSH,
+    PUSH_POLICY_SCRUB_GATE,
+    PUSH_POLICY_ASK,
+)
+
+OWNERSHIP_SOURCE_REGISTRY = "registry"
+OWNERSHIP_SOURCE_HEURISTIC = "remote-heuristic"
+OWNERSHIP_SOURCE_NONE = "none"
+
+#: Registry ``ownership:`` spellings -> this module's vocabulary. The live
+#: registry only says ``owned`` / ``owned-local`` today; ``external-upstream``
+#: and its synonyms are accepted now so bead v6ac.6.4 can start writing them
+#: without a second change here. An unrecognized spelling deliberately does NOT
+#: fall through to "probably fine" -- it lands on ``unknown`` and asks.
+_REGISTRY_OWNERSHIP = {
+    "owned": OWNERSHIP_OPERATOR,
+    "operator-owned": OWNERSHIP_OPERATOR,
+    "owned-local": OWNERSHIP_LOCAL,
+    "local": OWNERSHIP_LOCAL,
+    "external": OWNERSHIP_EXTERNAL,
+    "external-upstream": OWNERSHIP_EXTERNAL,
+    "upstream": OWNERSHIP_EXTERNAL,
+    "fork": OWNERSHIP_EXTERNAL,
+    "vendor": OWNERSHIP_EXTERNAL,
+}
+
+#: Fallback operator account when the registry is unreadable. The registry's
+#: own ``metadata.owner`` is preferred whenever it parses -- the estate model
+#: should not be duplicated in Python.
+DEFAULT_OPERATOR_REMOTE_OWNER = "build000r"
+
+#: Hosts whose URLs carry an owner segment we can compare against the operator
+#: account. A host outside this set is not "external", it is unrecognized, and
+#: an unrecognized remote is an ``ask``.
+_KNOWN_FORGE_HOSTS = frozenset({"github.com", "www.github.com", "gitlab.com", "bitbucket.org"})
 
 #: ``--only`` vocabulary backed by scan classes today (repo_inventory.sh
 #: semantics: ``behind`` matches behind-clean + diverged-clean, ``ahead``
@@ -209,6 +308,10 @@ FILTER_CLASSES = (
     "diverged-clean",
     "mid-op",
     "no-remote",
+    # A linked worktree whose HEAD branch has no upstream but whose shared
+    # store does have a remote. Filterable in its own right so a coordinator
+    # can ask for exactly the rows this bead reclassified out of no-remote.
+    "unpublished-branch",
     "clean-current",
     "blocked",
 )
@@ -269,6 +372,23 @@ LIVE_DRIFT_STATES = frozenset(
     {"behind-origin", "diverged-from-origin", "origin-newer", "origin-differs"}
 )
 
+# ---------------------------------------------------------------------------
+# EXTERNAL-STATE JOINS
+#
+# Everything below reads state that lives OUTSIDE the repo being scanned, and
+# every one of them defaults to a real path on the operator's machine. That is
+# what makes them dangerous in tests: a fixture that forgets to redirect one
+# scans the host instead, and the suite passes or fails depending on whose
+# laptop it runs on. On 2026-08-15 a real receipts store leaked into fixture
+# envelopes the same day the receipts join shipped.
+#
+# ADDING A JOIN? Register its env var in ``HERMETIC_JOIN_ENVS`` in
+# ``tests/helpers.py`` — or the regression test will fail you.
+# ``tests/test_git_estate_hermetic.py`` derives the true set from the constants
+# in THIS file, so an unregistered join is a test failure, not a surprise three
+# weeks later.
+# ---------------------------------------------------------------------------
+
 #: Env override for the reconcile receipts store (tests point at a fixture);
 #: falls back to the reconcile skill's state dir
 #: (``~/.local/state/reconcile/receipts`` -- the skill's loader,
@@ -319,15 +439,21 @@ def risk_band(record: GitRepoRecord) -> int:
     if "mid-op" in classes:
         return RISK_BAND_NAMES.index("mid-op")
     dirty = "dirty" in classes
-    if record.ahead > 0 and record.behind > 0:
+    # Band on the numbers that describe REALITY. When a branch's configured
+    # upstream is not the ref holding its commits, its own ahead/behind
+    # describe a config artifact -- that is how cfo-qbo-control-plane sat at
+    # the top of the risk table as "diverged 3/58" for months while its 3
+    # commits were already on origin/<branch> at identical SHA.
+    ahead, behind = effective_ahead_behind(record)
+    if ahead > 0 and behind > 0:
         return RISK_BAND_NAMES.index("diverged")
-    if record.behind > 0 and not dirty:
+    if behind > 0 and not dirty:
         return RISK_BAND_NAMES.index("behind-clean")
-    if record.behind > 0 and dirty:
+    if behind > 0 and dirty:
         return RISK_BAND_NAMES.index("dirty-behind")
     if dirty:
         return RISK_BAND_NAMES.index("dirty")
-    if record.ahead > 0:
+    if ahead > 0:
         return RISK_BAND_NAMES.index("ahead")
     if "no-remote" in classes:
         return RISK_BAND_NAMES.index("no-remote")
@@ -361,10 +487,194 @@ def risk_sorted(
 # --------------------------------------------------------------------------- #
 
 
+def parse_remote_owner(url: str) -> tuple[str | None, str | None]:
+    """``(host, owner)`` for a remote URL, or ``(None, None)`` when unreadable.
+
+    Handles the three spellings git actually hands back: ``scp``-style
+    (``git@github.com:owner/repo.git``), ``ssh://``/``https://`` URLs, and
+    plain filesystem paths. A local path has no host and no owner -- it is the
+    "ownership-unknown" case the live run hit, not a forge to compare against.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return None, None
+    # Local paths first: file:// and anything that is just a path.
+    if text.startswith("file://"):
+        return None, None
+    if text.startswith((".", "/", "~")):
+        return None, None
+
+    host = ""
+    remainder = ""
+    if "://" in text:
+        _scheme, _, rest = text.partition("://")
+        authority, _, remainder = rest.partition("/")
+        # Strip credentials and any port.
+        host = authority.rpartition("@")[2].partition(":")[0]
+    elif "@" in text and ":" in text.rpartition("@")[2]:
+        authority, _, remainder = text.rpartition("@")[2].partition(":")
+        host = authority.partition(":")[0]
+    else:
+        # Bare ``host:path`` with no user, or something we do not recognize.
+        authority, sep, remainder = text.partition(":")
+        if not sep or "/" in authority:
+            return None, None
+        host = authority
+
+    host = host.strip().lower()
+    owner = remainder.strip("/").split("/")[0] if remainder.strip("/") else ""
+    return (host or None), (owner or None)
+
+
+def derive_ownership(
+    record: GitRepoRecord,
+    *,
+    registry_entry: Mapping[str, Any] | None = None,
+    operator_owner: str | None = None,
+) -> dict[str, Any]:
+    """Ownership + push policy for one row. Pure; touches nothing.
+
+    Precedence is registry, then the remote-URL heuristic, then nothing --
+    reported verbatim as ``ownership_source`` so a coordinator can see whether
+    a verdict was declared or guessed. ``push_policy_reason`` is the one-line
+    why, because a coordinator brief should contain zero prose about who may
+    push.
+
+    The registry wins on ownership, but it does not get to override an
+    observed external remote into a push: an entry saying ``owned`` on a
+    checkout whose origin points at somebody else's account is a *conflict*,
+    and a conflict is an ``ask``, not a push.
+    """
+    account = (operator_owner or DEFAULT_OPERATOR_REMOTE_OWNER).strip().lower()
+    remotes = dict(record.remotes)
+    primary_url = remotes.get("origin") or (
+        record.remotes[0][1] if record.remotes else ""
+    )
+    host, owner = parse_remote_owner(primary_url)
+
+    declared = ""
+    if registry_entry:
+        declared = str(registry_entry.get("ownership") or "").strip().lower()
+
+    remote_verdict: str | None = None
+    if not record.remotes:
+        remote_verdict = None
+    elif host and owner and host in _KNOWN_FORGE_HOSTS:
+        remote_verdict = (
+            OWNERSHIP_OPERATOR if owner.lower() == account else OWNERSHIP_EXTERNAL
+        )
+
+    if declared:
+        ownership = _REGISTRY_OWNERSHIP.get(declared, OWNERSHIP_UNKNOWN)
+        source = OWNERSHIP_SOURCE_REGISTRY
+    elif remote_verdict is not None:
+        ownership = remote_verdict
+        source = OWNERSHIP_SOURCE_HEURISTIC
+    elif registry_entry is not None and not record.remotes:
+        # Registered and genuinely remoteless: the estate model already says
+        # this checkout is deliberate, it just has nowhere to push.
+        ownership = OWNERSHIP_LOCAL
+        source = OWNERSHIP_SOURCE_REGISTRY
+    else:
+        ownership = OWNERSHIP_UNKNOWN
+        source = (
+            OWNERSHIP_SOURCE_HEURISTIC if record.remotes else OWNERSHIP_SOURCE_NONE
+        )
+
+    conflict = (
+        ownership == OWNERSHIP_OPERATOR
+        and remote_verdict == OWNERSHIP_EXTERNAL
+    )
+
+    policy, reason = _push_policy_for(
+        ownership,
+        conflict=conflict,
+        has_remote=bool(record.remotes),
+        owner=owner,
+        host=host,
+        source=source,
+        registry_entry=registry_entry,
+    )
+    result: dict[str, Any] = {
+        "ownership": ownership,
+        "ownership_source": source,
+        "push_policy": policy,
+        "push_policy_reason": reason,
+    }
+    if primary_url:
+        result["remote_url"] = primary_url
+    if owner:
+        result["remote_owner"] = owner
+    return result
+
+
+def _push_policy_for(
+    ownership: str,
+    *,
+    conflict: bool,
+    has_remote: bool,
+    owner: str | None,
+    host: str | None,
+    source: str,
+    registry_entry: Mapping[str, Any] | None,
+) -> tuple[str, str]:
+    if conflict:
+        return (
+            PUSH_POLICY_ASK,
+            f"registry says operator-owned but origin is {owner}/@{host}; confirm before pushing",
+        )
+    # Forward compatibility with bead v6ac.6.4, which will write explicit
+    # push-policy flags into the registry. Honour them the moment they exist.
+    declared_policy = ""
+    if registry_entry:
+        declared_policy = str(registry_entry.get("push_policy") or "").strip().lower()
+        if not declared_policy and registry_entry.get("scrub_gate"):
+            declared_policy = PUSH_POLICY_SCRUB_GATE
+    if declared_policy in PUSH_POLICY_VALUES:
+        return declared_policy, f"registry declares push_policy: {declared_policy}"
+
+    if ownership == OWNERSHIP_EXTERNAL:
+        who = f" ({owner})" if owner else ""
+        return PUSH_POLICY_NO_PUSH, f"external upstream{who}; publish via PR, never a direct push"
+    if ownership == OWNERSHIP_LOCAL:
+        return PUSH_POLICY_NO_PUSH, "no remote configured; nothing to push to"
+    if ownership == OWNERSHIP_OPERATOR:
+        if not has_remote:
+            return PUSH_POLICY_NO_PUSH, "operator-owned but no remote configured"
+        return PUSH_POLICY_PUSH, f"operator-owned remote ({source})"
+    if not has_remote:
+        return PUSH_POLICY_ASK, "no remote and no registry entry; confirm intent"
+    return PUSH_POLICY_ASK, "ownership could not be established from registry or remote"
+
+
+def _ahead_fix(path: str, record: GitRepoRecord, push_policy: str | None) -> str:
+    """Advice for an ahead-of-upstream row, gated on who owns the remote.
+
+    ``git push`` is emitted for exactly one policy. Every other policy gets a
+    read-only command that shows the same commits without publishing them:
+    telling a coordinator to push at somebody else's upstream is the one error
+    in this surface that cannot be undone by reading more output.
+
+    ``push_policy=None`` means the caller did not derive one; that is treated
+    as unknown and asks, not as permission.
+    """
+    ahead = record.ahead
+    plural = "" if ahead == 1 else "s"
+    if push_policy == PUSH_POLICY_PUSH:
+        return f"git -C {path} push"
+    review = f"git -C {path} log --oneline @{{u}}..HEAD  # {ahead} unpublished commit{plural}"
+    if push_policy == PUSH_POLICY_NO_PUSH:
+        return f"{review}; external upstream — open a PR, do not publish directly"
+    if push_policy == PUSH_POLICY_SCRUB_GATE:
+        return f"{review}; scrub gate — run the scrub before publishing"
+    return f"{review}; ownership unconfirmed — establish intent before publishing"
+
+
 def fix_commands(
     record: GitRepoRecord,
     registration: str | None = None,
     registry_path: str | None = None,
+    push_policy: str | None = None,
 ) -> list[str]:
     """Copy-pasteable remediation per row. Diverged rows get the reconcile
     handoff INSTEAD of push/pull so nobody hand-merges a divergence.
@@ -373,6 +683,10 @@ def fix_commands(
     ignore, with the exact registry file path) AFTER the work-securing fixes.
     Blocked rows stay inspect-only: an unprobeable path gets triaged before
     it gets registered.
+
+    ``push_policy`` (from :func:`derive_ownership`) gates the ahead-of-upstream
+    advice: ``git push`` is emitted for ``push`` and for nothing else. Passing
+    ``None`` is treated as unconfirmed, not as permission.
 
     Rows carrying at least :data:`JUNK_CANDIDATE_MIN` untracked entries get the
     ``git-repo-janitor`` handoff, mirroring the ``git-stash-janitor`` one: it
@@ -386,13 +700,23 @@ def fix_commands(
         return [f"inspect: {record.error or 'probe failed'}"]
     if record.mid_op:
         fixes.append(f"git -C {path} status  # finish or abort the {record.mid_op}")
-    diverged = record.ahead > 0 and record.behind > 0
+    mismatch = record.upstream_mismatch
+    if mismatch is not None:
+        # Repair the config, do not reconcile a divergence that does not
+        # exist. The commits are already on `same_name` at identical SHA; the
+        # only wrong thing here is which ref the branch is pointed at.
+        fixes.append(
+            f"git -C {path} branch --set-upstream-to {mismatch.same_name}"
+            f"  # upstream points at {mismatch.configured}"
+        )
+    ahead, behind = effective_ahead_behind(record)
+    diverged = ahead > 0 and behind > 0
     if diverged:
         fixes.append("sbp doctor / reconcile skill — do not hand-merge")
-    elif record.behind > 0:
+    elif behind > 0:
         fixes.append(f"git -C {path} pull --ff-only  # or /reconcile")
-    elif record.ahead > 0:
-        fixes.append(f"git -C {path} push")
+    elif ahead > 0:
+        fixes.append(_ahead_fix(path, record, push_policy))
     if "dirty" in record.classes:
         fixes.append(f"git -C {path} add -p && git -C {path} commit")
     if record.untracked >= JUNK_CANDIDATE_MIN:
@@ -500,8 +824,15 @@ def _config_root() -> Path:
     return Path.home() / "repos" / "skillbox-config"
 
 
-def _load_registry_rules() -> tuple[Any, list[dict[str, Any]], list[dict[str, Any]], str | None]:
-    """(registry_doctor module, ignore rules, registered entries, unavailable-reason).
+def _load_registry_rules() -> tuple[
+    Any, list[dict[str, Any]], list[dict[str, Any]], str | None, str | None
+]:
+    """(registry_doctor module, ignore rules, entries, unavailable-reason, operator owner).
+
+    ``operator owner`` is the registry's own ``metadata.owner``. Ownership
+    derivation compares remote URLs against it rather than hard-coding an
+    account here: the estate model is the registry's to declare, and a fork of
+    this repo should not have to patch Python to say who it is.
 
     ONE registry parse: ``load_registry`` + ``normalize_registry`` run once
     and that single normalized payload supplies both the ignore rules and the
@@ -514,20 +845,25 @@ def _load_registry_rules() -> tuple[Any, list[dict[str, Any]], list[dict[str, An
     script = config_root / "scripts" / "registry_doctor.py"
     registry_path = config_root / "registry" / "repos.yaml"
     if not script.is_file():
-        return None, [], [], f"no registry_doctor.py at {script}"
+        return None, [], [], f"no registry_doctor.py at {script}", None
     if not registry_path.is_file():
-        return None, [], [], f"no registry at {registry_path}"
+        return None, [], [], f"no registry at {registry_path}", None
     try:
         spec = importlib.util.spec_from_file_location("_sbp_registry_doctor", script)
         if spec is None or spec.loader is None:
-            return None, [], [], f"cannot load {script}"
+            return None, [], [], f"cannot load {script}", None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         payload = module.load_registry(registry_path)
         normalized = module.normalize_registry(payload, None)
-        return module, list(normalized["ignore"]), list(normalized["repos"]), None
+        metadata = payload.get("metadata") if isinstance(payload, Mapping) else None
+        owner = None
+        if isinstance(metadata, Mapping):
+            raw_owner = str(metadata.get("owner") or "").strip()
+            owner = raw_owner or None
+        return module, list(normalized["ignore"]), list(normalized["repos"]), None, owner
     except BaseException as exc:  # SystemExit included: degrade, never crash
-        return None, [], [], f"registry_doctor failed: {exc}"
+        return None, [], [], f"registry_doctor failed: {exc}", None
 
 
 def _split_ignored(
@@ -1281,13 +1617,262 @@ def apply_amp_campaign(report: dict[str, Any], *, timeout_s: float | None = None
     report.setdefault("amp", {})["campaign"] = campaign
 
 
+# --------------------------------------------------------------------------- #
+# Lane plan
+#
+# The 2026-08-15 coordinator brief hand-partitioned 55 issue rows into 5 lanes
+# with prose write scopes. Every rule it applied was mechanical -- band, size,
+# ownership, worktree grouping -- so the envelope hands the division over
+# instead of making the next coordinator re-derive it.
+#
+# Everything here is a PURE function over rows: no I/O, no git, no clock, so a
+# lane plan is unit-testable and identical across runs on the same envelope.
+# Lanes carry fix strings and never execute: the glance still only plans.
+#
+# Per the epic's VISION CORRECTION, the partition's goal is ORIGIN PARITY per
+# lane. No lane's end state may be a new side ref -- there is deliberately no
+# "snapshot to a safety branch" kind, because safety branches are the debris a
+# reconcile eliminates, not an outcome. Work that genuinely cannot converge
+# from here is a TYPED EXCEPTION (``withheld``) carrying its reason, never a
+# silently dropped row.
+# --------------------------------------------------------------------------- #
+
+LANE_WITHHELD = "withheld"
+LANE_DIVERGED = "diverged"
+LANE_DIRTY_BEHIND = "dirty-behind"
+LANE_CONVERGE = "converge"
+LANE_PUSH_AHEAD = "push-ahead"
+LANE_UNREGISTERED_DIRTY = "unregistered-dirty"
+LANE_SMALL_DIRTY = "small-dirty"
+LANE_MECHANICAL = "mechanical-cluster"
+LANE_DOC_ONLY = "doc-only"
+
+#: Emission order IS the assignment ladder: first match wins, so every issue
+#: row lands in exactly one lane and the result is deterministic.
+#:
+#: ``doc-only`` is in the vocabulary because the bead names it, but it is NOT
+#: emitted: deciding a change is docs-only needs file-level data
+#: (``git diff --name-only``) that the envelope does not carry and that the
+#: read-only glance does not probe. Declaring it here without producing it
+#: keeps the contract honest and leaves the slot for a bead that adds the data.
+LANE_KINDS: tuple[str, ...] = (
+    LANE_WITHHELD,
+    LANE_DIVERGED,
+    LANE_DIRTY_BEHIND,
+    LANE_CONVERGE,
+    LANE_PUSH_AHEAD,
+    LANE_UNREGISTERED_DIRTY,
+    LANE_SMALL_DIRTY,
+    LANE_MECHANICAL,
+    LANE_DOC_ONLY,
+)
+
+#: Kinds a lane plan can actually contain today.
+EMITTED_LANE_KINDS: tuple[str, ...] = tuple(
+    kind for kind in LANE_KINDS if kind != LANE_DOC_ONLY
+)
+
+#: Staged+unstaged+untracked at or under this is a "small" dirty tree: one
+#: commit's worth of review, not a session's.
+SMALL_DIRTY_MAX = 5
+
+#: Upper bound on a lane's suggested parallelism. Past this the coordinator is
+#: managing agents rather than work.
+MAX_LANE_CONCURRENCY = 4
+
+_LANE_RATIONALE = {
+    LANE_WITHHELD: (
+        "cannot reach origin parity from here — each row carries its reason; "
+        "these are the judgment blocks, not work to dispatch"
+    ),
+    LANE_DIVERGED: (
+        "ahead and behind: pull, merge, push to parity — never hand-merge, "
+        "never park on a side branch"
+    ),
+    LANE_DIRTY_BEHIND: "commit the working tree first, then converge to parity",
+    LANE_CONVERGE: "clean and behind: fast-forward to parity",
+    LANE_PUSH_AHEAD: "local commits on an operator-owned remote: push to parity",
+    LANE_UNREGISTERED_DIRTY: (
+        "uncommitted work in a repo the estate model does not know: secure the "
+        "work, then register or ignore it"
+    ),
+    LANE_SMALL_DIRTY: "small working trees: one commit each",
+    LANE_MECHANICAL: (
+        "bounded per-repo handoffs, no cross-repo coordination: forgotten "
+        "branches to publish, upstream re-pointing, stash review"
+    ),
+}
+
+
+def _lane_withhold_reason(row: Mapping[str, Any]) -> str | None:
+    """Why this row cannot be dispatched toward parity, or ``None``.
+
+    A withhold is a TYPED EXCEPTION, not a dropped row: the coordinator still
+    sees it, with the reason it needs a human.
+    """
+    if "blocked" in (row.get("classes") or []):
+        return f"probe blocked: {row.get('error') or 'unknown'}"
+    if row.get("mid_op"):
+        return f"{row['mid_op']} in flight — finish or abort before any lane runs"
+    classes = row.get("classes") or []
+    ahead, behind = _lane_effective(row)
+    if (
+        "no-remote" in classes
+        and "dirty" not in classes
+        and not ahead
+        and not behind
+        and not row.get("unpushed_branches")
+    ):
+        # Nothing to converge TO. Several of these are registry-declared
+        # "Deliberately remoteless. Verified 2026-08-15" -- dispatching an
+        # agent to add a remote to one of those would be actively wrong, so
+        # the declaration is repeated back rather than overridden.
+        if row.get("ownership") == OWNERSHIP_LOCAL:
+            return "remoteless by declaration (registry: owned-local) — no origin to converge to"
+        return "no remote configured — declare intent before any lane can converge it"
+    policy = row.get("push_policy")
+    if policy == PUSH_POLICY_NO_PUSH and _lane_needs_publish(row):
+        return f"{row.get('push_policy_reason') or 'publishing withheld'}"
+    if policy == PUSH_POLICY_ASK and _lane_needs_publish(row):
+        return f"ownership unconfirmed — {row.get('push_policy_reason') or 'confirm intent'}"
+    if policy == PUSH_POLICY_SCRUB_GATE and _lane_needs_publish(row):
+        return "scrub gate — run the scrub before publishing"
+    return None
+
+
+def _lane_needs_publish(row: Mapping[str, Any]) -> bool:
+    """True when reaching parity would require pushing something."""
+    mismatch = row.get("upstream_mismatch") or {}
+    ahead = (
+        int(mismatch.get("ahead_vs_same_name") or 0)
+        if mismatch
+        else int(row.get("ahead") or 0)
+    )
+    return ahead > 0 or bool(row.get("unpushed_branches"))
+
+
+def _lane_effective(row: Mapping[str, Any]) -> tuple[int, int]:
+    """Row-level twin of ``effective_ahead_behind`` (rows, not records)."""
+    mismatch = row.get("upstream_mismatch") or {}
+    if mismatch:
+        return (
+            int(mismatch.get("ahead_vs_same_name") or 0),
+            int(mismatch.get("behind_vs_same_name") or 0),
+        )
+    return int(row.get("ahead") or 0), int(row.get("behind") or 0)
+
+
+def lane_kind_for_row(row: Mapping[str, Any]) -> str | None:
+    """The one lane this row belongs to, or ``None`` when it needs no lane.
+
+    First match down :data:`LANE_KINDS` wins, so the assignment is total and
+    order-independent of how the rows arrived.
+    """
+    if not _is_issue_row(dict(row)):
+        return None
+    if _lane_withhold_reason(row):
+        return LANE_WITHHELD
+
+    dirty = "dirty" in (row.get("classes") or [])
+    ahead, behind = _lane_effective(row)
+    unregistered = row.get("registration") == "unregistered"
+
+    if ahead > 0 and behind > 0:
+        return LANE_DIVERGED
+    if dirty and behind > 0:
+        return LANE_DIRTY_BEHIND
+    if behind > 0:
+        return LANE_CONVERGE
+    if ahead > 0:
+        return LANE_PUSH_AHEAD
+    if dirty and unregistered:
+        return LANE_UNREGISTERED_DIRTY
+    if dirty:
+        return LANE_SMALL_DIRTY
+    return LANE_MECHANICAL
+
+
+def _lane_family_key(row: Mapping[str, Any]) -> str:
+    """The shared-store family a row belongs to.
+
+    A linked worktree keys on its PRIMARY, so a repo and its worktrees are one
+    unit. This is the hard rule the live run paid for: lanes partitioned by
+    directory let L2 push L4's branch through the shared git dir.
+    """
+    return str(row.get("worktree_of") or row.get("path") or "")
+
+
+def build_lane_plan(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Partition issue rows into dispatchable lanes. Pure and deterministic.
+
+    Returns ``[]`` when nothing needs a lane, so the envelope key stays absent
+    on a healthy estate (additive contract).
+    """
+    families: dict[str, list[Mapping[str, Any]]] = {}
+    for row in rows:
+        families.setdefault(_lane_family_key(row), []).append(row)
+
+    # One kind per FAMILY, taken from its most urgent member: a worktree and
+    # its parent must never be dispatched to two different lanes.
+    family_kind: dict[str, str] = {}
+    for key, members in families.items():
+        kinds = [
+            kind
+            for kind in (lane_kind_for_row(member) for member in members)
+            if kind is not None
+        ]
+        if kinds:
+            family_kind[key] = min(kinds, key=LANE_KINDS.index)
+
+    lanes: list[dict[str, Any]] = []
+    for kind in EMITTED_LANE_KINDS:
+        members = sorted(key for key, value in family_kind.items() if value == kind)
+        if not members:
+            continue
+        repos: list[str] = []
+        write_scope: list[str] = []
+        withholds: list[dict[str, str]] = []
+        for key in members:
+            family = families.get(key, [])
+            # write_scope is the WHOLE shared store, including checkouts that
+            # are clean: writing through a shared git dir touches every
+            # worktree on it, so a clean sibling still belongs to the scope.
+            for member in family:
+                path = str(member.get("path") or "")
+                if path and path not in write_scope:
+                    write_scope.append(path)
+                if path and lane_kind_for_row(member) is not None and path not in repos:
+                    repos.append(path)
+                reason = _lane_withhold_reason(member) if kind == LANE_WITHHELD else None
+                if reason:
+                    withholds.append({"path": path, "reason": reason})
+        lane: dict[str, Any] = {
+            "id": f"L{len(lanes) + 1}",
+            "kind": kind,
+            "repos": sorted(repos),
+            "write_scope": sorted(write_scope),
+            "rationale": _LANE_RATIONALE[kind],
+            # One agent per independent family, capped: families in a lane
+            # share no git dir, so they are safe to run in parallel.
+            "suggested_concurrency": min(len(members), MAX_LANE_CONCURRENCY),
+        }
+        if withholds:
+            lane["withheld"] = sorted(withholds, key=lambda item: item["path"])
+            # A withheld lane is not dispatchable work; it is a read.
+            lane["suggested_concurrency"] = 0
+        lanes.append(lane)
+    return lanes
+
+
 def _is_issue_row(row: dict[str, Any]) -> bool:
     """A row that earns footer next_actions: non-clean band, unpushed
-    branches (silent-loss class), or a non-quiet amp verdict on a clean HEAD
-    (an Orb problem hides behind a clean tree the same way)."""
+    branches (silent-loss class), a misconfigured upstream (correctly banded
+    clean, but still carrying a repair), or a non-quiet amp verdict on a clean
+    HEAD (an Orb problem hides behind a clean tree the same way)."""
     return bool(
         row.get("risk_band") != "clean"
         or row.get("unpushed_branches")
+        or row.get("upstream_mismatch")
         or row.get("amp_capsule")
         or row.get("amp_verdict")
     )
@@ -1339,6 +1924,47 @@ def stash_store_owners(records: Sequence[GitRepoRecord]) -> dict[str, str]:
         for path in members:
             owners[path] = owner
     return owners
+
+
+def worktree_primary(
+    record: GitRepoRecord, scanned: Mapping[str, str] | None = None
+) -> str | None:
+    """The main checkout behind a linked worktree, or ``None``.
+
+    A linked worktree is ``git_dir != common_dir`` -- git's own definition, and
+    the same one the amp campaign guard uses, so guard and scan cannot disagree.
+
+    The primary path is taken from a scanned sibling whenever one exists
+    (authoritative: that row IS the main worktree). Otherwise it is derived
+    from the store path, because git puts a main worktree's store at
+    ``<primary>/.git`` -- which is how a worktree whose parent lives outside
+    the scan roots still names its parent instead of reporting nothing. A store
+    that is not a ``.git`` directory (a bare repo serving worktrees) yields
+    ``None`` rather than a guess at its parent directory.
+    """
+    git_dir = record.git_dir
+    common = record.common_dir
+    if not git_dir or not common or git_dir == common:
+        return None
+    if scanned and common in scanned:
+        return scanned[common]
+    parent = Path(common)
+    if parent.name != ".git":
+        return None
+    return str(parent.parent)
+
+
+def worktree_primaries(records: Sequence[GitRepoRecord]) -> dict[str, str]:
+    """``common_dir -> path`` for every scanned MAIN worktree.
+
+    Feeds :func:`worktree_primary` so a linked worktree prefers a real scanned
+    sibling over a path derived from the store layout.
+    """
+    return {
+        record.common_dir: record.path
+        for record in records
+        if record.common_dir and record.git_dir == record.common_dir
+    }
 
 
 def _attribute_stash(row: dict[str, Any], owner: str | None) -> None:
@@ -1404,13 +2030,53 @@ def _row(
     registration: str = "unknown",
     registry_path: str | None = None,
     stash_owner: str | None = None,
+    registry_entry: Mapping[str, Any] | None = None,
+    operator_owner: str | None = None,
+    worktree_parents: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     row = record.to_dict()
     row["risk_band"] = RISK_BAND_NAMES[risk_band(record)]
     row["registration"] = registration
-    row["fix"] = fix_commands(record, registration, registry_path)
+    # Additive and present only on linked worktrees, so an estate without any
+    # renders byte-identically. Lane partitioning (v6ac.1.2) groups on this:
+    # directory-based partitioning let one lane push another's branch through
+    # the shared git dir, so grouping has to be mechanical, not path-shaped.
+    parent = worktree_primary(record, worktree_parents)
+    if parent:
+        row["worktree_of"] = parent
+    ownership = derive_ownership(
+        record, registry_entry=registry_entry, operator_owner=operator_owner
+    )
+    row.update(ownership)
+    # The fix list is derived AFTER ownership so the ahead-of-upstream advice
+    # can be gated on it. This ordering is the whole point of the bead.
+    row["fix"] = fix_commands(
+        record, registration, registry_path, ownership["push_policy"]
+    )
     _attribute_stash(row, stash_owner)
     return row
+
+
+def _registry_entry_map(
+    module: Any, repo_entries: Sequence[Mapping[str, Any]]
+) -> dict[str, Mapping[str, Any]]:
+    """normalized path -> registry entry, from the ONE registry parse.
+
+    ``normalize_registry`` already preserves every field on each entry, so the
+    ownership join costs no extra read: it is a lookup over the same payload
+    that supplies ignore rules and registration states.
+    """
+    if module is None:
+        return {}
+    return {str(entry["path"]): entry for entry in repo_entries if entry.get("path")}
+
+
+def _entry_for(
+    module: Any, entries: Mapping[str, Mapping[str, Any]], path: str
+) -> Mapping[str, Any] | None:
+    if module is None or not entries:
+        return None
+    return entries.get(module.normalize_path(path))
 
 
 def build_report(
@@ -1445,10 +2111,11 @@ def build_report(
     started = time.monotonic()
     records = scan(resolved_roots, depth=depth, timeout_s=timeout_s)
 
-    module, rules, repo_entries, registry_reason = _load_registry_rules()
+    module, rules, repo_entries, registry_reason, operator_owner = _load_registry_rules()
     kept, ignored_count = _split_ignored(records, module, rules)
     registration = _registration_states(kept, module, repo_entries)
     stale_entries = _stale_registered_entries(repo_entries)
+    entry_map = _registry_entry_map(module, repo_entries)
     registry_path = str(_config_root() / "registry" / "repos.yaml")
 
     notes: list[str] = []
@@ -1468,6 +2135,7 @@ def build_report(
     # estate, so narrowing the table must not promote a linked worktree to
     # owner and change what the very same row says.
     stash_owners = stash_store_owners(kept)
+    worktree_parents = worktree_primaries(kept)
 
     cwd_root = resolve_cwd_repo_root(cwd)
     cwd_repo = None
@@ -1483,6 +2151,9 @@ def build_report(
             cwd_states[cwd_record.path],
             registry_path,
             stash_owners.get(cwd_record.path),
+            _entry_for(module, entry_map, cwd_record.path),
+            operator_owner,
+            worktree_parents,
         )
 
     # Estate-level like ignored_count: counted over the ignore-filtered scan,
@@ -1540,6 +2211,9 @@ def build_report(
                 registration.get(record.path, "unknown"),
                 registry_path,
                 stash_owners.get(record.path),
+                _entry_for(module, entry_map, record.path),
+                operator_owner,
+                worktree_parents,
             )
             for record in filtered
         ],
@@ -1560,6 +2234,11 @@ def build_report(
     # into an issue row). Below the threshold the key is absent, keeping the
     # small-estate default envelope byte-identical.
     issue_count = sum(1 for row in report["repos"] if _is_issue_row(row))
+    # Additive: absent entirely on an estate with nothing to dispatch, so a
+    # healthy envelope is byte-identical to before.
+    lanes = build_lane_plan(report["repos"])
+    if lanes:
+        report["lanes"] = lanes
     if issue_count >= _BACKLOG_THRESHOLD:
         report["backlog"] = (
             f"{issue_count} issue rows — run the reconcile skill (dispatcher) "
@@ -1763,6 +2442,29 @@ def _table_lines(
         # Unregistered rows carry an inline marker instead of a column: they
         # already cluster at the top of each band via the sort tiebreak.
         marker = "  [unregistered]" if row.get("registration") == "unregistered" else ""
+        # Push policy earns a marker ONLY where it changes the advice: a row
+        # that is ahead of its upstream and may not simply push. Marking every
+        # external or unknown row would put a badge on repos nobody was about
+        # to publish, and the table stays column-stable either way.
+        policy = row.get("push_policy")
+        # Effective ahead, not the raw column: a misconfigured upstream shows
+        # ahead > 0 against the wrong ref while having nothing to publish, and
+        # badging that row with a push policy would be advice about work that
+        # does not exist.
+        mismatch = row.get("upstream_mismatch") or {}
+        effective_ahead = (
+            int(mismatch.get("ahead_vs_same_name") or 0)
+            if mismatch
+            else int(row.get("ahead") or 0)
+        )
+        if effective_ahead > 0 and policy and policy != PUSH_POLICY_PUSH:
+            marker += f"  [{policy}]"
+        # A branch measured against the wrong ref. The A/B column still shows
+        # what the CONFIGURED upstream says (that is a real fact about the
+        # config), so the marker is what tells a reader the numbers beside it
+        # are a config artifact rather than unpublished work.
+        if row.get("upstream_mismatch"):
+            marker += "  [upstream-misconfigured]"
         # --live origin drift is a marker too (absent without --live).
         if row.get("origin_state") in LIVE_DRIFT_STATES:
             marker += f"  [{row['origin_state']}]"
@@ -1895,6 +2597,9 @@ def report_text_lines(report: dict[str, Any], *, color: bool = False) -> list[st
         or r["risk_band"] != "clean"
         or r.get("origin_state") in LIVE_DRIFT_STATES
         or r.get("unpushed_branches")
+        # Correctly banded clean, but it still has a config repair to hand
+        # over. Folding it would trade a false alarm for silence.
+        or r.get("upstream_mismatch")
         or r.get("amp_capsule")
         or r.get("amp_verdict")
     ]
@@ -1963,6 +2668,12 @@ def report_text_lines(report: dict[str, Any], *, color: bool = False) -> list[st
                 f"  (… {hidden_rows} more issue rows — "
                 "sbp git --json for the full set)"
             )
+    lanes = report.get("lanes") or []
+    if lanes:
+        # One line by contract: the plan is for machines, and reprinting it as
+        # a table would bury the rows the operator came to read.
+        kinds = ", ".join(f"{lane['id']} {lane['kind']}" for lane in lanes)
+        lines.append(f"lanes: {len(lanes)} ({kinds}) — use --json for write scopes")
     if report.get("backlog"):
         lines.append(f"backlog: {report['backlog']}")
     return lines

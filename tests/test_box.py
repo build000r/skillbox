@@ -228,6 +228,25 @@ class BoxTests(unittest.TestCase):
         self.assertIn(profile.skillbox_branch, tokens)
         self.assertIn(profile.skillbox_repo, tokens)
 
+    def test_build_deploy_command_converges_dcg_through_the_shared_make_target(
+        self,
+    ) -> None:
+        profile = BOX_MODULE.load_profile("dev-small")
+        command = BOX_MODULE.build_deploy_command(profile)
+
+        # Box deploy is one of the five entrypoints that must call the shared
+        # DCG lifecycle contract. It does so via `make dcg-reconcile` rather
+        # than re-implementing convergence in the deploy shell.
+        self.assertIn("make dcg-reconcile", command)
+
+        # It runs last, against a built and started box, and it is chained with
+        # `&&` so a reconciler failure (or an untrusted Codex hook, exit 3)
+        # fails the deploy instead of leaving a box that looks deployed but is
+        # not actually guarded.
+        stages = [stage.strip() for stage in command.split("&&")]
+        self.assertEqual(stages[-1], "make dcg-reconcile")
+        self.assertLess(stages.index("make up"), stages.index("make dcg-reconcile"))
+
     def test_profiles_lists_available_profiles(self) -> None:
         result = self._run("profiles", "--format", "json")
 
@@ -1630,6 +1649,81 @@ class NetworkPostureContractTests(unittest.TestCase):
             BOX_MODULE.cmd_ssh("test-box")
         self.assertIn("recovery mode", mock_err.getvalue())
         mock_exec.assert_called_once()
+
+
+class TeardownSurfaceParityTests(unittest.TestCase):
+    """Every advertised teardown surface must speak the CLI's confirmation contract.
+
+    `make box-down` is the other surface operators are told to use, so it has to
+    be able to express both preview and identity-bound confirmation. It must do
+    that by forwarding flags to scripts/box.py -- never by deciding anything
+    itself -- so the CLI gate below stays the single authority.
+    """
+
+    def _make(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["make", "-n", "box-down", *args],
+            cwd=str(ROOT_DIR),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def _run_box(self, *args: str) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ)
+        env["SKILLBOX_DO_TOKEN"] = ""
+        return subprocess.run(
+            ["python3", str(BOX_SCRIPT), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+
+    def test_make_box_down_previews_with_dry_run(self) -> None:
+        result = self._make("BOX=alpha", "DRY_RUN=1")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("down alpha --dry-run", result.stdout)
+        self.assertNotIn("--confirm", result.stdout)
+
+    def test_make_box_down_forwards_identity_bound_confirmation(self) -> None:
+        result = self._make("BOX=alpha", "CONFIRM=alpha")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("down alpha --confirm alpha", result.stdout)
+
+    def test_make_box_down_forwards_a_mismatch_instead_of_repairing_it(self) -> None:
+        # The wrapper must not "helpfully" rewrite CONFIRM to match BOX; the
+        # CLI has to see the mismatch so it can refuse.
+        result = self._make("BOX=alpha", "CONFIRM=beta")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("down alpha --confirm beta", result.stdout)
+
+    def test_make_box_down_offers_no_blanket_confirmation_shortcut(self) -> None:
+        # A truthy YES=1 would confirm a teardown without naming the box.
+        for var in ("YES=1", "CONFIRM=1", "FORCE=1"):
+            with self.subTest(var=var):
+                result = self._make("BOX=alpha", var)
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertNotIn("--yes", result.stdout)
+                if var == "CONFIRM=1":
+                    # Forwarded verbatim, and "1" != "alpha", so box.py refuses.
+                    self.assertIn("down alpha --confirm 1", result.stdout)
+
+    def test_bare_teardown_refuses_before_any_destructive_helper(self) -> None:
+        # 'ghost' is not in any inventory. A not_found answer would prove the
+        # gate ran after the teardown path started resolving the box; the gate
+        # must fire first.
+        result = self._run_box("down", "ghost", "--format", "json")
+        self.assertNotEqual(0, result.returncode)
+        payload = json.loads(result.stdout)
+        self.assertEqual("confirmation_required", payload["error_code"])
+
+    def test_mismatched_confirmation_refuses_before_any_destructive_helper(self) -> None:
+        result = self._run_box("down", "ghost", "--confirm", "other", "--format", "json")
+        self.assertNotEqual(0, result.returncode)
+        payload = json.loads(result.stdout)
+        self.assertEqual("confirmation_required", payload["error_code"])
+        self.assertIn("exactly match", payload["error"])
 
 
 if __name__ == "__main__":

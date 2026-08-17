@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+markers = [
+  "db: mark a test as needing postgres (applied by hand)",
+]
+addopts = "-q"

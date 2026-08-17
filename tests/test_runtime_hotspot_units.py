@@ -800,7 +800,8 @@ class RuntimePortVerificationTests(unittest.TestCase):
             model = {
                 "root_dir": str(root),
                 "repos": [],
-                "artifacts": [{"id": "dcg-bin"}],
+                # sync.mode manual is what marks dcg-bin as reconciler-owned.
+                "artifacts": [{"id": "dcg-bin", "sync": {"mode": "manual"}}],
                 "env_files": [],
                 "logs": [{"id": "runtime", "host_path": str(log_dir)}],
             }
@@ -818,15 +819,23 @@ class RuntimePortVerificationTests(unittest.TestCase):
                     return_value=["render-dcg-config: /repo/.dcg.toml (packs: core.git)"],
                 ),
                 mock.patch("runtime_manager.runtime_ops.sync_ingress_artifacts", return_value=[]),
+                mock.patch(
+                    "runtime_manager.runtime_ops.sync_dcg_reconcile",
+                    return_value=["dcg-reconcile: /srv/home (host scope, healthy)"],
+                ),
             ):
                 records = runtime_ops_module.sync_runtime_records(model, dry_run=True)
 
+        # dcg-bin does NOT appear as an artifact record: the generic artifact
+        # syncer would emit its optional-binary "sync mode manual" skip, and the
+        # DCG setup contract forbids an optional skip on the healthy path. It is
+        # converged by the dcg-reconcile lifecycle record instead.
         self.assertEqual(
             [(record["id"], record["kind"]) for record in records],
             [
-                ("dcg-bin", "artifact"),
                 ("runtime", "log"),
                 ("dcg-config", "dcg"),
+                ("dcg-reconcile", "dcg"),
             ],
         )
 

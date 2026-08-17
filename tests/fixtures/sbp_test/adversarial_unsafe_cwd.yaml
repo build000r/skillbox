@@ -1,0 +1,13 @@
+schema_version: 1
+units:
+  escapes:
+    command: ["true"]
+    cwd: ../../etc
+  absolute:
+    command: ["true"]
+    cwd: /etc
+  sneaky:
+    command: ["true"]
+    cwd: tests/../../outside
+groups:
+  default: [escapes]

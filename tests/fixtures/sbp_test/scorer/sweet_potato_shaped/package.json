@@ -1,0 +1,7 @@
+{
+  "name": "sweet-potato-shaped",
+  "private": true,
+  "scripts": {
+    "build": "tsc -b"
+  }
+}

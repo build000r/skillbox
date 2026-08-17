@@ -1,0 +1,9 @@
+# PyYAML would silently keep the LAST `dupe:` block.
+schema_version: 1
+units:
+  dupe:
+    command: [echo, first]
+  dupe:
+    command: [echo, second]
+groups:
+  default: [dupe]

@@ -28,6 +28,8 @@ ENV_MANAGER_DIR = ROOT / ".env-manager"
 if str(ENV_MANAGER_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_MANAGER_DIR))
 
+from tests import helpers  # noqa: E402
+
 from runtime_manager import git_scan_cache  # noqa: E402
 
 SBP = ROOT / "scripts" / "sbp"
@@ -72,9 +74,7 @@ class StateRootCase(unittest.TestCase):
             os.environ,
             {
                 "SKILLBOX_STATE_ROOT": str(self.state_root),
-                "SKILLBOX_RECONCILE_RECEIPTS_DIR": str(self.tmp / "no-receipts"),
-                "SKILLBOX_AMP_CAPSULE_GUARD": str(self.tmp / "no-capsule-guard"),
-                "SKILLBOX_AMP_CAMPAIGN_GUARD": str(self.tmp / "no-campaign-guard"),
+                **helpers.hermetic_join_env(self.tmp),
             },
         )
         patcher.start()

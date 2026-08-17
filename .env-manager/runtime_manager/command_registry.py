@@ -368,6 +368,11 @@ REQUIRED_TIER2_IDS = frozenset(
         "runtime.git_status",
         "runtime.render",
         "runtime.evidence",
+        # Both halves are required: this contract was already landed once as an
+        # import-only module with no surface, and the point of registering it is
+        # that it cannot quietly lose its door again.
+        "runtime.env_inventory_show",
+        "runtime.env_inventory_refresh",
         "runtime.skills",
         "runtime.skill_lint",
         "runtime.skill_resolve",
@@ -480,6 +485,44 @@ def default_registry() -> tuple[CommandSpec, ...]:
             examples=("python3 .env-manager/manage.py capabilities --format json",),
             validations=(_REGISTRY_TEST,),
             graph_nodes=("command", "mcp_tool"),
+        ),
+        CommandSpec(
+            id="runtime.dcg-reconcile",
+            tier=2,
+            surface=("cli", "make"),
+            summary=(
+                "Converge, verify, or relinquish DCG hooks through the one shared "
+                "lifecycle contract."
+            ),
+            inputs={
+                "action": "enum[apply|verify|relinquish]?",
+                "entrypoint": "string?",
+                "scope": "enum[host|container]?",
+                "remove": "boolean?",
+                "purge": "boolean?",
+                "dry_run": "boolean?",
+                "format": _FORMAT_JSON_TEXT,
+            },
+            outputs={
+                "ok": "boolean",
+                "status": "string",
+                "marker": "string",
+                "home": "string",
+                "scope": "string",
+                "entrypoint": "string",
+                "operator_actions": "string[]",
+            },
+            side_effect="local_write",
+            risk="medium",
+            entrypoint="manage.py",
+            owner_binary="sbp",
+            scopes=("client", "profile"),
+            examples=(
+                "python3 .env-manager/manage.py dcg-reconcile --action verify --format json",
+                "python3 .env-manager/manage.py dcg-reconcile --remove --format json",
+            ),
+            validations=(_REGISTRY_TEST,),
+            graph_nodes=("command", "check"),
         ),
         CommandSpec(
             id="brain.next",
@@ -613,6 +656,37 @@ def default_registry() -> tuple[CommandSpec, ...]:
             graph_nodes=("snapshot", "diff", "evidence"),
         ),
         # ---- Tier 2: existing runtime CLI / MCP surfaces ----
+        CommandSpec(
+            id="runtime.contract_lint",
+            tier=2,
+            surface=("cli",),
+            summary=(
+                "Report NEW cross-surface command and destructive-safety drift against "
+                "the accepted baselines."
+            ),
+            inputs={"format": "enum[json|text]?"},
+            outputs={
+                "ok": "boolean",
+                "schema": "string",
+                "counts": "object",
+                "new_gaps": "object[]",
+                "new_policy_findings": "object[]",
+                "resolved_baseline_entries": "object[]",
+                "next_actions": "string[]",
+            },
+            # Reads parsers, the registry, the Makefile and the checked-in
+            # baselines; runs nothing and writes nothing. That is what lets the
+            # same command be the CI gate from a fresh checkout.
+            side_effect="none",
+            risk="low",
+            entrypoint="manage.py",
+            examples=(
+                "python3 .env-manager/manage.py contract-lint --format json",
+                "python3 .env-manager/manage.py contract-lint --format text",
+            ),
+            validations=("python3 -m unittest tests.test_command_contract",),
+            graph_nodes=("command", "check"),
+        ),
         CommandSpec(
             id="runtime.registry_docs",
             tier=2,
@@ -790,7 +864,12 @@ def default_registry() -> tuple[CommandSpec, ...]:
             tier=2,
             surface=("cli", "mcp"),
             summary="Validate the internal repos/skills/logs/check graph for the selected scope.",
-            inputs={"client": "string?", "profile": "string[]?", "format": _FORMAT_JSON_TEXT},
+            inputs={
+                "client": "string?",
+                "profile": "string[]?",
+                "format": _FORMAT_JSON_TEXT,
+                "all": "boolean?",
+            },
             outputs={"ok": "boolean", "checks": "object[]", "next_actions": "string[]"},
             side_effect="none",
             risk="low",
@@ -846,6 +925,74 @@ def default_registry() -> tuple[CommandSpec, ...]:
             examples=("python3 .env-manager/manage.py git-status --cwd \"$PWD\" --format json",),
             validations=("python3 -m unittest tests.test_git_estate",),
             graph_nodes=("repo",),
+        ),
+        CommandSpec(
+            id="runtime.test",
+            tier=2,
+            surface=("cli",),
+            summary=(
+                "Read .skillbox/test.yaml. plan/lint read-only; capsule stores a "
+                "source capsule; run/dispatch gated, unimplemented."
+            ),
+            inputs={
+                "test_verb": "enum[plan|lint|capsule|run|dispatch]?",
+                "group": "string?",
+                "cwd": "string?",
+                "format": _FORMAT_JSON_TEXT,
+            },
+            outputs={
+                "ok": "boolean",
+                "schema_version": "string",
+                "command": "string",
+                "verb": "string",
+                "cwd": "string",
+                "manifest_path": "string",
+                "issues": "string[]",
+                "next_actions": "string[]",
+            },
+            # plan/lint write nothing, but `capsule` admits an archive into the
+            # local content-addressed store. Declaring "none" would be a lie an
+            # agent would act on.
+            side_effect="local_write",
+            risk="low",
+            entrypoint="manage.py",
+            owner_binary="sbp",
+            scopes=("cwd",),
+            examples=(
+                "python3 .env-manager/manage.py test --format json",
+                "python3 .env-manager/manage.py test plan --format json",
+                "python3 .env-manager/manage.py test lint --format json",
+            ),
+            validations=(
+                "python3 -m unittest tests.test_sbp_test_front_door",
+                "python3 -m unittest tests.test_sbp_test_manifest",
+            ),
+            graph_nodes=("command",),
+        ),
+        CommandSpec(
+            id="runtime.oracle_lane",
+            tier=2,
+            surface=("cli",),
+            summary="Report the Oracle lane every native surface routes through, with the identity that proved it.",
+            inputs={"format": _FORMAT_JSON_TEXT, "state-root": "string?"},
+            outputs={
+                "ok": "boolean",
+                "schema_version": "string",
+                "lane": "string",
+                "caller_id": "string",
+                "auth_method": "string",
+                "endpoint": "string?",
+                "scope": "string?",
+                "reason": "string",
+                "identity_path": "string",
+            },
+            side_effect="none",
+            risk="low",
+            entrypoint="manage.py",
+            owner_binary="sbp",
+            examples=("python3 .env-manager/manage.py oracle-lane --format json",),
+            validations=("python3 -m unittest tests.test_oracle_lane_parity",),
+            graph_nodes=("command",),
         ),
         CommandSpec(
             id="runtime.cass_evidence",
@@ -918,6 +1065,58 @@ def default_registry() -> tuple[CommandSpec, ...]:
             examples=("python3 .env-manager/manage.py evidence --cwd \"$PWD\" --format json",),
             validations=("python3 -m unittest tests.test_runtime_evidence",),
             graph_nodes=("evidence", "check", "service", "skill", "mcp_tool"),
+        ),
+        CommandSpec(
+            id="runtime.env_inventory_show",
+            tier=2,
+            surface=("cli",),
+            summary="Read the versioned, sanitized environment-inventory contract (machine, clients, repos).",
+            inputs={
+                "action": "enum[show]",
+                "observe": "boolean?",
+                "no_clients": "boolean?",
+                "cached": "boolean?",
+                "format": _FORMAT_JSON_TEXT,
+            },
+            outputs={
+                "ok": "boolean",
+                "action": "string",
+                "source": "enum[build|cache]",
+                "stale": "boolean",
+                "cache_path": "string?",
+                "reason": "string?",
+                "inventory": "object",
+                "next_actions": "string[]",
+            },
+            side_effect="none",
+            risk="low",
+            entrypoint="manage.py",
+            examples=(
+                "python3 .env-manager/manage.py env-inventory show --format json",
+                "python3 .env-manager/manage.py env-inventory show --cached --format json",
+            ),
+            validations=(
+                "python3 -m unittest tests.test_env_inventory_cli",
+                "python3 -m unittest tests.test_environment_inventory",
+            ),
+            graph_nodes=("client", "repo", "profile", "evidence"),
+        ),
+        CommandSpec(
+            id="runtime.env_inventory_refresh",
+            tier=2,
+            surface=("cli",),
+            summary="Rebuild the environment-inventory cache off the hot path, under the state-root lease.",
+            inputs={"action": "enum[refresh]", "no_observe": "boolean?", "format": _FORMAT_JSON_TEXT},
+            outputs={"ok": "boolean", "action": "string", "cache": "object", "next_actions": "string[]"},
+            side_effect="local_write",
+            risk="low",
+            entrypoint="manage.py",
+            examples=("python3 .env-manager/manage.py env-inventory refresh --format json",),
+            validations=(
+                "python3 -m unittest tests.test_env_inventory_cli",
+                "python3 -m unittest tests.test_state_mutation_inventory",
+            ),
+            graph_nodes=("client", "repo", "artifact"),
         ),
         CommandSpec(
             id="runtime.skills",

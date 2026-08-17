@@ -188,6 +188,10 @@ class Finding:
         return payload
 
 
+#: Payload keys a finding's ``extra`` may never redefine.
+_RESERVED_PAYLOAD_KEYS = frozenset({"code", "status", "message", "details", "fix_command", "fixable"})
+
+
 def finding_from_obj(obj: Any) -> Finding:
     """Adapt any dataclass/mapping with ``status``/``code`` into a :class:`Finding`.
 
@@ -207,6 +211,14 @@ def finding_from_obj(obj: Any) -> Finding:
         fix_command=get("fix_command"),
         fixable=bool(get("fixable", False)),
         fix_reason=str(get("fix_reason", "") or ""),
+        # A check may promote domain fields to the top level of its payload
+        # entry. `status` and `code` are the family's, not the check's, so they
+        # are dropped rather than allowed to shadow the vocabulary.
+        extra={
+            key: value
+            for key, value in (get("extra", None) or {}).items()
+            if key not in _RESERVED_PAYLOAD_KEYS
+        },
     )
 
 

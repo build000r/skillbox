@@ -135,6 +135,64 @@ class ExposureLintTests(unittest.TestCase):
         self.assertTrue(hasattr(runtime_ops, "validate_service_exposure"))
 
 
+class OracleBrokerListenerTests(unittest.TestCase):
+    """The Oracle fleet RPC broker must never describe a public listener.
+
+    The broker carries the one host that holds the Oracle session credential,
+    so its bind gate is a posture invariant, not just a module detail: a
+    refactor that lets 0.0.0.0 through here reopens the box.
+    """
+
+    def _broker(self):
+        from runtime_manager import oracle_broker
+        return oracle_broker
+
+    def test_wildcard_binds_are_refused(self):
+        broker = self._broker()
+        for host in ("0.0.0.0", "::", "::ffff:0.0.0.0"):
+            with self.assertRaises(broker.OracleBrokerError) as caught:
+                broker.validate_bind_endpoint(host, 8443)
+            self.assertEqual("wildcard_listener_forbidden", caught.exception.code, host)
+
+    def test_public_and_lan_binds_are_refused(self):
+        broker = self._broker()
+        for host in ("8.8.8.8", "192.168.1.5", "10.0.0.7", "2001:db8::1"):
+            with self.assertRaises(broker.OracleBrokerError) as caught:
+                broker.validate_bind_endpoint(host, 8443)
+            self.assertEqual("public_listener_forbidden", caught.exception.code, host)
+
+    def test_only_loopback_and_tailnet_are_accepted(self):
+        broker = self._broker()
+        self.assertEqual(
+            "loopback", broker.validate_bind_endpoint("127.0.0.1", 8443).scope
+        )
+        self.assertEqual("loopback", broker.validate_bind_endpoint("::1", 8443).scope)
+        self.assertEqual(
+            "tailnet", broker.validate_bind_endpoint("100.64.0.1", 8443).scope
+        )
+        self.assertEqual(
+            "tailnet", broker.validate_bind_endpoint("fd7a:115c:a1e0::1", 8443).scope
+        )
+
+    def test_tailnet_ranges_match_the_assigned_networks(self):
+        broker = self._broker()
+        self.assertEqual("100.64.0.0/10", str(broker.TAILNET_V4_NETWORK))
+        self.assertEqual("fd7a:115c:a1e0::/48", str(broker.TAILNET_V6_NETWORK))
+
+    def test_admission_refuses_an_unverified_listener(self):
+        broker = self._broker()
+        manager = broker.broker_admission(
+            b"{}",
+            broker.PeerIdentity(caller_id="devbox-1", auth_method="tailscale-whois"),
+            endpoint=("100.64.0.1", 8443),
+            policy_engine=None,
+            replay_guard=None,
+        )
+        with self.assertRaises(broker.OracleBrokerError) as caught:
+            manager.__enter__()
+        self.assertEqual("listener_unverified", caught.exception.code)
+
+
 class ScriptSyntaxTests(unittest.TestCase):
     """Shell scripts and Python modules must parse cleanly."""
 

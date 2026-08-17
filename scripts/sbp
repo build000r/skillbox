@@ -643,6 +643,7 @@ payload = {
         {"name": "robot-docs", "json": True, "safe_first_try": f"{wrapper} robot-docs guide --json"},
         {"name": "robot-triage", "json": True, "safe_first_try": f"{wrapper} --robot-triage"},
         {"name": "status", "json": True, "safe_first_try": f"{wrapper} status --json"},
+        {"name": "test", "json": True, "safe_first_try": f"{wrapper} test --format json", "notes": "Reads .skillbox/test.yaml. plan/lint are read-only; capsule writes a source capsule to the local store; run/dispatch are DCG-gated and not implemented in this slice."},
         {"name": "logs", "json": True, "safe_first_try": f"{wrapper} logs <profile> <service> --json"},
         {"name": "up", "json": True, "safe_first_try": f"{wrapper} up <profile> <service> --dry-run --json"},
         {"name": "down", "json": True, "safe_first_try": f"{wrapper} down <profile> <service> --dry-run --json"},
@@ -922,6 +923,10 @@ case "${1:-}" in
     action="repo-atlas"
     shift
     ;;
+  test)
+    action="test"
+    shift
+    ;;
   git|gs)
     action="git-status"
     shift
@@ -1148,7 +1153,7 @@ append_passthrough_token() {
           ;;
       esac
       ;;
-    help|skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|mcp-sync|structure-doctor|family|git-status|repo-atlas|repo-registry|cass|cass-evidence|wiki|oracle|cron|send-later|safe|conference1|beads|mmdx|operator-booking|swimmers-launch|fleet)
+    help|skills|skill|skill-candidates|overlay|overlay-toggle|recalibrate|mcp-audit|mcp-sync|structure-doctor|family|git-status|repo-atlas|repo-registry|cass|cass-evidence|wiki|oracle|cron|send-later|safe|conference1|beads|mmdx|operator-booking|swimmers-launch|fleet|test)
       passthrough_args+=("${token}")
       ;;
     *)
@@ -1647,6 +1652,12 @@ PY
     ;;
   git-status)
     python3 .env-manager/manage.py git-status --cwd "${invoke_cwd}" "${passthrough_args[@]}"
+    ;;
+  test)
+    # Explicit native verb (skillbox-sbp-test-front-door-1y29). Deliberately NOT
+    # the generic sbp-<cmd> PATH resolver: that lookup seam does not exist, and
+    # an explicit verb keeps command-shadowing/path-trust policy out of slice 1.
+    python3 .env-manager/manage.py test --cwd "${invoke_cwd}" "${passthrough_args[@]}"
     ;;
   cass)
     config_root="${SKILLBOX_CONFIG_ROOT:-${HOME}/repos/skillbox-config}"

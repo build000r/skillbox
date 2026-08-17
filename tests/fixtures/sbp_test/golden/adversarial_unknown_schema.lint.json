@@ -1,0 +1,12 @@
+{
+  "findings": [
+    {
+      "code": "unknown_schema_version",
+      "location": "schema_version",
+      "message": "unsupported schema_version 99; supported: [1]"
+    }
+  ],
+  "groups": {},
+  "manifest_parsed": false,
+  "unit_ids": []
+}

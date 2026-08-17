@@ -536,10 +536,25 @@ class KnownRiskAssertionTests(unittest.TestCase):
             "OBSERVED RUN STATE", SM.boundary("manage.worker-artifacts").dry_run_predicate
         )
 
-    def test_fleet_skill_default_dry_run_is_not_write_free(self) -> None:
+    def test_fleet_skill_default_dry_run_is_write_free(self) -> None:
+        """Was a known risk; fixed by skillbox-nominal-reads-that-write-kxm5.
+
+        Fleet-mode ``--dry-run`` used to stamp the review marker that authorizes
+        its own apply, so previewing silently granted consent. Recording is now
+        gated behind an explicit ``--record-review``. The surface as a whole is
+        still CONDITIONAL_MUTATION -- applying writes override files -- but the
+        preview itself is inert.
+        """
         entry = SM.boundary("manage.skill.default")
         self.assertEqual(entry.classification, SM.CONDITIONAL_MUTATION)
-        self.assertIn("STILL WRITES a review marker", entry.dry_run_predicate)
+        self.assertNotIn("STILL WRITES a review marker", entry.dry_run_predicate)
+        self.assertIn("all now write-free under --dry-run", entry.dry_run_predicate)
+        self.assertIn("--record-review", entry.dry_run_predicate)
+        # The marker is still declared as a write, just an opt-in one.
+        self.assertTrue(
+            any("--record-review only" in item for item in entry.writes),
+            f"marker write must stay declared, got {entry.writes}",
+        )
 
     def test_box_inventory_rebuild_has_no_preview(self) -> None:
         entry = SM.boundary("box.inventory-rebuild")
@@ -575,11 +590,21 @@ class KnownRiskAssertionTests(unittest.TestCase):
             for entry in SM.mutations()
             if "state_mutation_lease" in entry.lock_owner
         ]
-        self.assertEqual(
-            sorted(leased),
-            ["manage.doctor", "manage.structure-doctor", "reconcile.doctor"],
+        doctor_fix_surfaces = [
+            "manage.doctor",
+            "manage.structure-doctor",
+            "reconcile.doctor",
+        ]
+        # Superset, not equality: adoption has spread beyond doctor --fix, so
+        # pinning the whole leased set here would fail for every newly gated
+        # surface. What this test owns is the doctor --fix contract; the
+        # complete adoption picture is owned by
+        # tests/test_state_mutation_integration.py.
+        self.assertTrue(
+            set(doctor_fix_surfaces) <= set(leased),
+            f"a doctor --fix surface lost its lease: {sorted(set(doctor_fix_surfaces) - set(leased))}",
         )
-        for boundary_id in leased:
+        for boundary_id in doctor_fix_surfaces:
             with self.subTest(boundary_id=boundary_id):
                 entry = SM.boundary(boundary_id)
                 self.assertEqual(entry.classification, SM.CONDITIONAL_MUTATION)

@@ -237,7 +237,43 @@ class InstallScriptTests(unittest.TestCase):
                 json.loads(line)["argv"][0]
                 for line in (repo_dir / "manage-invocations.jsonl").read_text(encoding="utf-8").splitlines()
             ]
-            self.assertEqual(invocations, ["first-box", "doctor", "status"])
+            self.assertEqual(
+                invocations, ["first-box", "doctor", "status", "dcg-reconcile"]
+            )
+            # The lifecycle marker reaches the install log; nothing in install.sh
+            # synthesizes it, so its presence proves the contract actually ran.
+            self.assertIn("DCG_HEALTHY", result.stdout)
+            self.assertIn("dcg: ok", result.stdout)
+
+    def _run_verify_with_dcg_exit(self, dcg_exit: str) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            self._write_fake_source(source_dir)
+            return self._run(
+                "--source-dir", str(source_dir),
+                "--repo-dir", str(root / "skillbox"),
+                "--private-path", str(root / "skillbox-config"),
+                "--client", "personal",
+                "--skip-build", "--skip-up", "--verify", "--no-gum",
+                extra_env={"FAKE_DCG_EXIT": dcg_exit},
+            )
+
+    def test_verify_fails_when_the_codex_trust_gate_is_unmet(self) -> None:
+        # A prepared-but-untrusted Codex hook is needs-operator-action (exit 3).
+        # install --verify must NOT report a converged install: the guard is not
+        # actually armed yet.
+        result = self._run_verify_with_dcg_exit("3")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("DCG_NEEDS_OPERATOR_ACTION", result.stdout)
+        self.assertIn("DCG is not converged", result.stderr)
+
+    def test_verify_fails_when_the_reconciler_fails(self) -> None:
+        result = self._run_verify_with_dcg_exit("1")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("DCG is not converged", result.stderr)
 
     def test_skip_first_box_leaves_private_repo_uncreated(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -456,6 +492,7 @@ class InstallScriptTests(unittest.TestCase):
             """from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -495,6 +532,19 @@ if command == "first-box":
 if command in {"doctor", "status"}:
     print(json.dumps({"ok": True, "command": command}))
     raise SystemExit(0)
+
+if command == "dcg-reconcile":
+    # Stands in for the real lifecycle contract. FAKE_DCG_EXIT lets a test
+    # inject a reconciler failure or an unmet Codex-trust gate and assert that
+    # install.sh propagates it instead of reporting a converged install.
+    code = int(os.environ.get("FAKE_DCG_EXIT", "0"))
+    marker = os.environ.get(
+        "FAKE_DCG_MARKER",
+        "DCG_HEALTHY" if code == 0 else "DCG_NEEDS_OPERATOR_ACTION",
+    )
+    print("marker: " + marker)
+    print("status: " + ("healthy" if code == 0 else "needs-operator-action"))
+    raise SystemExit(code)
 
 print(json.dumps({"ok": False, "command": command}), file=sys.stderr)
 raise SystemExit(2)

@@ -164,14 +164,13 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(
                 BOX,
                 "ssh_script",
-                side_effect=[_completed(), _completed(), _completed()],
+                side_effect=[_completed(), _completed(stdout="TAILSCALE_IPV4=100.100.0.1\n"), _completed()],
             ), \
             mock.patch.object(BOX, "scp_file", return_value=_completed()), \
             mock.patch.object(
                 BOX,
                 "ssh_cmd",
                 side_effect=[
-                    _completed(stdout="100.100.0.1\n"),
                     _completed(stdout='{"env_updates":["SKILLBOX_STATE_ROOT"],"mcp_config":"created"}\n'),
                     _completed(stdout="launch ok\n"),
                     _completed(stdout='{"client_id":"alpha","active_profiles":["core","ops"],"created_client":true}\n'),
@@ -197,7 +196,7 @@ class BoxRefactorTests(unittest.TestCase):
         self.assertEqual(payload["tailscale_ip"], "100.100.0.1")
         self.assertEqual(payload["storage"]["mount_path"], "/srv/skillbox")
         self.assertEqual(payload["volume"]["name"], "skillbox-state-alpha")
-        self.assertEqual([step["status"] for step in payload["steps"]], ["ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok"])
+        self.assertEqual([step["status"] for step in payload["steps"]], ["ok"] * 11)
 
     def test_cmd_up_returns_structured_error_when_deploy_fails(self) -> None:
         profile = BOX.BoxProfile(id="dev-small", storage=_storage())
@@ -219,10 +218,14 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(
                 BOX,
                 "ssh_script",
-                side_effect=[_completed(), _completed(), _completed(returncode=1, stderr="deploy failed")],
+                side_effect=[
+                    _completed(),
+                    _completed(stdout="TAILSCALE_IPV4=100.100.0.1\n"),
+                    _completed(returncode=1, stderr="deploy failed"),
+                ],
             ), \
             mock.patch.object(BOX, "scp_file", return_value=_completed()), \
-            mock.patch.object(BOX, "ssh_cmd", side_effect=[_completed(stdout="100.100.0.1\n")]), \
+            mock.patch.object(BOX, "ssh_cmd", side_effect=[]), \
             mock.patch.object(BOX, "save_inventory"), \
             mock.patch.object(BOX, "emit_json", side_effect=payloads.append):
             result = BOX.cmd_up(
@@ -346,13 +349,16 @@ class BoxRefactorTests(unittest.TestCase):
             mock.patch.object(BOX, "do_attach_volume"), \
             mock.patch.object(BOX, "do_get_volume", return_value={"id": "vol-1", "size_gigabytes": 20, "droplet_ids": [42]}), \
             mock.patch.object(BOX, "wait_for_ssh", side_effect=[True, True, True]), \
-            mock.patch.object(BOX, "ssh_script", side_effect=[_completed(), _completed(), _completed()]), \
+            mock.patch.object(
+                BOX,
+                "ssh_script",
+                side_effect=[_completed(), _completed(stdout="TAILSCALE_IPV4=100.100.0.1\n"), _completed()],
+            ), \
             mock.patch.object(BOX, "scp_file", return_value=_completed()), \
             mock.patch.object(
                 BOX,
                 "ssh_cmd",
                 side_effect=[
-                    _completed(stdout="100.100.0.1\n"),
                     _completed(stdout='{"env_updates":["SKILLBOX_STATE_ROOT"],"mcp_config":"created"}\n'),
                     _completed(stdout="launch ok\n"),
                     _completed(returncode=1, stderr="first-box failed"),
@@ -1003,3 +1009,87 @@ class BoxRefactorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StateRootLeaseHelperTests(unittest.TestCase):
+    """The shared primitive both operator surfaces gate on.
+
+    It lives in opslib so box.py and operator_mcp_server.py cannot canonicalize
+    "the state root" two different ways and each believe it is the single
+    writer.
+    """
+
+    def setUp(self) -> None:
+        from lib import opslib
+
+        self.opslib = opslib
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name).resolve()
+        self.addCleanup(setattr, self.opslib, "_ACTIVE_STATE_LEASE", None)
+
+    def test_default_state_root_is_repo_relative(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SKILLBOX_STATE_ROOT", None)
+            self.assertEqual(
+                self.opslib.resolve_state_root(self.repo),
+                (self.repo / ".skillbox-state").resolve(),
+            )
+
+    def test_a_relative_override_is_read_repo_relative_not_cwd_relative(self) -> None:
+        """The lease refuses a relative root rather than guess a base."""
+        with mock.patch.dict(os.environ, {"SKILLBOX_STATE_ROOT": "state/here"}):
+            self.assertEqual(
+                self.opslib.resolve_state_root(self.repo),
+                (self.repo / "state" / "here").resolve(),
+            )
+
+    def test_an_absolute_override_wins(self) -> None:
+        other = self.repo / "elsewhere"
+        with mock.patch.dict(os.environ, {"SKILLBOX_STATE_ROOT": str(other)}):
+            self.assertEqual(self.opslib.resolve_state_root(self.repo), other.resolve())
+
+    def test_a_read_boundary_never_takes_the_write_lease(self) -> None:
+        with mock.patch.dict(os.environ, {"SKILLBOX_STATE_ROOT": str(self.repo / "s")}):
+            with self.assertRaises(Exception) as caught:
+                with self.opslib.state_root_lease("box.list", repo_root=self.repo):
+                    pass
+        self.assertEqual(type(caught.exception).__name__, "StateMutationBoundaryError")
+
+    def test_an_unknown_boundary_is_refused(self) -> None:
+        with mock.patch.dict(os.environ, {"SKILLBOX_STATE_ROOT": str(self.repo / "s")}):
+            with self.assertRaises(Exception) as caught:
+                with self.opslib.state_root_lease("box.not-a-surface", repo_root=self.repo):
+                    pass
+        self.assertEqual(type(caught.exception).__name__, "StateMutationBoundaryError")
+
+    def test_a_nested_owner_reuses_the_held_lease_instead_of_deadlocking(self) -> None:
+        """Without explicit reuse this is either a self-deadlock or a refusal."""
+        with mock.patch.dict(os.environ, {"SKILLBOX_STATE_ROOT": str(self.repo / "s")}):
+            with self.opslib.state_root_lease("box.register", repo_root=self.repo) as outer:
+                self.assertIs(self.opslib.active_state_lease(), outer)
+                with self.opslib.state_root_lease("box.register", repo_root=self.repo) as inner:
+                    self.assertEqual(str(inner.state_root), str(outer.state_root))
+                # the inner exit must NOT have released the outer lease
+                self.assertTrue(outer.held)
+                self.assertIs(self.opslib.active_state_lease(), outer)
+        self.assertIsNone(self.opslib.active_state_lease())
+
+    def test_the_active_lease_is_cleared_even_when_the_body_raises(self) -> None:
+        class Boom(RuntimeError):
+            pass
+
+        with mock.patch.dict(os.environ, {"SKILLBOX_STATE_ROOT": str(self.repo / "s")}):
+            with self.assertRaises(Boom):
+                with self.opslib.state_root_lease("box.register", repo_root=self.repo):
+                    raise Boom()
+        self.assertIsNone(self.opslib.active_state_lease())
+
+    def test_an_unreachable_lease_refuses_rather_than_writing_ungated(self) -> None:
+        with mock.patch.object(
+            self.opslib, "_load_state_mutation_lease",
+            side_effect=self.opslib.StateLeaseUnavailable("no lease"),
+        ):
+            with self.assertRaises(self.opslib.StateLeaseUnavailable):
+                with self.opslib.state_root_lease("box.register", repo_root=self.repo):
+                    pass

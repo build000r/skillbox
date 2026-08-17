@@ -1,0 +1,499 @@
+{
+  "schema": "skillbox.command-contract-gaps.v1",
+  "note": "Checked-in known-gap baseline for the cross-surface command contract. SHRINK-ONLY: the test fails when a gap appears that is not listed here, and passes when a listed gap disappears. Adding an entry IS the review step - it requires a reason and an owner. There are deliberately no destructive_without_confirmation entries: that kind is a real safety defect and must be fixed, never accepted.",
+  "generated_by": "runtime_manager.command_contract.build_report",
+  "gaps": [
+    {
+      "id": "box:capabilities",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "box:compose-down",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "box:compose-up",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "box:exec",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "box:import",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "box:inventory-rebuild",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "box:list",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "box:place",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "box:posture-proof",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "box:profiles",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "box:register",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "box:robot-docs",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "box:robot-triage",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "box:ssh",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "box:unregister",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "box:upgrade",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:acceptance",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:bootstrap",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:client-diff",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:client-init",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:client-open",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:client-project",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:client-publish",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:context",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:distribution-preview",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:distribution-publish",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:distribution-rollback",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:first-box",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:focus",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:forge accept",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:forge init",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:forge propose",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:forge reject",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:forge status",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:mmdx",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:onboard",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:operator-booking",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:overlay",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:parity-report",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:private-init",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:rch-report",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:rch-stage",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:restart",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:robot-docs",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:robot-triage",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:sbh-report",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:session-end",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:session-event",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:session-resume",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:session-start",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:session-status",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:skill activate",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:skill add",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:skill move",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:skill plan",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:skill prune",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:skill remove",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:skill sync",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:skill togglable",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:skill toggleable",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:skill-audit",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:snap actions",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:snap create",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:snap diff",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:snap replay",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:state-backup create",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:state-backup list",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:state-backup verify",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:stewardship-report",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:swimmers-launch",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:worker-artifacts",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:worker-promote-learning",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:worker-status",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "runtime:worker-submit",
+      "kind": "live_command_unregistered",
+      "reason": "command_registry is a curated tier-1 agent surface, not a mirror of every CLI verb. This command is live but has never been promoted to a rich spec. Accepted for now; the ratchet forbids ADDING to this list without review, so the set can only shrink.",
+      "owner": "runtime-cli-owner"
+    },
+    {
+      "id": "registry:clipboard.doctor",
+      "kind": "registry_surface_not_modelled",
+      "reason": "Spec targets a surface this linter does not extract yet (clipboard bundle, outer reconcile, or a Make-only entrypoint). Not drift: the spec is real and correct, the linter simply has no extractor for its surface.",
+      "owner": "command-contract-owner"
+    },
+    {
+      "id": "registry:clipboard.explain",
+      "kind": "registry_surface_not_modelled",
+      "reason": "Spec targets a surface this linter does not extract yet (clipboard bundle, outer reconcile, or a Make-only entrypoint). Not drift: the spec is real and correct, the linter simply has no extractor for its surface.",
+      "owner": "command-contract-owner"
+    },
+    {
+      "id": "registry:clipboard.status",
+      "kind": "registry_surface_not_modelled",
+      "reason": "Spec targets a surface this linter does not extract yet (clipboard bundle, outer reconcile, or a Make-only entrypoint). Not drift: the spec is real and correct, the linter simply has no extractor for its surface.",
+      "owner": "command-contract-owner"
+    },
+    {
+      "id": "registry:make.dev_sanity",
+      "kind": "registry_surface_not_modelled",
+      "reason": "Spec targets a surface this linter does not extract yet (clipboard bundle, outer reconcile, or a Make-only entrypoint). Not drift: the spec is real and correct, the linter simply has no extractor for its surface.",
+      "owner": "command-contract-owner"
+    },
+    {
+      "id": "registry:outer.doctor",
+      "kind": "registry_surface_not_modelled",
+      "reason": "Spec targets a surface this linter does not extract yet (clipboard bundle, outer reconcile, or a Make-only entrypoint). Not drift: the spec is real and correct, the linter simply has no extractor for its surface.",
+      "owner": "command-contract-owner"
+    },
+    {
+      "id": "registry:outer.render",
+      "kind": "registry_surface_not_modelled",
+      "reason": "Spec targets a surface this linter does not extract yet (clipboard bundle, outer reconcile, or a Make-only entrypoint). Not drift: the spec is real and correct, the linter simply has no extractor for its surface.",
+      "owner": "command-contract-owner"
+    },
+    {
+      "id": "registry:brain.snap",
+      "kind": "registry_targets_command_group",
+      "reason": "Spec names an argparse command GROUP rather than a runnable leaf. The group's leaves are live; the spec id sits one level up. Harmless for dispatch, but it means the spec cannot be joined to an exact parser for safety comparison.",
+      "owner": "command-contract-owner"
+    },
+    {
+      "id": "registry:runtime.state_backup",
+      "kind": "registry_targets_command_group",
+      "reason": "Spec names an argparse command GROUP rather than a runnable leaf. The group's leaves are live; the spec id sits one level up. Harmless for dispatch, but it means the spec cannot be joined to an exact parser for safety comparison.",
+      "owner": "command-contract-owner"
+    }
+  ]
+}

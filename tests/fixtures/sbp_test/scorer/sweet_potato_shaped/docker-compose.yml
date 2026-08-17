@@ -1,0 +1,10 @@
+name: sweet-potato-test-deps
+services:
+  postgres:
+    image: pgvector/pgvector@sha256:00000000000000000000000000000000000000000000000000000000000000aa
+    ports:
+      - "0:5432"
+  redis:
+    image: redis@sha256:00000000000000000000000000000000000000000000000000000000000000bb
+    ports:
+      - "0:6379"

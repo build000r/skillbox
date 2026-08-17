@@ -416,5 +416,42 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("command registry validation failed", str(error))
 
 
+class ContractLintSpecTests(unittest.TestCase):
+    """contract-lint must advertise itself as the read-only thing it is.
+
+    An agent picks commands off the registry. A lint that advertised any risk
+    or side effect would be skipped by exactly the callers it exists for.
+    """
+
+    def setUp(self) -> None:
+        self.spec = next(
+            spec for spec in REG.default_registry() if spec.id == "runtime.contract_lint"
+        )
+
+    def test_it_is_declared_read_only(self) -> None:
+        self.assertEqual(self.spec.risk, "low")
+        self.assertEqual(self.spec.side_effect, "none")
+
+    def test_it_is_a_cli_surface_with_no_mcp_tool(self) -> None:
+        """No MCP exposure until usage proves it useful (bead non-goal)."""
+        self.assertEqual(self.spec.surface, ("cli",))
+        self.assertIsNone(self.spec.mcp_tool)
+
+    def test_it_names_the_manage_entrypoint_and_json_example(self) -> None:
+        self.assertEqual(self.spec.entrypoint, "manage.py")
+        self.assertIn(
+            "python3 .env-manager/manage.py contract-lint --format json",
+            self.spec.examples,
+        )
+
+    def test_it_declares_the_payload_keys_it_returns(self) -> None:
+        for key in ("ok", "counts", "new_gaps", "new_policy_findings", "next_actions"):
+            with self.subTest(key=key):
+                self.assertIn(key, self.spec.outputs)
+
+    def test_the_registry_still_validates_with_it(self) -> None:
+        self.assertEqual([], REG.validate_registry(REG.default_registry()))
+
+
 if __name__ == "__main__":
     unittest.main()

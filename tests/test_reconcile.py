@@ -967,5 +967,174 @@ class RuntimeDoctorExitVocabularyTests(unittest.TestCase):
         self.assertEqual(result.details["exit_code"], 1)
 
 
+import os  # noqa: E402
+
+
+class ReferenceDriftSelfPoisoningTests(unittest.TestCase):
+    """`reference-drift` must not fail because it failed before.
+
+    The check searches for a retired script's literal name, and its own FAIL
+    message quotes that name. Anything that records the check's output — a
+    doctor-run receipt, an issue database holding the bug report — therefore
+    contains the literal. Scanning those made the hit count grow monotonically
+    and `make doctor` unable to pass again on any machine that failed it once.
+    """
+
+    # Split so this test file cannot itself trip the check it exercises — the
+    # same convention the older drift test uses.
+    LEGACY = "00" "-skill-sync.sh"
+    FAIL_MESSAGE = f"stale references to {LEGACY} remain in the repo"
+
+    def _patch_roots(self, repo: Path):
+        return mock.patch.multiple(
+            RECONCILE, ROOT_DIR=repo, WORKSPACE_DIR=repo / "workspace"
+        )
+
+    def _repo(self, tmpdir: str) -> Path:
+        repo = Path(tmpdir).resolve()
+        (repo / "docs").mkdir(parents=True)
+        return repo
+
+    def _write(self, repo: Path, relative: str, text: str) -> Path:
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def _drift(self, repo: Path):
+        with self._patch_roots(repo):
+            return RECONCILE.check_reference_drift()
+
+    def test_a_doctor_run_receipt_no_longer_poisons_the_next_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = self._repo(tmpdir)
+            self._write(
+                repo,
+                ".skillbox-state/doctor-runs/2026-08-16/receipt.json",
+                json.dumps({"code": "reference-drift", "message": self.FAIL_MESSAGE}),
+            )
+            drift = self._drift(repo)
+        self.assertEqual("pass", drift.status)
+        self.assertIsNone(drift.details)
+
+    def test_the_issue_database_is_not_a_stale_reference(self) -> None:
+        # `.beads/issues.jsonl` is TRACKED and holds the bug report for this
+        # very defect, so filing it re-poisoned the check. An issue record is
+        # what someone said, not a reference to the script.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = self._repo(tmpdir)
+            self._write(
+                repo,
+                ".beads/issues.jsonl",
+                json.dumps({"id": "x", "description": f"{self.LEGACY} drift"}) + "\n",
+            )
+            self._write(
+                repo, ".beads/.br_history/issues.20260816.jsonl", self.FAIL_MESSAGE
+            )
+            drift = self._drift(repo)
+        self.assertEqual("pass", drift.status)
+
+    def test_a_genuinely_stale_reference_in_a_tracked_file_still_fails(self) -> None:
+        # The acceptance fixture: excluding generated state must not blind the
+        # check to the drift it exists to catch.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = self._repo(tmpdir)
+            self._write(repo, "docs/setup.md", f"run {self.LEGACY} first\n")
+            drift = self._drift(repo)
+        self.assertEqual("fail", drift.status)
+        self.assertEqual(["docs/setup.md:1"], drift.details["hits"])
+
+    def test_generated_state_is_ignored_while_real_drift_is_still_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = self._repo(tmpdir)
+            self._write(repo, "docs/setup.md", f"run {self.LEGACY} first\n")
+            self._write(
+                repo, ".skillbox-state/doctor-runs/receipt.json", self.FAIL_MESSAGE
+            )
+            self._write(repo, ".beads/issues.jsonl", self.FAIL_MESSAGE)
+            self._write(repo, "logs/doctor.log", self.FAIL_MESSAGE)
+            drift = self._drift(repo)
+        self.assertEqual("fail", drift.status)
+        self.assertEqual(["docs/setup.md:1"], drift.details["hits"])
+
+    def test_the_git_directory_is_never_scanned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = self._repo(tmpdir)
+            self._write(repo, ".git/COMMIT_EDITMSG", f"remove {self.LEGACY}\n")
+            drift = self._drift(repo)
+        self.assertEqual("pass", drift.status)
+
+    def test_a_relocated_state_root_inside_the_repo_is_pruned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = self._repo(tmpdir)
+            self._write(repo, "var/state/doctor-runs/receipt.json", self.FAIL_MESSAGE)
+            with mock.patch.dict(
+                os.environ, {"SKILLBOX_STATE_ROOT": str(repo / "var" / "state")}
+            ):
+                drift = self._drift(repo)
+        self.assertEqual("pass", drift.status)
+
+    def test_a_state_root_outside_the_repo_does_not_prune_repo_paths(self) -> None:
+        # A relocated state root must not accidentally widen the exclusion set.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = self._repo(tmpdir)
+            self._write(repo, "docs/setup.md", f"run {self.LEGACY} first\n")
+            with mock.patch.dict(os.environ, {"SKILLBOX_STATE_ROOT": "/var/tmp/elsewhere"}):
+                drift = self._drift(repo)
+        self.assertEqual("fail", drift.status)
+        self.assertEqual(["docs/setup.md:1"], drift.details["hits"])
+
+    def test_the_check_never_removes_a_receipt(self) -> None:
+        # AGENTS.md forbids cleaning ignored directories, and deleting receipts
+        # would only re-poison on the next failure anyway.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = self._repo(tmpdir)
+            receipt = self._write(
+                repo, ".skillbox-state/doctor-runs/receipt.json", self.FAIL_MESSAGE
+            )
+            before = receipt.read_bytes()
+            self._drift(repo)
+            self.assertTrue(receipt.is_file())
+            self.assertEqual(before, receipt.read_bytes())
+
+    def test_an_unreadable_file_does_not_abort_the_walk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = self._repo(tmpdir)
+            self._write(repo, "docs/setup.md", f"run {self.LEGACY} first\n")
+            (repo / "docs" / "binary.bin").write_bytes(b"\xff\xfe\x00\x01")
+            drift = self._drift(repo)
+        self.assertEqual("fail", drift.status)
+        self.assertEqual(["docs/setup.md:1"], drift.details["hits"])
+
+    def test_hits_are_reported_in_a_deterministic_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = self._repo(tmpdir)
+            self._write(repo, "docs/b.md", f"{self.LEGACY}\n")
+            self._write(repo, "docs/a.md", f"{self.LEGACY}\n")
+            self._write(repo, "alpha/z.md", f"{self.LEGACY}\n")
+            first = self._drift(repo).details["hits"]
+            second = self._drift(repo).details["hits"]
+        self.assertEqual(first, second)
+        self.assertEqual(sorted(first), first)
+
+    def test_the_exclusion_lists_separate_generated_state_from_data_stores(self) -> None:
+        # Two reasons, two lists, so the next person extends the right one.
+        self.assertIn(".skillbox-state", RECONCILE.REFERENCE_DRIFT_GENERATED_PREFIXES)
+        self.assertIn(".git", RECONCILE.REFERENCE_DRIFT_GENERATED_PREFIXES)
+        self.assertIn(".beads", RECONCILE.REFERENCE_DRIFT_DATASTORE_PREFIXES)
+        self.assertEqual(
+            set(),
+            set(RECONCILE.REFERENCE_DRIFT_GENERATED_PREFIXES)
+            & set(RECONCILE.REFERENCE_DRIFT_DATASTORE_PREFIXES),
+        )
+
+    def test_the_real_repo_no_longer_self_poisons(self) -> None:
+        # The bead's acceptance, against the actual working tree: this machine
+        # has doctor-run receipts and an issue database that both quote the
+        # literal, and the check must still pass.
+        drift = RECONCILE.check_reference_drift()
+        self.assertEqual("pass", drift.status, (drift.details or {}).get("hits"))
+
+
 if __name__ == "__main__":
     unittest.main()

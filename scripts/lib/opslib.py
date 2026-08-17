@@ -14,11 +14,13 @@ import hashlib
 import random
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 INVENTORY_PATH_INVALID = "INVENTORY_PATH_INVALID"
 INVENTORY_LOCK_TIMEOUT = "INVENTORY_LOCK_TIMEOUT"
@@ -65,6 +67,137 @@ class InventoryLockTimeout(TimeoutError):
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+# ---------------------------------------------------------------------------
+# Single-writer state-root lease
+# ---------------------------------------------------------------------------
+#
+# One canonical root, one writer. `runtime_manager.state_mutation` owns the
+# lock; this module owns the two things every operator surface needs from it and
+# must agree on:
+#
+#   * `resolve_state_root` -- the SAME reading of $SKILLBOX_STATE_ROOT that
+#     box.py, operator_mcp_server.py, and scripts/self-test.sh already use, so
+#     two surfaces mutating "the state root" cannot canonicalize to two
+#     different locks and both believe they are the single writer.
+#   * `state_root_lease` -- acquire once at the final mutation owner. A nested
+#     owner REUSES the held lease explicitly rather than taking a second one;
+#     the lease itself refuses implicit ambient reuse, and this keeps that
+#     refusal from turning into a self-deadlock inside a single command.
+#
+# Reads and true dry-runs never come here. There is no read lock, on purpose.
+
+STATE_ROOT_ENV = "SKILLBOX_STATE_ROOT"
+DEFAULT_STATE_ROOT_REL = ".skillbox-state"
+STATE_LEASE_UNAVAILABLE = "STATE_LEASE_UNAVAILABLE"
+
+#: The lease this process holds, if any. The operator CLIs are single-threaded
+#: by construction; the lease API rejects cross-thread reuse on its own, so this
+#: is a convenience for nesting within one command, never a substitute for the
+#: lease's own ownership proof.
+_ACTIVE_STATE_LEASE: Any = None
+
+
+class StateLeaseUnavailable(RuntimeError):
+    """Raised when the authoritative lease cannot be reached.
+
+    Refusing is the only safe answer: an ungated mutation is never the degrade
+    path, because the whole point of the lease is that a second writer must not
+    be able to proceed while the first one is mid-flight.
+    """
+
+    error_code = STATE_LEASE_UNAVAILABLE
+
+
+def resolve_state_root(repo_root: Path | None = None) -> Path:
+    """``$SKILLBOX_STATE_ROOT`` else ``<repo>/.skillbox-state``, absolute.
+
+    A relative override is read REPO-relative, matching
+    ``scripts/self-test.sh`` and ``resolve_inventory_path``. The lease refuses a
+    relative root rather than guessing a base, so it is resolved here.
+    ``expandvars`` is deliberately not used: it would make the resolved lock
+    path depend on the ambient environment, which is exactly the property that
+    lets two surfaces disagree about which root they are guarding.
+    """
+    root = Path(repo_root) if repo_root is not None else _repo_root()
+    raw = str(os.environ.get(STATE_ROOT_ENV) or "").strip()
+    if not raw:
+        return (root / DEFAULT_STATE_ROOT_REL).resolve()
+    expanded = Path(os.path.expanduser(raw))
+    if not expanded.is_absolute():
+        expanded = root / expanded
+    return expanded.resolve()
+
+
+def _load_state_mutation_lease() -> Callable[..., Any]:
+    """Import the authoritative lease, or refuse.
+
+    Located from THIS module's own repo root, never from the caller's
+    ``repo_root``: that argument selects which state root to guard, which is a
+    different question from where the lease implementation lives. Conflating
+    them made a test that guards a throwaway root unable to find the real
+    module -- and in production would make an unusual cwd look like "the lease
+    is unavailable".
+    """
+    root = _repo_root()
+    env_manager = root / ".env-manager"
+    if str(env_manager) not in sys.path:
+        sys.path.insert(0, str(env_manager))
+    try:
+        from runtime_manager.state_mutation import state_mutation_lease  # noqa: PLC0415
+
+        return state_mutation_lease
+    except Exception as exc:  # noqa: BLE001 -- refusing is the only safe answer
+        raise StateLeaseUnavailable(
+            "the state-root mutation lease is unreachable "
+            f"({type(exc).__name__}: {exc}); refusing to mutate ungated"
+        ) from exc
+
+
+def active_state_lease() -> Any:
+    """The lease held by this process for the current command, or ``None``."""
+    return _ACTIVE_STATE_LEASE
+
+
+@contextmanager
+def state_root_lease(
+    boundary_id: str,
+    *,
+    repo_root: Path | None = None,
+    annotations: Mapping[str, Any] | None = None,
+    **lease_kwargs: Any,
+) -> Iterator[Any]:
+    """Hold the single-writer lease for ``boundary_id`` on the canonical root.
+
+    ``boundary_id`` MUST be classified as a mutation in
+    ``state_mutation.MANIFEST``; the lease rejects a read, which is how a new
+    mutating surface cannot ship without an inventory row.
+
+    Nested owners inside one command reuse the held lease explicitly. That is
+    the whole deadlock story: without it, a command that took the lease and then
+    called a helper that takes it again would either self-deadlock on the flock
+    or be refused outright by the lease's anti-ambient-reuse check.
+    """
+    global _ACTIVE_STATE_LEASE
+    lease_fn = _load_state_mutation_lease()
+    state_root = resolve_state_root(repo_root)
+    state_root.mkdir(parents=True, exist_ok=True)
+    held = _ACTIVE_STATE_LEASE
+    payload = dict(annotations or {})
+    if held is not None:
+        # Subordinate owner: prove ownership by passing the live lease.
+        with lease_fn(
+            state_root, boundary_id, lease=held, annotations=payload, **lease_kwargs
+        ) as nested:
+            yield nested
+        return
+    with lease_fn(state_root, boundary_id, annotations=payload, **lease_kwargs) as fresh:
+        _ACTIVE_STATE_LEASE = fresh
+        try:
+            yield fresh
+        finally:
+            _ACTIVE_STATE_LEASE = None
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -740,6 +873,11 @@ __all__ = [
     "classify_box_exec_command",
     "classify_ssh_failure",
     "command_hash",
+    "STATE_ROOT_ENV",
+    "StateLeaseUnavailable",
+    "active_state_lease",
+    "resolve_state_root",
+    "state_root_lease",
     "dryrun_marker_payload",
     "marker_session_scope",
     "normalize_command",

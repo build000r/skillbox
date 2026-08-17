@@ -1,0 +1,196 @@
+{
+  "kind": "agent-ops-brain-latency-proof",
+  "generated_at_utc": "2026-08-16T20:26:28+00:00",
+  "python": "3.12.13",
+  "fixture": {
+    "nodes": 500,
+    "edges": 498,
+    "service_count": 50,
+    "task_count": 150,
+    "skill_count": 50
+  },
+  "budgets_ms": {
+    "capabilities": 50.0,
+    "graph_critical_path": 150.0,
+    "next_no_adapters": 150.0,
+    "explain_service": 100.0,
+    "search_graph": 100.0,
+    "adapter_collection_stub": 1500.0,
+    "adapter_parallel_fixture": 1000.0,
+    "model_build": 5000.0,
+    "capabilities_cli_import": 6000.0
+  },
+  "component_contract": {
+    "keys": [
+      "adapter_collection_ms",
+      "compute_ms",
+      "elapsed_ms",
+      "end_to_end_ms",
+      "model_ms",
+      "startup_ms",
+      "timing"
+    ],
+    "compute_ms": 1.7,
+    "end_to_end_ms": 8700.0,
+    "model_ms": 250.0,
+    "adapter_collection_ms": 7500.0,
+    "startup_ms": 900.0,
+    "compute_share_pct": 0.0195,
+    "ok": true
+  },
+  "rows": [
+    {
+      "surface": "capabilities",
+      "cycles": 5,
+      "p50_ms": 0.303,
+      "p95_ms": 0.396,
+      "max_ms": 0.396,
+      "payload_elapsed_p95_ms": 0.378,
+      "budget_ms": 50.0,
+      "ok": true
+    },
+    {
+      "surface": "graph_critical_path",
+      "cycles": 5,
+      "p50_ms": 31.22,
+      "p95_ms": 83.99,
+      "max_ms": 83.99,
+      "payload_elapsed_p95_ms": 83.907,
+      "budget_ms": 150.0,
+      "ok": true
+    },
+    {
+      "surface": "next_no_adapters",
+      "cycles": 5,
+      "p50_ms": 11.211,
+      "p95_ms": 35.39,
+      "max_ms": 35.39,
+      "payload_elapsed_p95_ms": 33.844,
+      "budget_ms": 150.0,
+      "ok": true
+    },
+    {
+      "surface": "explain_service",
+      "cycles": 5,
+      "p50_ms": 18.286,
+      "p95_ms": 46.164,
+      "max_ms": 46.164,
+      "payload_elapsed_p95_ms": 45.972,
+      "budget_ms": 100.0,
+      "ok": true
+    },
+    {
+      "surface": "search_graph",
+      "cycles": 5,
+      "p50_ms": 6.667,
+      "p95_ms": 56.409,
+      "max_ms": 56.409,
+      "payload_elapsed_p95_ms": 56.4,
+      "budget_ms": 100.0,
+      "ok": true
+    },
+    {
+      "surface": "adapter_collection_stub",
+      "cycles": 5,
+      "p50_ms": 5.522,
+      "p95_ms": 76.737,
+      "max_ms": 76.737,
+      "payload_elapsed_p95_ms": 0.0,
+      "budget_ms": 1500.0,
+      "ok": true,
+      "detail": {
+        "adapter_count": 5,
+        "statuses": {
+          "br_ready": "ok",
+          "br_open": "ok",
+          "bv_triage": "ok",
+          "sbp_skills": "ok",
+          "pulse": "unavailable"
+        },
+        "timeouts": [],
+        "unavailable": [
+          "pulse"
+        ],
+        "concurrency": {
+          "mode": "parallel",
+          "adapter_count": 5,
+          "max_workers": 4,
+          "requested_max_workers": 4,
+          "max_workers_source": "default",
+          "peak_in_flight": 4,
+          "warnings": [],
+          "parallel_speedup": 1.5
+        },
+        "order": [
+          "br_ready",
+          "br_open",
+          "bv_triage",
+          "sbp_skills",
+          "pulse"
+        ]
+      }
+    },
+    {
+      "surface": "adapter_parallel_fixture",
+      "cycles": 3,
+      "p50_ms": 408.264,
+      "p95_ms": 413.578,
+      "max_ms": 413.578,
+      "payload_elapsed_p95_ms": 0.0,
+      "budget_ms": 1000.0,
+      "ok": true,
+      "detail": {
+        "order": [
+          "fixture-0",
+          "fixture-1",
+          "fixture-2",
+          "fixture-3",
+          "fixture-4",
+          "fixture-5"
+        ],
+        "declared_order_preserved": true,
+        "mode": "parallel",
+        "max_workers": 4,
+        "peak_in_flight": 4,
+        "bounded": true,
+        "serial_equivalent_ms": 1200.0,
+        "observed_wall_ms": 408.241,
+        "speedup_vs_serial": 2.939
+      }
+    },
+    {
+      "surface": "model_build",
+      "cycles": 3,
+      "p50_ms": 24.298,
+      "p95_ms": 34.288,
+      "max_ms": 34.288,
+      "payload_elapsed_p95_ms": 0.0,
+      "budget_ms": 5000.0,
+      "ok": true,
+      "detail": {
+        "services": 11,
+        "repos": 4,
+        "skills": 2
+      }
+    },
+    {
+      "surface": "capabilities_cli_import",
+      "cycles": 1,
+      "p50_ms": 1444.995,
+      "p95_ms": 1444.995,
+      "max_ms": 1444.995,
+      "payload_elapsed_p95_ms": 0.904,
+      "budget_ms": 6000.0,
+      "ok": true,
+      "returncode": 0,
+      "stderr": "",
+      "component_meta_keys": [
+        "compute_ms",
+        "elapsed_ms",
+        "end_to_end_ms",
+        "startup_ms"
+      ]
+    }
+  ],
+  "ok": true
+}

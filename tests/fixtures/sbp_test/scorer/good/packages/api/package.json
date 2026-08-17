@@ -1,0 +1,6 @@
+{
+  "name": "@good/api",
+  "scripts": {
+    "test": "vitest run"
+  }
+}

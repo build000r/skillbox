@@ -10,7 +10,15 @@ set +x
 readonly EXIT_NO_KEY=10
 readonly EXIT_INSTALL_FAIL=20
 readonly EXIT_JOIN_FAIL=30
-readonly DEFAULT_BOX_HEALTH_URL='http://100.100.1.3:8443/healthz'
+# The box's real tailnet address is operator fleet identity and never ships in
+# this repo — the tracked literal below is a documentation placeholder in the
+# fake 100.100.0.0/16 range. Operators point SKILLBOX_BOX_HEALTH_URL at the real
+# value from their private registry (skillbox-config), the same shim pattern as
+# SKILLBOX_CLIPBOARD_HOSTS. Without it, --resume can never confirm health and
+# falls through to a full rejoin, which is the fail-closed direction.
+readonly PLACEHOLDER_BOX_HEALTH_URL='http://100.100.1.3:8443/healthz'
+DEFAULT_BOX_HEALTH_URL="${SKILLBOX_BOX_HEALTH_URL:-$PLACEHOLDER_BOX_HEALTH_URL}"
+readonly DEFAULT_BOX_HEALTH_URL
 readonly NETMON_ADDRESS='10.254.254.254/32'
 readonly DEFAULT_NETMON_DEVICE='eth0'
 
@@ -20,7 +28,10 @@ usage() {
     '' \
     '  --resume               Keep the current join when the box health check passes;' \
     '                         otherwise perform a full rejoin.' \
-    "  --box-health-url URL   Health endpoint (default: ${DEFAULT_BOX_HEALTH_URL})."
+    "  --box-health-url URL   Health endpoint (default: ${DEFAULT_BOX_HEALTH_URL})." \
+    '' \
+    'Set SKILLBOX_BOX_HEALTH_URL to the real box endpoint from the private fleet' \
+    'registry; the built-in default is a placeholder address that never resolves.'
 }
 
 notice() {
@@ -182,6 +193,10 @@ main() {
         ;;
     esac
   done
+
+  if [[ "$resume" == true && "$box_health_url" == "$PLACEHOLDER_BOX_HEALTH_URL" ]]; then
+    notice 'box health URL is still the placeholder; set SKILLBOX_BOX_HEALTH_URL or pass --box-health-url to resume'
+  fi
 
   if [[ "$resume" == true ]] && box_is_healthy "$box_health_url"; then
     notice 'box health check passed; keeping the current tailnet join'

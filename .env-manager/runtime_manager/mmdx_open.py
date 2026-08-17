@@ -29,6 +29,19 @@ MMDX_GENERATED_ROOT_DIRS = {
     "htmlcov",
     "out",
 }
+# The MMDX skill short-circuits its `npm install` when this module is already
+# present (`mmd.py: parser_dependencies_ready`). We check the same path, and we
+# only ever use a positive result to *relax* the --tmux gate below, never to
+# tighten it — so an upstream layout change makes this check fail closed.
+MMDX_PARSER_MODULE_RELATIVE = ("node_modules", "mermaid")
+
+# Skillbox states the detached handoff's lifetime rather than inheriting
+# whatever the skill defaults to. The state-mutation manifest classifies
+# `manage.mmdx` with a lease span of "whole_command + BOUNDED 600s detached tail
+# only with --tmux"; passing this explicitly is what keeps that claim true if
+# the skill's own default ever changes.
+MMDX_HANDOFF_TTL_SECONDS = 600
+
 MMDX_IMPORT_CANDIDATE_NOTE = (
     "Generated/build artifact roots are omitted from MMDX discovery; "
     "import canonical source files such as docs/diagrams/*.mmdx instead."
@@ -426,6 +439,65 @@ def resolve_mmdx_script(root_dir: Path = DEFAULT_ROOT_DIR) -> Path:
     )
 
 
+def mmdx_parser_module_path(script: Path) -> Path:
+    """Where the MMDX skill keeps the parser dependency it may install."""
+
+    return script.parent.joinpath(*MMDX_PARSER_MODULE_RELATIVE)
+
+
+def mmdx_parser_installed(script: Path) -> bool:
+    """True when the skill's `npm install` short-circuit provably fires."""
+
+    return mmdx_parser_module_path(script).exists()
+
+
+def assert_tmux_parser_install_consent(
+    script: Path, *, allow_parser_install: bool
+) -> None:
+    """Refuse `--tmux` when the detached child could install behind the operator.
+
+    `--no-parser-install` is honoured by the foreground command and nowhere
+    else. `--tmux` makes the skill spawn a detached handoff server with
+    ``start_new_session=True``; that argv does not carry `--no-parser-install`,
+    and the server's source-preflight handlers call ``preflight_source_code``
+    without an ``auto_install`` argument, so it defaults to True. The net effect
+    is that an operator who declined a parser install can still get an
+    ``npm install`` — in a grandchild that outlives the command they ran, for
+    the whole life of the handoff channel.
+
+    Neither half of that is fixable from this repo, so this gate refuses the
+    combination instead. The refusal is narrow on purpose: when the parser
+    module is already present the skill's own short-circuit fires before any
+    install, so `--tmux` is allowed. A missing script directory, a moved
+    dependency, or anything else that makes the check unanswerable lands in the
+    refusal branch, because the only thing that may relax this gate is positive
+    evidence that no install can happen.
+    """
+
+    if allow_parser_install:
+        return
+    if mmdx_parser_installed(script):
+        return
+    parser_module = mmdx_parser_module_path(script)
+    raise MmdxOpenError(
+        "mmdx_tmux_parser_install_unconsented",
+        "Refusing --tmux: the MMDX handoff could run `npm install` without your consent.",
+        recoverable=True,
+        recovery_hint=(
+            "--tmux spawns a detached handoff server that does not inherit "
+            "--no-parser-install, so it can install the Mermaid parser after this "
+            "command has already exited. Install the dependency once with "
+            f"`python3 {script} --setup-parser`, or re-run with "
+            "--allow-parser-install to consent explicitly, or drop --tmux."
+        ),
+        next_actions=[
+            f"python3 {script} --setup-parser",
+            "mmdx --tmux --allow-parser-install",
+        ],
+        data={"parser_module": str(parser_module)},
+    )
+
+
 def _open_selected_mmdx(
     selected: dict[str, Any],
     *,
@@ -436,6 +508,10 @@ def _open_selected_mmdx(
     mmd_script: Path | None = None,
 ) -> dict[str, Any]:
     script = mmd_script or resolve_mmdx_script(root_dir)
+    if tmux:
+        assert_tmux_parser_install_consent(
+            script, allow_parser_install=allow_parser_install
+        )
     command = [
         sys.executable,
         str(script),
@@ -444,6 +520,9 @@ def _open_selected_mmdx(
     ]
     if tmux:
         command.append("--tmux")
+        # Bound the detached tail from here rather than inheriting the skill's
+        # default, so the declared lease span stays true if that default moves.
+        command.extend(["--handoff-ttl", str(MMDX_HANDOFF_TTL_SECONDS)])
     if tmux_submit:
         command.append("--tmux-submit")
     if not allow_parser_install:

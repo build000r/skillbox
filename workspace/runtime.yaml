@@ -405,14 +405,22 @@ core:
     - id: dcg-binary
       type: path_exists
       path: ${SKILLBOX_DCG_BIN}
-      required: false
+      # Required, not optional. An agent box whose destructive-command guard is
+      # absent is not a working box, and declaring it optional is how a host
+      # with no protection at all reported "required runtime checks passed".
+      required: true
       profiles:
         - core
       notes: >
-        Destructive command guard should be installed for agent safety. Presence
-        alone is not health: the installed binary must report the pinned v0.6.7
-        (see .env-manager/runtime_manager/dcg_distribution.py provenance_record)
-        and must serve `dcg mcp-server`.
+        Destructive command guard, required for agent safety. Presence alone is
+        NOT health and this declaration does not claim otherwise: it is an
+        inventory assertion that the file exists. Real health is the `dcg` check
+        in .env-manager/runtime_manager/dcg_doctor.py, which validates the
+        installed version against the pinned v0.6.7 and the asset digest (see
+        dcg_distribution.py provenance_record), the rendered policy including
+        fail_closed, the exact Claude/Codex/Grok hook commands, Codex's
+        persisted trust hash, the persistent mount, the `dcg mcp-server`
+        spelling, and the operator adapter's fail-closed protocol.
 
     - id: apr-binary
       type: path_exists

@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "unified_exec",
+  "tool_input": {
+    "input": [
+      "rm -rf /"
+    ]
+  }
+}

@@ -369,6 +369,50 @@ def _run_mcp_parity(ctx: DoctorContext) -> tuple[str, str]:
     return STATUS_PASS, "claude/codex MCP config parity holds (no unexplained drift)"
 
 
+def _run_oracle_browser_sandbox(ctx: DoctorContext) -> tuple[str, str]:
+    """Oracle host Chrome sandbox posture, reported without a false green.
+
+    The cookie-bearing Chrome runs with ``--no-sandbox``. This gate never lets
+    that read as healthy: a waived-and-fully-compensated host is INCO — visible
+    in every run, explicitly not a pass, and non-blocking, because an accepted
+    expiring exception should not train operators to ignore a red gate. Only a
+    genuinely enforced sandbox passes; a missing, malformed, expired, or
+    under-compensated exception FAILs.
+
+    Boxes that are not the Oracle host carry no declaration and are INCO with a
+    detail that says so.
+    """
+    import time as _time
+
+    from .oracle_sandbox import (
+        STATE_ENFORCED,
+        STATE_UNDECLARED,
+        OracleSandboxError,
+        posture_from_declaration,
+    )
+
+    state_root = os.environ.get("SKILLBOX_STATE_ROOT") or str(
+        ctx.runtime_root / ".skillbox-state"
+    )
+    try:
+        posture = posture_from_declaration(
+            state_root, now_ms=int(_time.time() * 1000)
+        )
+    except OracleSandboxError as error:
+        # A declaration that exists but does not validate is a finding on the
+        # host that matters most; it must never degrade to "inconclusive".
+        return (STATUS_FAIL, f"oracle sandbox declaration unusable: {error.code}")
+    if posture.state == STATE_ENFORCED:
+        return (STATUS_PASS, posture.detail())
+    if posture.state == STATE_UNDECLARED:
+        return (STATUS_INCO, posture.detail())
+    if posture.green:  # pragma: no cover - defended by test_oracle_sandbox
+        raise AssertionError("only an enforced sandbox may report green")
+    if posture.state == "waived":
+        return (STATUS_INCO, posture.detail())
+    return (STATUS_FAIL, posture.detail())
+
+
 def _run_skill_drift(ctx: DoctorContext) -> tuple[str, str]:
     """Global + cwd skill-drift summary.
 
@@ -778,6 +822,19 @@ def _gate_specs() -> tuple[_GateSpec, ...]:
             cap_s=CAP_FAST_LINT,
             fix_command="sbp recalibrate  # review skill add/remove for this cwd",
             runner=_run_skill_drift,
+        ),
+        _GateSpec(
+            name="oracle_browser_sandbox",
+            kind=KIND_STRUCTURE,
+            # Reads one small JSON declaration under the state root; it probes
+            # nothing and never touches the browser.
+            cap_s=CAP_FAST_LINT,
+            fix_command=(
+                "restore the Chrome sandbox on the oracle host, or renew the "
+                "expiring waiver + compensating controls in "
+                "<state-root>/oracle/sandbox-posture.json (see docs/oracle-sandbox.md)"
+            ),
+            runner=_run_oracle_browser_sandbox,
         ),
         _GateSpec(
             name="git_hygiene",

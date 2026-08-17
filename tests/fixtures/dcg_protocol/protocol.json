@@ -1,0 +1,33 @@
+{
+  "schema": "dcg-protocol-fixture/v1",
+  "matcher": "Bash",
+  "hook_event": "PreToolUse",
+  "agents": [
+    {
+      "name": "claude",
+      "hook_relpath": ".claude/settings.json",
+      "safe": "claude-safe.json",
+      "destructive": "claude-destructive.json"
+    },
+    {
+      "name": "codex",
+      "hook_relpath": ".codex/hooks.json",
+      "safe": "codex-safe.json",
+      "destructive": "codex-destructive.json"
+    },
+    {
+      "name": "grok",
+      "hook_relpath": ".grok/hooks/dcg.json",
+      "safe": "grok-safe.json",
+      "destructive": "grok-destructive.json"
+    }
+  ],
+  "limitation_probes": [
+    {
+      "name": "codex-unified-exec",
+      "payload": "codex-unified-exec.json",
+      "why": "unified_exec keeps a shell session open; the hook sees the invocation, not each command"
+    }
+  ],
+  "malformed_payload": "malformed.json"
+}

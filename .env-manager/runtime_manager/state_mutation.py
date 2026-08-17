@@ -178,6 +178,14 @@ STATE_ROOT_SOURCES: Mapping[str, str] = {
         "<state_root>/git-scan/last-scan.json (git_scan_cache.py:73 CACHE_REL_PATH, "
         ":101 cache_path)"
     ),
+    "environment_inventory.cache_rel": (
+        "environment_inventory.py:105 INVENTORY_CACHE_REL joined onto the root passed to "
+        "inventory_cache_path (:1318) — REPO-RELATIVE and deliberately blind to "
+        "SKILLBOX_STATE_ROOT, so it is the one resolver here that cannot be moved by the "
+        "env var. cli._env_inventory_cache_root closes that gap from the caller side: it "
+        "compares this path against canonical_runtime_state_root and REFUSES the write when "
+        "they disagree, rather than dropping the file into a root whose lease is not held"
+    ),
     "opslib.inventory": (
         "scripts/lib/opslib.py:235 resolve_inventory_path -> env SKILLBOX_STATE_ROOT else "
         "<repo>/.skillbox-state; the inventory itself is <repo>/workspace/boxes.json unless "
@@ -192,6 +200,15 @@ STATE_ROOT_SOURCES: Mapping[str, str] = {
         "scripts/operator_mcp_server.py:980 operator_secret_dir -> env SKILLBOX_STATE_ROOT "
         "else './.skillbox-state', then 'if not base.is_absolute(): base = REPO_ROOT / base' "
         "(REPO-RELATIVE, despite the './' spelling); also roots the dry-run marker dir"
+    ),
+    "make.state_root": (
+        "Makefile:7 `_STATE_ROOT := $(if $(strip $(SKILLBOX_STATE_ROOT)),"
+        "$(SKILLBOX_STATE_ROOT),./.skillbox-state)` — the recipe runs from the repo "
+        "root, so the './' default is REPO-RELATIVE and agrees with "
+        "selftest.state_root and opslib.inventory. Reached through "
+        "scripts/bootstrap-operator-env.py, which resolves it via "
+        "canonical_runtime_state_root so the Make surface and the CLI surfaces "
+        "cannot canonicalize the same root two different ways"
     ),
     "selftest.state_root": (
         "scripts/self-test.sh:178 ${SKILLBOX_STATE_ROOT:-${REPO_ROOT}/.skillbox-state} "
@@ -209,6 +226,12 @@ STATE_ROOT_SOURCES: Mapping[str, str] = {
         "(doctor_fix.py:104 RUNS_DIRNAME, :283 runs_dir)"
     ),
     "home": "$HOME — ~/.claude, ~/.skillbox-state, user crontab; outside every state root",
+    "sbp_test_capsule.store_root": (
+        "sbp_test_capsule.py:449 store_root -> explicit override, then env "
+        "SKILLBOX_TEST_CAPSULE_STORE, else <repo>/.skillbox-state/test-capsules "
+        "(sbp_test_capsule.py:60 CAPSULE_STORE_RELPATH; REPO-RELATIVE — resolved "
+        "against the repo the capsule is built from, not SKILLBOX_STATE_ROOT)"
+    ),
     "remote": "the state root ON THE REMOTE BOX; not resolvable from the operator host",
     "external": "state owned by a process outside this repo (docker, git target repo, HTTP service)",
 }
@@ -313,6 +336,20 @@ LOCK_OVERRIDES = (
     "policy_eval.update_repo_override_policy (policy_eval.py:1273-1313); PER-FILE ONLY"
 )
 LOCK_SELFTEST = "flock ${SKILLBOX_STATE_ROOT}/self-test/toolchain/.lock (scripts/self-test.sh:186)"
+LOCK_MAKE_BOOTSTRAP_ENV = (
+    "state_mutation_lease(canonical_runtime_state_root, 'make.bootstrap-env') — the "
+    "REAL cross-process state-root lease, taken by "
+    "scripts/bootstrap-operator-env.py for the whole decide-then-seed span. A "
+    "Makefile recipe cannot hold a lease, so the recipe delegates to the script "
+    "rather than writing inline"
+)
+LOCK_ENV_INVENTORY_REFRESH = (
+    "state_mutation_lease(canonical_runtime_state_root, 'manage.env-inventory.refresh') — the "
+    "REAL cross-process state-root lease, taken by "
+    "cli.refresh_environment_inventory_cache around build+write. The WRITER holds it, not its "
+    "callers: the `refresh` verb arrives with the dispatch gate's lease and the post-sync hook "
+    "with sync's, and both are nested reuse of the one held lease rather than a second flock"
+)
 LOCK_DOCTOR_FIX = (
     "state_mutation_lease(state_root, boundary_id) — the REAL cross-process state-root lease "
     "(state_mutation.py:3001), taken by doctor_fix.mutation_gate (scripts/lib/doctor_fix.py:324) "
@@ -326,19 +363,42 @@ MARKER_NOT_A_LOCK = (
 )
 
 # --------------------------------------------------------------------------
-# manage CLI — 98 leaf surfaces
+# manage CLI — 107 leaf surfaces
 # --------------------------------------------------------------------------
 
 _MANAGE_READ = (
     ("capabilities", "cli.py:3512 _handle_capabilities -> command_registry.registry_payload()"),
     ("client-diff", "publish.py:854 diff_client_bundle; candidate bundle built in tempfile.TemporaryDirectory (publish.py:874)"),
     ("client-open", ""),  # placeholder replaced below (mutation) — never emitted
+    (
+        "contract-lint",
+        "cli.py:3923 _handle_contract_lint -> cli.py:3850 contract_lint_payload -> "
+        "command_contract.build_report (command_contract.py:599) + load_baseline "
+        "(:719) + diff_against_baseline (:730) + check_destructive_policy (:898). "
+        "Introspection only: it imports the runtime/box parsers, reads the Makefile "
+        "and tests/goldens/command_contract_gaps.json, and runs no command. It "
+        "REPORTS drift against the checked-in baselines and never rewrites them — "
+        "the baseline is edited by hand, on purpose, so widening the ratchet is a "
+        "reviewable diff rather than a side effect of running the linter. Being "
+        "write-free is also what lets the canonical gate (self-test.sh lane "
+        "\"contract\") and CI run it against an isolated checkout.",
+    ),
     ("distribution-preview", "distribution/preview.py:57 preview_manifest; reads the lockfile only"),
+    (
+        "env-inventory show",
+        "cli.py _handle_env_inventory show branch -> _env_inventory_show_payload -> "
+        "environment_inventory.build_environment_inventory (environment_inventory.py:735) or, "
+        "with --cached, read_inventory_cache (:1336). Both are read-only: the builder has no "
+        "write primitive at all (its only filesystem contact on the observe path is one "
+        "os.lstat per declared repo, environment_inventory.py:441), and the cached path is one "
+        "file read. The WRITE half of this contract is a separate leaf, `env-inventory "
+        "refresh`, so a read cannot become a write by acquiring a flag.",
+    ),
     ("doctor", ""),  # placeholder replaced below (mutation) — never emitted
     ("explain", "cli.py:4406 _handle_explain -> agent_decisions.explain_payload"),
     ("fleet converge", "cli.py:4138 _handle_fleet_converge -> fleet_converge.py:740 build_fleet_converge_plan; zero write primitives in fleet_converge.py"),
     ("forge status", "forge.py:407 forge_status"),
-    ("git-status", "cli.py:546 git_status_parser (read-only estate git status via the sbp git front door; cli.py:3603 'never fetches')"),
+    ("git-status", ""),  # placeholder replaced below (mutation) — never emitted
     ("graph", "cli.py:4355 -> agent_graph_engine.graph_command_payload"),
     ("logs", "cli.py:7158 -> runtime_ops.py:5987 collect_service_logs (tail only)"),
     ("mcp-audit", "cli.py:4107 -> mcp_visibility.py:220 collect_mcp_audit; only os.readlink (mcp_visibility.py:80)"),
@@ -347,6 +407,13 @@ _MANAGE_READ = (
     ("operator-booking config", "operator_booking.py:57; HTTP GET only, no local write"),
     ("operator-booking list", "operator_booking.py:57; HTTP GET only, no local write"),
     ("operator-booking times", "operator_booking.py:57; HTTP GET only, no local write"),
+    (
+        "oracle-lane",
+        "cli.py _handle_oracle_lane -> oracle_broker.resolve_lane; reads the "
+        "service-owned identity file (os.open O_RDONLY|O_NOFOLLOW) and writes "
+        "nothing. provision_local_identity is the only writer and is an "
+        "operator action, never reachable from this verb or a request path.",
+    ),
     ("overlay list", "cli.py:6644 _handle_overlay list branch"),
     ("parity-report", "cli.py:4728 -> parity_report.py:747; no mkdir/write in parity_report.py"),
     ("ports", "cli.py:4012 -> port_registry.port_registry_payload"),
@@ -567,6 +634,30 @@ _MANAGE_BOUNDARIES: tuple[Boundary, ...] = tuple(
         lock_owner=UNOWNED,
         writes=("service pid files (unlinked)", "logs/runtime/runtime.log"),
         evidence=("cli.py:7086 -> runtime_ops.py:5931 stop_services",),
+    ),
+    _b(
+        SURFACE_MANAGE, "env-inventory refresh", UNCONDITIONAL_MUTATION,
+        state_root_source="environment_inventory.cache_rel",
+        dry_run_predicate=(
+            "NONE on the verb — `manage env-inventory refresh` always rebuilds and always "
+            "writes. The dry-run path belongs to the POST-SYNC HOOK, which passes "
+            "dry_run=args.dry_run and returns a 'would refresh' record before the lease is "
+            "taken (cli.refresh_environment_inventory_cache), so `sync --dry-run` stays a "
+            "true dry run"
+        ),
+        nested_call_policy=(
+            "leaf. It is reached two ways — the `refresh` verb under the dispatch gate's lease, "
+            "and the `manage sync` hook under sync's — and in both the writer's own "
+            "runtime_mutation_lease is nested reuse of the already-held lease"
+        ),
+        lease_span="whole_command (build + atomic replace are one span)",
+        lock_owner=LOCK_ENV_INVENTORY_REFRESH,
+        writes=("<repo>/.skillbox-state/inventory/environment_inventory.json",),
+        evidence=(
+            "cli.py _handle_env_inventory refresh branch -> cli.refresh_environment_inventory_cache",
+            "cli._handle_sync appends refresh_environment_inventory_cache(root_dir, dry_run=args.dry_run)",
+            "environment_inventory.py:1323 write_inventory_cache -> tmp write + os.replace (:1332)",
+        ),
     ),
     _b(
         SURFACE_MANAGE, "evidence", CONDITIONAL_MUTATION,
@@ -947,17 +1038,19 @@ _MANAGE_BOUNDARIES: tuple[Boundary, ...] = tuple(
         SURFACE_MANAGE, "skill default", CONDITIONAL_MUTATION,
         state_root_source="cli.skill_default_review",
         dry_run_predicate=(
-            "THREE MODES, and one of them is NOT write-free. --repo: `if dry_run:` cli.py:4960 "
-            "(true dry run). --global: `if dry_run:` cli.py:5605 plus a --yes gate at cli.py:5577. "
-            "--repos/--category: `if dry_run:` cli.py:5206 STILL WRITES a review marker via "
-            "_record_fleet_skill_default_review -> cli.py:5068-5069 "
-            "`marker_path.parent.mkdir(...)` + `atomic_write_text(...)`. Apply then refuses "
-            "without a matching marker (cli.py:5265-5272). Deliberate, but --dry-run is not inert."
+            "THREE MODES, all now write-free under --dry-run. --repo: `if dry_run:` (true dry "
+            "run). --global: `if dry_run:` plus a --yes gate. --repos/--category: `if dry_run:` "
+            "reports review status only; the review marker is written ONLY when the operator "
+            "also passes --record-review (_record_fleet_skill_default_review -> "
+            "`marker_path.parent.mkdir(...)` + `atomic_write_text(...)`). Apply still refuses "
+            "without a matching marker, so consent is unchanged in strength -- it simply can no "
+            "longer be granted as a side effect of previewing "
+            "(skillbox-nominal-reads-that-write-kxm5)."
         ),
         nested_call_policy="reenters_inprocess: policy_eval.update_repo_override_policy per matched repo",
         lease_span="whole_command (fleet mode spans N repos; the marker is the only cross-repo consent record)",
         lock_owner=LOCK_OVERRIDES + "; the review marker itself is " + UNOWNED,
-        writes=("<repo>/.skillbox/skill-overrides.yaml per matched repo", "operator skill-scope.yaml (--global)", "${STATE_ROOT}/skill-default-previews/<sha>.json (--dry-run, fleet mode)"),
+        writes=("<repo>/.skillbox/skill-overrides.yaml per matched repo", "operator skill-scope.yaml (--global)", "${STATE_ROOT}/skill-default-previews/<sha>.json (fleet mode, --record-review only)"),
         evidence=("cli.py:4908 _handle_repo_skill_default", "cli.py:5572 _handle_global_skill_default", "cli.py:5238 _handle_fleet_skill_default", "cli.py:4984 _skill_default_review_dir"),
     ),
     _b(
@@ -1150,7 +1243,16 @@ _MANAGE_BOUNDARIES: tuple[Boundary, ...] = tuple(
         ),
         lock_owner=UNOWNED,
         writes=("managed dirs", "repo clones", "artifacts", "env files", "port contracts", "log dirs", "skill link sets", "dcg config", "ingress artifacts", "CLAUDE.md/AGENTS.md", "logs/runtime/runtime.log"),
-        evidence=("cli.py:3981 _handle_sync -> runtime_ops.py:2349 sync_runtime + context_rendering.py:633 sync_context",),
+        evidence=(
+            "cli.py:3981 _handle_sync -> runtime_ops.py:2349 sync_runtime + context_rendering.py:633 sync_context",
+            "cli._handle_sync tail: refresh_environment_inventory_cache(root_dir, dry_run=args.dry_run)",
+        ),
+        # The environment-inventory cache is NOT listed in `writes` on purpose:
+        # sync triggers the refresh but does not own it. The write, its path and
+        # its lease all belong to manage.env-inventory.refresh, which takes the
+        # lease itself — so there is exactly one row to read when asking who may
+        # write that file, however many callers hook it.
+        delegates_to=("manage.env-inventory.refresh",),
     ),
     _b(
         SURFACE_MANAGE, "up", TRUE_DRY_RUN,
@@ -1205,6 +1307,65 @@ _MANAGE_BOUNDARIES: tuple[Boundary, ...] = tuple(
         lock_owner=UNOWNED,
         writes=("<state_root>/worker/runs/<id>/run.json", ".../events.jsonl", ".../stdout|stderr logs", "logs/runtime/runtime.log"),
         evidence=("cli.py:3111 -> _shared/worker.py:844 create_worker_run", "worker.py:951 write_json_file", "worker.py:793-796 append handles + Popen", "worker.py:547 atomic_write_text"),
+    ),
+    _b(
+        SURFACE_MANAGE, "test", CONDITIONAL_MUTATION,
+        state_root_source="sbp_test_capsule.store_root",
+        dry_run_predicate=(
+            "the write is VERB-gated, not flagged: bare `test`/`test plan`/`test lint` "
+            "write nothing (cli.py _handle_test; sbp_test.py READ_ONLY_VERBS). NOTE "
+            "(skillbox-sbp-test-plan-compiler-er74): `test plan` DOES now shell out to "
+            "git to source-bind the compiled plan, but writes nothing durable — the "
+            "index is a temp GIT_INDEX_FILE, the archive is built in a TemporaryDirectory, "
+            "and object writes are redirected via GIT_OBJECT_DIRECTORY to a scratch dir "
+            "with the real odb as an alternate. Without that redirect `git write-tree` "
+            "would land loose objects in the caller's .git/objects whenever the tree had "
+            "uncommitted work (sbp_test_capsule.build_source_tree_oid ephemeral_objects); "
+            "`test capsule` always admits on success — there is no --dry-run "
+            "(sbp_test.py:202 capsule_payload -> build_capsule(admit_to_store=True)); "
+            "`test run`/`test dispatch` are typed not_implemented refusals that write "
+            "nothing (sbp_test.py:227 deferred_payload)"
+        ),
+        nested_call_policy=(
+            "leaf (in-process; builds the archive itself, executes nothing, sends "
+            "nothing — sbp_test.py:210)"
+        ),
+        lease_span="single_write (one atomic admission per invocation; duplicate admission is idempotent, sbp_test_capsule.py:524)",
+        lock_owner=UNOWNED,
+        writes=(
+            "<repo>/.skillbox-state/test-capsules/ content-addressed archives + tmp/ staging "
+            "(sbp_test_capsule.py:60 CAPSULE_STORE_RELPATH, :458 ensure_store, :503 admit)",
+        ),
+        evidence=(
+            "cli.py:3953 _handle_test — capsule branch is the only path into WRITE_VERBS",
+            "sbp_test.py:46 WRITE_VERBS = ('capsule',)",
+            "sbp_test_capsule.py:503 atomic admit with quota gate (capsule_store_quota_exceeded)",
+        ),
+    ),
+    _b(
+        SURFACE_MANAGE, "dcg-reconcile", TRUE_DRY_RUN,
+        state_root_source="home",
+        dry_run_predicate=(
+            "`mutating = action == \"apply\" and not dry_run` (dcg_reconcile.py:1350); "
+            "per-write `if not dry_run:` (dcg_reconcile.py:1668); verify never mutates "
+            "(dcg_reconcile.py:1284 stamps dry_run=True for action == 'verify')"
+        ),
+        nested_call_policy=(
+            "reenters_inprocess: dcg_lifecycle.converge -> dcg_reconcile.apply/verify/"
+            "relinquish; --remove is spelled as action relinquish (cli.py:4633)"
+        ),
+        lease_span="whole_command",
+        lock_owner=UNOWNED,
+        writes=(
+            "the model-resolved managed home's DCG surface: agent hook files and "
+            "marker-stamped policy under <home> (.claude/.codex), plus the pinned "
+            "dcg binary link",
+        ),
+        evidence=(
+            "cli.py:4620 _handle_dcg_reconcile — the one agent-facing door to the DCG lifecycle",
+            "cli.py:4651 dcg_lifecycle.converge(..., dry_run=args.dry_run)",
+            "dcg_lifecycle.py:222 converge — apply/verify/relinquish dispatch",
+        ),
     ),
 )
 
@@ -1662,7 +1823,6 @@ def _make_read_delegate(target: str, delegate: str) -> Boundary:
 
 _MAKE_BOUNDARIES: tuple[Boundary, ...] = (
     _read(SURFACE_MAKE, "help", "Makefile:44 help — printf block only"),
-    _make_read_delegate("git-estate-e2e", "manage.git-status"),
     _read(
         SURFACE_MAKE, "render",
         "Makefile render -> `python3 scripts/04-reconcile.py render` (outer reconcile, read-only)",
@@ -1730,13 +1890,28 @@ _MAKE_BOUNDARIES: tuple[Boundary, ...] = (
     ),
     _b(
         SURFACE_MAKE, "bootstrap-env", CONDITIONAL_MUTATION,
-        state_root_source="runtime_model.root_dir",
-        dry_run_predicate="`@test -f $(_STATE_ROOT)/operator/.env || test -f ./.env || cp .env.example $(_STATE_ROOT)/operator/.env` — seeds only when both files are absent; the mkdir is unconditional",
-        nested_call_policy="reenters_make: install-hooks (prerequisite)",
+        state_root_source="make.state_root",
+        dry_run_predicate=(
+            "seeds only when BOTH <state_root>/operator/.env and the repo-root .env "
+            "are absent (bootstrap-operator-env.py:bootstrap_operator_env); the mkdir "
+            "is unconditional and idempotent. The decision and the copy are one span "
+            "inside the lease, so two processes cannot both observe 'absent' and both "
+            "seed"
+        ),
+        nested_call_policy=(
+            "delegates_inprocess: scripts/bootstrap-operator-env.py is the final "
+            "mutation owner and takes the lease itself; the recipe also reenters_make "
+            "install-hooks as a PREREQUISITE, which writes git config, not state"
+        ),
         lease_span="single_write",
-        lock_owner=UNOWNED,
-        writes=("$(_STATE_ROOT)/operator/", "$(_STATE_ROOT)/operator/.env"),
-        evidence=("Makefile:95 `bootstrap-env: install-hooks`", "Makefile bootstrap-env recipe `@mkdir -p $(_STATE_ROOT)/operator`"),
+        lock_owner=LOCK_MAKE_BOOTSTRAP_ENV,
+        writes=("<state_root>/operator/", "<state_root>/operator/.env (0600)"),
+        evidence=(
+            "Makefile:96 `bootstrap-env: install-hooks`",
+            "Makefile:100 `@python3 scripts/bootstrap-operator-env.py`",
+            "scripts/bootstrap-operator-env.py:bootstrap_operator_env -> "
+            "state_mutation.runtime_mutation_lease('make.bootstrap-env')",
+        ),
         delegates_to=(),
     ),
     _b(
@@ -1936,6 +2111,63 @@ _MAKE_BOUNDARIES: tuple[Boundary, ...] = (
     ),
     _make_delegate("box-register", "box.register", UNCONDITIONAL_MUTATION),
     _make_delegate("box-unregister", "box.unregister", UNCONDITIONAL_MUTATION),
+    _b(
+        SURFACE_MAKE, "dcg-reconcile", TRUE_DRY_RUN,
+        state_root_source="home",
+        dry_run_predicate=(
+            "DCG_ARGS='--dry-run' is write-free: `mutating = action == \"apply\" and "
+            "not dry_run` (dcg_reconcile.py:1350); per-write `if not dry_run:` "
+            "(dcg_reconcile.py:1668). Without DCG_ARGS the apply converges only "
+            "drifted entries and is idempotent"
+        ),
+        nested_call_policy=(
+            "reenters_subprocess: python3 -m runtime_manager.dcg_lifecycle apply "
+            "--entrypoint box-deploy --scope host --from-model . — NOT via manage.py, "
+            "so detect_wrapper_bypass cannot derive it; this row is the declaration"
+        ),
+        lease_span="whole_command",
+        lock_owner=UNOWNED,
+        writes=(
+            "the model-resolved managed home's DCG surface: agent hook files and "
+            "marker-stamped policy under <home> (.claude/.codex), plus the pinned "
+            "dcg binary link",
+        ),
+        evidence=(
+            "Makefile:177 dcg-reconcile -> `python3 -m runtime_manager.dcg_lifecycle apply ... $(DCG_ARGS)`",
+            "dcg_lifecycle.py:430 main — argparse CLI with --dry-run",
+        ),
+    ),
+    _read(
+        SURFACE_MAKE, "dcg-verify",
+        "Makefile:181 dcg-verify -> `python3 -m runtime_manager.dcg_lifecycle verify ...`; "
+        "verify never mutates (dcg_lifecycle.py:262 -> dcg_reconcile.verify; "
+        "dcg_reconcile.py:1284 stamps dry_run=True for action == 'verify')",
+    ),
+    _b(
+        SURFACE_MAKE, "dcg-relinquish", TRUE_DRY_RUN,
+        state_root_source="home",
+        dry_run_predicate=(
+            "DCG_ARGS='--dry-run' is write-free (dcg_reconcile.py:1668 `if not "
+            "dry_run:` on the removal path); without it the relinquish removes ONLY "
+            "DCG-owned hook entries and marker-stamped policy and is idempotent — a "
+            "second run is 'unchanged', not an error (dcg_lifecycle.py:296)"
+        ),
+        nested_call_policy=(
+            "reenters_subprocess: python3 -m runtime_manager.dcg_lifecycle relinquish "
+            "--entrypoint box-deploy --scope host --from-model . — NOT via manage.py, "
+            "so detect_wrapper_bypass cannot derive it; this row is the declaration"
+        ),
+        lease_span="whole_command",
+        lock_owner=UNOWNED,
+        writes=(
+            "removal of DCG-owned hook entries and marker-stamped policy under the "
+            "model-resolved managed home (.claude/.codex); --purge widens the removal",
+        ),
+        evidence=(
+            "Makefile:187 dcg-relinquish -> `python3 -m runtime_manager.dcg_lifecycle relinquish ... $(DCG_ARGS)`",
+            "Makefile:185-186 comment — removes ONLY DCG-owned entries; safe to run twice",
+        ),
+    ),
 )
 
 # --------------------------------------------------------------------------
@@ -2343,6 +2575,48 @@ def render_manifest_text() -> str:
     for entry in MANIFEST:
         lines.append(f"{entry.boundary_id}\t{entry.classification}\t{entry.lock_owner}")
     return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------
+# Canonical runtime state-root resolution (NOT part of the lease)
+# --------------------------------------------------------------------------
+#
+# STATE_ROOT_SOURCES above records the hazard this resolves: five expressions
+# read the same SKILLBOX_STATE_ROOT with three different fallbacks
+# (cwd-relative, repo-relative, model-driven), and the note there says a
+# single-writer lease has to pick ONE as canonical. This is that pick.
+#
+# The canonical reading is REPO-RELATIVE, because that is what
+# scripts/self-test.sh and scripts/lib/opslib.resolve_state_root already use --
+# so the box/operator half (gated separately) and the runtime/pulse half land on
+# the same lock file for the same operator-visible state root. Two halves
+# canonicalizing differently would each hold a lock and each believe it was the
+# single writer, which is the exact failure the lease exists to remove.
+#
+# This resolver reads the environment BY DESIGN; it therefore lives above the
+# lease banner, whose region is pinned env-free by test.
+
+RUNTIME_STATE_ROOT_ENV = "SKILLBOX_STATE_ROOT"
+RUNTIME_DEFAULT_STATE_ROOT_REL = ".skillbox-state"
+
+
+def canonical_runtime_state_root(root_dir: Path | str) -> Path:
+    """``$SKILLBOX_STATE_ROOT`` else ``<root_dir>/.skillbox-state``, absolute.
+
+    A relative override is anchored to ``root_dir`` (the repo), never to the
+    process cwd. ``expandvars`` is deliberately not used: it would make the
+    resolved lock path depend on ambient environment, which is precisely how two
+    processes end up guarding what they each believe is "the state root" with
+    two different locks.
+    """
+    base = Path(root_dir)
+    raw = str(os.environ.get(RUNTIME_STATE_ROOT_ENV) or "").strip()
+    if not raw:
+        return (base / RUNTIME_DEFAULT_STATE_ROOT_REL).resolve()
+    expanded = Path(os.path.expanduser(raw))
+    if not expanded.is_absolute():
+        expanded = base / expanded
+    return expanded.resolve()
 
 
 # ==========================================================================
@@ -3364,6 +3638,100 @@ def state_mutation_lease(
                     del _LEASE_REGISTRY[key]
 
 
+# --------------------------------------------------------------------------
+# Runtime-side gate
+# --------------------------------------------------------------------------
+#
+# Root resolution for this gate is canonical_runtime_state_root, defined above
+# the lease banner because it reads the environment by design.
+
+#: The lease this process holds for the runtime surfaces, if any. The runtime
+#: CLI is single-threaded per invocation and pulse's mutation windows are
+#: serial; the lease itself still refuses cross-thread reuse, so this only ever
+#: shortcuts nesting WITHIN one owner and never substitutes for that refusal.
+_ACTIVE_RUNTIME_LEASE: Any = None
+
+
+def active_runtime_lease() -> Any:
+    """The runtime lease held by this process, or ``None``."""
+    return _ACTIVE_RUNTIME_LEASE
+
+
+@contextlib.contextmanager
+def runtime_mutation_lease(
+    boundary_id: str,
+    *,
+    root_dir: Path | str,
+    annotations: Mapping[str, Any] | None = None,
+    **lease_kwargs: Any,
+) -> Iterator[Any]:
+    """Hold the single-writer lease for a runtime/pulse boundary.
+
+    ``boundary_id`` MUST be a mutation in :data:`MANIFEST`; the lease refuses a
+    read, which is how a surface cannot be gated without also being classified.
+
+    A nested owner REUSES the held lease explicitly rather than taking a second
+    one. That is the whole nested-work story from the design: ``focus`` calling
+    ``sync`` inside one dispatch would otherwise either self-deadlock on the
+    flock or be refused outright by the lease's anti-ambient-reuse check.
+    """
+    global _ACTIVE_RUNTIME_LEASE
+    state_root = canonical_runtime_state_root(root_dir)
+    state_root.mkdir(parents=True, exist_ok=True)
+    held = _ACTIVE_RUNTIME_LEASE
+    payload = dict(annotations or {})
+    if held is not None:
+        with state_mutation_lease(
+            state_root, boundary_id, lease=held, annotations=payload, **lease_kwargs
+        ) as nested:
+            yield nested
+        return
+    with state_mutation_lease(
+        state_root, boundary_id, annotations=payload, **lease_kwargs
+    ) as fresh:
+        _ACTIVE_RUNTIME_LEASE = fresh
+        try:
+            yield fresh
+        finally:
+            _ACTIVE_RUNTIME_LEASE = None
+
+
+def manage_boundary_for(args: Any) -> str | None:
+    """The manifest boundary a parsed ``manage`` invocation owns, or ``None``.
+
+    Dispatch consults the canonical manifest rather than a second hand-kept
+    table: the key is derived exactly the way :func:`enumerate_manage_surfaces`
+    derives it from the parser (``"<command>"`` or ``"<command> <subaction>"``),
+    so a surface that is classified is a surface that is gated, and there is no
+    way to add one without the coverage ratchet noticing.
+
+    Returns ``None`` for reads and for a ``true_dry_run`` boundary invoked with
+    ``--dry-run`` -- a preview that queued behind a writer would not be the
+    lock-free read the contract promises.
+    """
+    command = str(getattr(args, "command", "") or "").strip()
+    if not command:
+        return None
+    leaf = ""
+    for attr in (f"{command.replace('-', '_')}_action", "action"):
+        value = getattr(args, attr, None)
+        if isinstance(value, str) and value.strip():
+            leaf = value.strip()
+            break
+    key = f"{command} {leaf}".strip()
+    boundary_id = f"{SURFACE_MANAGE}.{key.replace(' ', '.')}"
+    try:
+        entry = boundary(boundary_id)
+    except KeyError:
+        return None
+    if not entry.is_mutation:
+        return None
+    if entry.classification == TRUE_DRY_RUN and bool(getattr(args, "dry_run", False)):
+        return None
+    return boundary_id
+
+
+
 __all__ = [
     "MANIFEST",
     "MANIFEST_SCHEMA_VERSION",
@@ -3413,10 +3781,14 @@ __all__ = [
     "StateMutationLeaseUnsupported",
     "StateMutationRootAmbiguous",
     "StateMutationRootInvalid",
+    "active_runtime_lease",
+    "canonical_runtime_state_root",
     "canonical_state_root",
     "describe_lease_holder",
     "held_lease_roots",
     "lease_lock_path",
+    "manage_boundary_for",
     "read_lease_metadata",
+    "runtime_mutation_lease",
     "state_mutation_lease",
 ]

@@ -178,3 +178,69 @@ def make_fake_binary(directory: str | os.PathLike[str], name: str, script: str) 
     target.write_text(body, encoding="utf-8")
     target.chmod(0o755)
     return target
+
+
+# ---------------------------------------------------------------------------
+# Hermetic external-state joins (bead skillbox-era-program-v6ac.7.1)
+#
+# `sbp git` grew joins that read state OUTSIDE the repo under test: the
+# reconcile receipts store, the two amp guard scripts, the fleet_convergence
+# script. Each is env-overridable, and each defaults to a real path on the
+# operator's machine. A fixture that forgets one silently scans the host: on
+# 2026-08-15 a real receipts store leaked into fixture envelopes the same day
+# the receipts join shipped, and the goldens started failing on one machine and
+# passing on another.
+#
+# The fix is not "remember to pin them" — it is one registry, used by every
+# suite, plus a byte-identity regression that fails when the registry falls
+# behind the code (tests/test_git_estate_hermetic.py).
+#
+# ADDING A JOIN? Add its env var here. That is the whole contract: the
+# regression test reads this list, so an unregistered join fails it.
+# ---------------------------------------------------------------------------
+
+#: Every env var that redirects an external-state join away from the host.
+#: Values are pointed at paths under the test's tmp dir that are never created,
+#: because "absent" is the state the default envelope is pinned against.
+HERMETIC_JOIN_ENVS: tuple[str, ...] = (
+    # reconcile receipts store -> `last_reconcile` fields
+    "SKILLBOX_RECONCILE_RECEIPTS_DIR",
+    # amp capsule guard script -> capsule verdict fields/markers
+    "SKILLBOX_AMP_CAPSULE_GUARD",
+    # amp campaign guard script -> campaign verdict fields/markers
+    "SKILLBOX_AMP_CAMPAIGN_GUARD",
+    # fleet_convergence.py -> --live origin state
+    "SKILLBOX_FLEET_CONVERGENCE",
+)
+
+#: Budget overrides for those joins. Not hermeticity-critical on their own (an
+#: absent join never spends its budget), but pinned so a slow host cannot make
+#: a fixture flaky through a join it was not even testing.
+HERMETIC_JOIN_BUDGET_ENVS: tuple[str, ...] = (
+    "SKILLBOX_FLEET_CONVERGENCE_TIMEOUT_S",
+    "SKILLBOX_AMP_GUARD_TIMEOUT_S",
+)
+
+
+def hermetic_join_env(tmp: str | os.PathLike[str], **overrides: str) -> dict[str, str]:
+    """Env pinning every external-state join at a nonexistent path under ``tmp``.
+
+    Pass ``overrides`` to point one join at a real fixture while the rest stay
+    absent — that is how the join-specific suites test a present store without
+    reopening the others to the host.
+
+    The paths are deliberately *not* created. Absent is the state the default
+    envelope is pinned against, and a directory that exists but is empty is a
+    different code path in at least the receipts join.
+    """
+    base = Path(tmp)
+    env = {name: str(base / f"no-{name.lower()}") for name in HERMETIC_JOIN_ENVS}
+    env.update({name: "0.5" for name in HERMETIC_JOIN_BUDGET_ENVS})
+    unknown = set(overrides) - set(HERMETIC_JOIN_ENVS) - set(HERMETIC_JOIN_BUDGET_ENVS)
+    if unknown:
+        raise AssertionError(
+            f"unregistered join env(s) {sorted(unknown)}; add them to "
+            "HERMETIC_JOIN_ENVS in tests/helpers.py"
+        )
+    env.update(overrides)
+    return env

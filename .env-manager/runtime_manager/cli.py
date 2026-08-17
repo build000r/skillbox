@@ -17,6 +17,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from . import runtime_ops
+from . import sbp_test
+from . import state_mutation
 from . import validation as VALIDATION
 from .errors import (
     OVERRIDE_REFUSED_FLOOR,
@@ -544,6 +546,58 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Write docs/API_REFERENCE.md instead of only printing the generated reference.",
     )
 
+    contract_lint_parser = subparsers.add_parser(
+        "contract-lint",
+        help="Report NEW cross-surface command/safety drift against the accepted baselines.",
+    )
+    contract_lint_parser.add_argument("--format", choices=("json", "text"), default="json")
+
+    env_inventory_parser = subparsers.add_parser(
+        "env-inventory",
+        help="Read the versioned, sanitized environment-inventory contract (machine/clients/repos).",
+    )
+    # Real nested subparsers, not a positional with choices. Both enumerators
+    # that matter walk subparsers: state_mutation.enumerate_manage_surfaces
+    # derives the two MANIFEST leaves (`show` is a read, `refresh` writes the
+    # cache), and command_contract._walk_parser derives the two live command
+    # names the registry specs resolve against. A positional `action` satisfies
+    # only the first, which is how a registered write ends up looking like a
+    # spec with no command behind it.
+    env_inventory_actions = env_inventory_parser.add_subparsers(dest="action")
+    env_inventory_show = env_inventory_actions.add_parser(
+        "show", help="Build (or read from cache) and print the contract."
+    )
+    env_inventory_show.add_argument("--format", choices=("text", "json"), default="text")
+    env_inventory_show.add_argument(
+        "--observe",
+        action="store_true",
+        help="Probe each declared repo (one lstat each); default is declared-only.",
+    )
+    env_inventory_show.add_argument("--no-observe", action="store_true", help=argparse.SUPPRESS)
+    env_inventory_show.add_argument(
+        "--no-clients",
+        action="store_true",
+        help="Skip clients/*/overlay.yaml; emit machine and registry intent only.",
+    )
+    env_inventory_show.add_argument(
+        "--cached",
+        action="store_true",
+        help="Read the cache (the hot path) instead of rebuilding, and report staleness.",
+    )
+    env_inventory_refresh = env_inventory_actions.add_parser(
+        "refresh", help="Rebuild the off-hot-path cache under the state-root lease."
+    )
+    env_inventory_refresh.add_argument("--format", choices=("text", "json"), default="text")
+    env_inventory_refresh.add_argument(
+        "--no-observe",
+        action="store_true",
+        help="Cache declared intent only; refresh observes repo presence by default.",
+    )
+    # No subcommand is `show` with defaults. The flags are deliberately NOT
+    # mirrored onto the parent: a subparser resets its own defaults, so a parent
+    # `--format json` placed before the subcommand would be silently overwritten
+    # back to text.
+
     robot_docs_parser = subparsers.add_parser(
         "robot-docs",
         help="Print agent-oriented in-tool documentation.",
@@ -572,11 +626,52 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_client_arg(sync_parser)
     _add_context_dir_arg(sync_parser)
 
+    dcg_parser = subparsers.add_parser(
+        "dcg-reconcile",
+        help="Converge, verify, or relinquish DCG hooks through the shared lifecycle contract.",
+    )
+    dcg_parser.add_argument(
+        "--action", choices=("apply", "verify", "relinquish"), default="apply"
+    )
+    dcg_parser.add_argument(
+        "--entrypoint",
+        default="runtime-sync",
+        help="lifecycle entrypoint label recorded on the receipt",
+    )
+    dcg_parser.add_argument("--scope", choices=("host", "container"), default="host")
+    dcg_parser.add_argument(
+        "--remove",
+        action="store_true",
+        help="alias for --action relinquish (remove DCG-owned hooks and policy)",
+    )
+    dcg_parser.add_argument(
+        "--purge",
+        action="store_true",
+        help="relinquish only: also drop the reconcile ledger and backup sets",
+    )
+    dcg_parser.add_argument("--dry-run", action="store_true")
+    dcg_parser.add_argument("--format", choices=("text", "json"), default="text")
+    _add_profile_arg(dcg_parser)
+    _add_client_arg(dcg_parser)
+
     doctor_parser = subparsers.add_parser(
         "doctor",
         help="Validate runtime graph, filesystem readiness, and installed skill integrity.",
     )
     doctor_parser.add_argument("--format", choices=("text", "json"), default="text")
+    doctor_parser.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "Federate the three authoritative health surfaces — outer reconcile, "
+            "structure doctor, and runtime evidence — into one read-only report "
+            "with stable provider/check IDs, provenance, per-provider duration, "
+            "explicit unavailable/timed-out states, and exactly ONE primary next "
+            "action. Providers run concurrently under a wall-clock cap, so total "
+            "latency tracks the slowest provider rather than their sum. Reports "
+            "only: incompatible with --fix, and no field is an executable action."
+        ),
+    )
     _add_profile_arg(doctor_parser)
     _add_client_arg(doctor_parser)
     _add_doctor_fix_args(doctor_parser)
@@ -692,6 +787,27 @@ def _build_parser() -> argparse.ArgumentParser:
             "delta banner on tty; no previous scan -> a loud 'delta "
             "unavailable' one-liner. Composes with --json; --cached is "
             "rejected (exit 2) because a delta needs a live scan."
+        ),
+    )
+
+    oracle_lane_parser = subparsers.add_parser(
+        "oracle-lane",
+        help=(
+            "Report the Oracle lane every native surface routes through: which "
+            "lane resolves on this host, the caller identity that proved it, and "
+            "how that identity was proven. Read-only; contacts no browser, no "
+            "socket, and no Oracle. Only the local lane is resolvable from a "
+            "CLI - the fleet lane is proven by the authenticated transport peer "
+            "inside the serving process."
+        ),
+    )
+    oracle_lane_parser.add_argument("--format", choices=("text", "json"), default="text")
+    oracle_lane_parser.add_argument(
+        "--state-root",
+        default=None,
+        help=(
+            "State root holding the service-owned local identity. Defaults to "
+            "the resolved SKILLBOX_STATE_ROOT."
         ),
     )
 
@@ -815,6 +931,85 @@ def _build_parser() -> argparse.ArgumentParser:
         "--scan-candidate-sizes",
         action="store_true",
         help="Run read-only du probes for review-only cleanup candidates.",
+    )
+
+    test_parser = subparsers.add_parser(
+        "test",
+        help="Read this repo's .skillbox/test.yaml test contract (plan/lint are read-only).",
+    )
+    # Free-form positional rather than argparse `choices`: an unknown verb must
+    # produce our own did-you-mean payload, not argparse's bare usage error.
+    test_parser.add_argument(
+        "test_verb",
+        nargs="?",
+        default=None,
+        metavar="VERB",
+        help=f"One of: {', '.join(sbp_test.VERBS)}. Omit for a summary.",
+    )
+    test_parser.add_argument(
+        "--group",
+        default=None,
+        help="Unit group to plan (default: the 'default' group, else every unit).",
+    )
+    test_parser.add_argument("--cwd", default=None)
+    test_parser.add_argument("--format", choices=("text", "json"), default="text")
+    # Probe mode (skillbox-sbp-test-probe-mode-sz4d). Fully flag-driven and never
+    # interactive: `score` stays a static read unless --probe is passed, and
+    # --probe alone still refuses until every authority below is explicit. There
+    # is deliberately no default for the workspace, the budget, the fan-out or
+    # either permission -- a default here would be an inferred permission to run
+    # a repository's own commands.
+    test_parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="Opt in to bounded probe execution inside an admitted disposable capsule.",
+    )
+    test_parser.add_argument(
+        "--probe-workspace",
+        default=None,
+        help="Admitted disposable capsule workspace. Required by --probe.",
+    )
+    test_parser.add_argument(
+        "--probe-budget-s",
+        type=float,
+        default=None,
+        help="Wall-clock budget for the whole probe run. Required by --probe.",
+    )
+    test_parser.add_argument(
+        "--probe-max-parallel",
+        type=int,
+        default=None,
+        help="Maximum probe parallelism. Required by --probe.",
+    )
+    test_parser.add_argument(
+        "--probe-repeats",
+        type=int,
+        default=3,
+        help="Repeat count for the agreement probes (2..16).",
+    )
+    test_parser.add_argument(
+        "--probe-seed", type=int, default=0, help="Seed for the randomized-order probe."
+    )
+    test_parser.add_argument(
+        "--probe-capsule",
+        default=None,
+        help="Expected capsule archive sha256; refuses if the workspace was built from another.",
+    )
+    # Permission is a decision, not a toggle: both spellings are explicit so
+    # `--probe-deny-services` is a recorded "no" rather than an unstated default.
+    services = test_parser.add_mutually_exclusive_group()
+    services.add_argument(
+        "--probe-allow-services", dest="probe_services", action="store_true", default=None
+    )
+    services.add_argument(
+        "--probe-deny-services", dest="probe_services", action="store_false", default=None
+    )
+    network = test_parser.add_mutually_exclusive_group()
+    network.add_argument(
+        "--probe-allow-network", dest="probe_network", action="store_true", default=None
+    )
+    network.add_argument(
+        "--probe-deny-network", dest="probe_network", action="store_false", default=None
     )
 
     rch_report_parser = subparsers.add_parser(
@@ -1759,6 +1954,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--yes",
         action="store_true",
         help="Confirm --global apply; --global dry-runs never require this.",
+    )
+    skill_default_parser.add_argument(
+        "--record-review",
+        action="store_true",
+        help=(
+            "With --repos/--category --dry-run, record the review marker that authorizes "
+            "the matching apply. Without it a dry-run writes nothing."
+        ),
     )
     skill_default_parser.add_argument(
         "--policy-path",
@@ -3635,6 +3838,10 @@ def _safe_first_try_command(name: str) -> str:
         return "manage.py snap --format json --no-adapters"
     if name == "registry-docs":
         return "manage.py registry-docs --format md"
+    if name == "contract-lint":
+        return "manage.py contract-lint --format json"
+    if name == "env-inventory":
+        return "manage.py env-inventory show --format json"
     if name in {"client-init"}:
         return "manage.py client-init --list-blueprints --format json"
     if name in {"client-project"}:
@@ -3744,6 +3951,327 @@ def _handle_registry_docs(args: argparse.Namespace, root_dir: Path) -> int:
     return EXIT_OK
 
 
+CONTRACT_LINT_SCHEMA = "skillbox.contract-lint.v1"
+
+
+def contract_lint_payload(root_dir: Path) -> dict[str, Any]:
+    """Report only NEW command/safety drift, naming the surface that owns it.
+
+    Two ratchets are combined because they answer the same question from two
+    directions and an agent should not have to know there are two:
+
+    * the inventory baseline (``tests/goldens/command_contract_gaps.json``) --
+      cross-surface gaps we have decided to live with;
+    * the destructive policy's accepted findings -- destructive surfaces whose
+      dispatch contract is knowingly incomplete.
+
+    Anything outside both is new drift, and new drift is what this reports. A
+    resolved baseline entry is reported too but never fails: fixing a gap must
+    not break the tree until someone remembers to also edit a JSON file.
+
+    Read-only by construction. It imports and introspects parsers, reads the
+    Makefile and the baseline, and runs nothing -- which is what lets the same
+    command be the CI gate from a fresh checkout with no Docker, no network, and
+    no operator state.
+    """
+    from . import command_contract as cc  # noqa: PLC0415
+    from . import command_registry  # noqa: PLC0415
+
+    report = cc.build_report()
+    baseline_path = Path(root_dir) / "tests" / "goldens" / "command_contract_gaps.json"
+    baseline = cc.load_baseline(baseline_path)
+    new_gaps, resolved = cc.diff_against_baseline(report, baseline)
+
+    specs = command_registry.default_registry()
+    findings = cc.check_destructive_policy(specs=specs, commands=report.commands)
+    new_findings = cc.unaccepted_findings(findings)
+
+    ok = not new_gaps and not new_findings
+    next_actions: list[str] = []
+    if new_gaps:
+        next_actions.append(
+            "each new gap names the surface that owns it; fix the surface, or add a "
+            "reasoned entry to tests/goldens/command_contract_gaps.json"
+        )
+    if new_findings:
+        next_actions.append(
+            "each finding carries the exact fix; apply it, or record an owned gap in "
+            "command_contract.ACCEPTED_DESTRUCTIVE_FINDINGS with a reason"
+        )
+    if resolved:
+        next_actions.append(
+            "resolved baseline entries can be trimmed from "
+            "tests/goldens/command_contract_gaps.json"
+        )
+    if ok and not next_actions:
+        next_actions.append("no new contract drift")
+
+    return {
+        "ok": ok,
+        "schema": CONTRACT_LINT_SCHEMA,
+        "counts": {
+            "commands": int(report.counts.get("commands", 0)),
+            "registry_specs": int(report.counts.get("registry_specs", 0)),
+            "gaps": int(report.counts.get("gaps", 0)),
+            "new_gaps": len(new_gaps),
+            "policy_findings": len(findings),
+            "new_policy_findings": len(new_findings),
+            "resolved_baseline_entries": len(resolved),
+        },
+        "new_gaps": [gap.to_payload() for gap in new_gaps],
+        "new_policy_findings": [finding.to_payload() for finding in new_findings],
+        "resolved_baseline_entries": [
+            {"id": entry[0], "kind": entry[1]} for entry in resolved
+        ],
+        "next_actions": next_actions,
+    }
+
+
+def _handle_contract_lint(args: argparse.Namespace, root_dir: Path) -> int:
+    payload = contract_lint_payload(root_dir)
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        counts = payload["counts"]
+        print(f"contract-lint {'ok' if payload['ok'] else 'DRIFT'}")
+        print(
+            f"  commands={counts['commands']} specs={counts['registry_specs']} "
+            f"gaps={counts['gaps']} (new {counts['new_gaps']}) "
+            f"policy={counts['policy_findings']} (new {counts['new_policy_findings']})"
+        )
+        for gap in payload["new_gaps"]:
+            print(f"  NEW GAP {gap['id']}: {gap['kind']} — {gap['detail']}")
+        for finding in payload["new_policy_findings"]:
+            print(f"  NEW POLICY {finding['surface']}: {finding['invariant']}")
+            print(f"    owner: {finding['owner']}")
+            print(f"    fix:   {finding['fix']}")
+        for action in payload["next_actions"]:
+            print(f"  -> {action}")
+    # EXIT_DRIFT, not EXIT_ERROR: the command worked, the tree disagrees with
+    # its own contract. CI gates on nonzero either way, and an operator reading
+    # the code can tell a broken linter from a broken tree.
+    return EXIT_OK if payload["ok"] else EXIT_DRIFT
+
+
+#: The MANIFEST leaf that owns every write of the environment-inventory cache.
+#: One id, one owner: whoever ends up calling the refresh (the `refresh` verb,
+#: the post-sync hook, a future scheduler) writes through the same gated helper
+#: rather than each caller re-deriving the path and the lock.
+ENV_INVENTORY_REFRESH_BOUNDARY = "manage.env-inventory.refresh"
+
+
+def _environment_inventory() -> Any:
+    """Lazy import: the contract module parses YAML and is not needed to boot."""
+    from . import environment_inventory  # noqa: PLC0415
+
+    return environment_inventory
+
+
+def _env_inventory_cache_root(root_dir: Path) -> Path | None:
+    """The root to hand the cache writer, or ``None`` when the roots disagree.
+
+    ``environment_inventory`` addresses its cache as ``<root_dir>/`` +
+    ``INVENTORY_CACHE_REL`` — repo-relative, and deliberately blind to
+    ``$SKILLBOX_STATE_ROOT``. The single-writer lease, by contrast, is taken on
+    ``canonical_runtime_state_root``. When an operator moves the state root
+    those two resolvers name different directories, and writing anyway would
+    put the file in a root whose lease we are not holding — a gate in name
+    only. So the mismatch is detected here and the write is refused, which is
+    the fail-closed half of the same contract that makes the write gated at all.
+
+    The comparison reads the module's own constant, so it cannot drift from the
+    path the module actually writes.
+    """
+    module = _environment_inventory()
+    first_segment = Path(str(module.INVENTORY_CACHE_REL)).parts[0]
+    repo_relative_root = (Path(root_dir) / first_segment).resolve()
+    canonical = state_mutation.canonical_runtime_state_root(root_dir)
+    return Path(root_dir) if canonical == repo_relative_root else None
+
+
+def refresh_environment_inventory_cache(
+    root_dir: Path,
+    *,
+    dry_run: bool = False,
+    observe: bool = True,
+    lease_timeout: float | None = None,
+) -> dict[str, Any]:
+    """Rebuild the environment-inventory cache under the single-writer lease.
+
+    Returns an action record (never raises) so a caller that is only *hooking*
+    the refresh — ``manage sync`` — reports the outcome as one more line of its
+    own output instead of failing a converge over a cache. The ``refresh`` verb
+    reads ``ok`` from the same record and sets its exit code from it.
+
+    Contention is the one exception: a lease error is re-raised rather than
+    folded into the record, because "someone else is mid-write" is not a fact
+    about the cache and the dispatcher already knows how to report a holder.
+    ``lease_timeout`` bounds that wait for a caller that is hooking the refresh
+    onto its own work and cannot afford the default; both CLI paths arrive with
+    the lease already held, so neither of them ever waits at all.
+    """
+    module = _environment_inventory()
+    record: dict[str, Any] = {
+        "id": "environment-inventory-cache",
+        "kind": "inventory",
+        "action": "refresh",
+        "ok": True,
+        "wrote": False,
+        "path": None,
+        "observed": bool(observe),
+    }
+    cache_root = _env_inventory_cache_root(root_dir)
+    if cache_root is None:
+        record["ok"] = False
+        record["reason"] = "state_root_mismatch"
+        record["text"] = (
+            "environment-inventory cache: skipped — $SKILLBOX_STATE_ROOT points away from "
+            f"{Path(root_dir) / Path(str(module.INVENTORY_CACHE_REL)).parts[0]}, so the write "
+            "would land outside the leased state root"
+        )
+        return record
+    record["path"] = str(module.inventory_cache_path(cache_root))
+    if dry_run:
+        record["reason"] = "dry_run"
+        record["text"] = f"would refresh environment-inventory cache: {record['path']}"
+        return record
+    try:
+        # The lease is taken by the writer, not by its callers: `refresh` reaches
+        # here under its own dispatch gate and `sync` under sync's, and both are
+        # nested reuse of the one held lease rather than a second flock.
+        lease_kwargs: dict[str, Any] = {} if lease_timeout is None else {"timeout": lease_timeout}
+        with state_mutation.runtime_mutation_lease(
+            ENV_INVENTORY_REFRESH_BOUNDARY,
+            root_dir=root_dir,
+            annotations={"surface": "manage", "contract": module.ENVIRONMENT_INVENTORY_CONTRACT},
+            **lease_kwargs,
+        ):
+            payload = module.build_environment_inventory(root_dir=root_dir, observe=observe)
+            path = module.write_inventory_cache(payload, cache_root)
+    except state_mutation.StateMutationLeaseError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — a cache must not fail a converge
+        record["ok"] = False
+        record["reason"] = f"{type(exc).__name__}: {exc}"
+        record["text"] = f"environment-inventory cache: FAILED ({record['reason']})"
+        return record
+    record["wrote"] = True
+    record["path"] = str(path)
+    record["repo_count"] = len(payload.get("repos") or [])
+    record["client_count"] = len(payload.get("clients") or [])
+    record["readiness"] = (payload.get("readiness") or {}).get("status")
+    record["text"] = (
+        f"refreshed environment-inventory cache: {path} "
+        f"({record['repo_count']} repos, {record['client_count']} clients, "
+        f"{record['readiness']})"
+    )
+    return record
+
+
+def _env_inventory_show_payload(
+    args: argparse.Namespace, root_dir: Path, module: Any
+) -> dict[str, Any]:
+    if getattr(args, "cached", False):
+        cache_root = _env_inventory_cache_root(root_dir)
+        cached = module.read_inventory_cache(cache_root) if cache_root is not None else None
+        stale = module.is_stale(cached)
+        payload: dict[str, Any] = {
+            # A cache miss is not a failure of this command, and staleness is not
+            # a miss: the module's contract is that a picker renders "not built
+            # yet" or "stale" rather than blocking on a rebuild, so `ok` tracks
+            # "there is a payload" and `stale` is reported beside it.
+            "ok": cached is not None,
+            "source": "cache",
+            "cache_path": str(module.inventory_cache_path(cache_root))
+            if cache_root is not None
+            else None,
+            "stale": stale,
+            "inventory": cached,
+            "next_actions": []
+            if cached is not None and not stale
+            else ["python3 .env-manager/manage.py env-inventory refresh --format json"],
+        }
+        if cache_root is None:
+            payload["reason"] = "state_root_mismatch"
+        elif cached is None:
+            payload["reason"] = "no cache written yet, or it was written by another schema_version"
+        return payload
+    built = module.build_environment_inventory(
+        root_dir=root_dir,
+        observe=bool(getattr(args, "observe", False) and not getattr(args, "no_observe", False)),
+        include_clients=not getattr(args, "no_clients", False),
+    )
+    return {
+        "ok": True,
+        "source": "build",
+        "stale": False,
+        "inventory": built,
+        "next_actions": [],
+    }
+
+
+def _print_env_inventory_text(payload: dict[str, Any]) -> None:
+    inventory = payload.get("inventory")
+    if not isinstance(inventory, dict):
+        print(f"env-inventory: no payload (source={payload.get('source')})")
+        for action in payload.get("next_actions") or []:
+            print(f"  -> {action}")
+        return
+    machine = (inventory.get("machine") or {}).get("declared") or {}
+    readiness = inventory.get("readiness") or {}
+    print(f"contract   {inventory.get('contract')} ({inventory.get('schema_version')})")
+    print(f"source     {payload.get('source')}{' STALE' if payload.get('stale') else ''}")
+    print(f"machine    {machine.get('machine_id')} ({(inventory.get('machine') or {}).get('detection_source')})")
+    print(f"readiness  {readiness.get('status')}")
+    for reason in readiness.get("reasons") or []:
+        print(f"  - {reason}")
+    print(f"clients    {readiness.get('declared_client_count')}")
+    print(f"repos      {readiness.get('declared_repo_count')}")
+    if readiness.get("observed_present_count") is not None:
+        print(
+            f"observed   {readiness.get('observed_present_count')} present / "
+            f"{readiness.get('observed_missing_count')} missing"
+        )
+    for item in inventory.get("recovery") or []:
+        print(f"recovery   {item.get('code')}: {item.get('message')}")
+    for action in payload.get("next_actions") or []:
+        print(f"  -> {action}")
+
+
+def _handle_env_inventory(args: argparse.Namespace, root_dir: Path) -> int:
+    module = _environment_inventory()
+    # No subcommand means `show`; the MANIFEST leaf for the bare form is the read.
+    action = getattr(args, "action", None) or "show"
+    output_format = getattr(args, "format", "text")
+    if action == "refresh":
+        record = refresh_environment_inventory_cache(
+            root_dir, observe=not getattr(args, "no_observe", False)
+        )
+        payload = {"ok": bool(record["ok"]), "action": "refresh", "cache": record, "next_actions": []}
+        if not record["ok"]:
+            payload["next_actions"] = [
+                "python3 .env-manager/manage.py env-inventory show --format json"
+            ]
+        if output_format == "json":
+            emit_json(payload)
+        else:
+            print(record["text"])
+            for next_action in payload["next_actions"]:
+                print(f"  -> {next_action}")
+        return EXIT_OK if record["ok"] else EXIT_ERROR
+
+    payload = _env_inventory_show_payload(args, root_dir, module)
+    payload["action"] = "show"
+    if output_format == "json":
+        emit_json(payload)
+    else:
+        _print_env_inventory_text(payload)
+    # EXIT_DRIFT, not EXIT_ERROR: `--cached` with no cache means the command
+    # worked and the tree is not in the state the caller asked about. A real
+    # failure to build raises and is rendered by the typed-error path instead.
+    return EXIT_OK if payload["ok"] else EXIT_DRIFT
+
+
 def _handle_robot_docs(args: argparse.Namespace, root_dir: Path) -> int:
     guide = _robot_docs_guide()
     if args.format == "json":
@@ -3837,6 +4365,152 @@ def _handle_pressure_report(args: argparse.Namespace, root_dir: Path) -> int:
     else:
         print("\n".join(pressure_report_text_lines(payload)))
     return EXIT_OK
+
+
+def _probe_text_lines(payload: dict[str, Any]) -> list[str]:
+    """Compact probe rendering. `ran`, `refused`, `failed` and `proven` are explicit.
+
+    A static score prints ``probe: not run (static score)`` rather than nothing,
+    because a silent absence is exactly how a reader concludes the probes passed.
+    Per-probe ``detail`` is printed verbatim and never summarised away -- it is
+    the only place a dependency's own words survive.
+    """
+    if not payload.get("probed"):
+        if payload.get("probe_state") == "refused":
+            return [
+                f"probe: refused [{payload.get('error_code')}] {payload.get('error', '')}"
+            ]
+        return ["probe: not run (static score; pass --probe to execute)"]
+
+    receipt = payload.get("probe_receipt") or {}
+    counts = payload.get("probe_counts") or {}
+    upgrades = payload.get("probe_upgrades") or []
+    lines = [
+        "probe: "
+        + ", ".join(f"{state}={counts.get(state, 0)}" for state in ("ran", "failed", "refused"))
+        + f" (receipt {payload.get('probe_receipt_digest', '')[:12]}"
+        + (", budget exhausted" if receipt.get("budget_exhausted") else "")
+        + ")"
+    ]
+    for probe in receipt.get("probes") or []:
+        suffix = f" -- {probe.get('detail')}" if probe.get("detail") else ""
+        if probe.get("refusal_code"):
+            suffix = f" [{probe['refusal_code']}]{suffix}"
+        lines.append(f"  {probe.get('state')} {probe.get('kind')}{suffix}")
+    for upgrade in upgrades:
+        lines.append(
+            f"  proven {upgrade.get('finding_code')} "
+            f"(upgraded from likely by {upgrade.get('probe_kind')})"
+        )
+    if not upgrades:
+        lines.append("  proven: none (no probe met an exact proof requirement)")
+    return lines
+
+
+def _test_text_lines(payload: dict[str, Any]) -> list[str]:
+    lines = [f"test {payload.get('verb')}: {'ok' if payload.get('ok') else 'not ok'}"]
+    if payload.get("error"):
+        lines.append(f"error: {payload['error']}")
+    if payload.get("suggestion"):
+        lines.append(f"did you mean: sbp test {payload['suggestion']}")
+    if payload.get("report"):
+        from . import sbp_test_scorer  # noqa: PLC0415
+
+        lines.extend(sbp_test_scorer.report_text_lines(payload["report"]))
+    if "probed" in payload:
+        lines.extend(_probe_text_lines(payload))
+    for unit in payload.get("units") or []:
+        command = unit.get("command")
+        rendered = " ".join(command) if isinstance(command, list) else command
+        lines.append(f"  {unit.get('id')}: {rendered}")
+    for issue in payload.get("issues") or []:
+        lines.append(f"  issue [{issue.get('code')}] {issue.get('message')}")
+    for drift in payload.get("drift") or []:
+        lines.append(f"  drift [{drift.get('code')}] {drift.get('message')}")
+    for action in payload.get("next_actions") or []:
+        lines.append(f"next: {action}")
+    return lines
+
+
+def _probe_authority(args: argparse.Namespace) -> Any:
+    """Build the probe authority from flags, or ``None`` for the static default.
+
+    Nothing is inferred. Every flag the caller omitted stays ``None`` and becomes
+    a named refusal downstream, so the error tells an agent exactly which
+    authority to add rather than silently running with a guess.
+    """
+    if not getattr(args, "probe", False):
+        return None
+    from . import sbp_test_probe as probe_mode  # noqa: PLC0415
+
+    workspace = getattr(args, "probe_workspace", None)
+    return probe_mode.ProbeAuthority(
+        workspace=Path(workspace) if workspace else None,
+        wall_clock_budget_s=getattr(args, "probe_budget_s", None),
+        max_parallel=getattr(args, "probe_max_parallel", None),
+        allow_services=getattr(args, "probe_services", None),
+        allow_network=getattr(args, "probe_network", None),
+        archive_sha256=getattr(args, "probe_capsule", None),
+        repeats=int(getattr(args, "probe_repeats", 3) or 3),
+        seed=int(getattr(args, "probe_seed", 0) or 0),
+    )
+
+
+def _handle_test(args: argparse.Namespace, root_dir: Path) -> int:
+    """`sbp test` front door (skillbox-sbp-test-front-door-1y29).
+
+    Delegates to :mod:`runtime_manager.sbp_test`. plan/lint are read-only;
+    run/dispatch are declared but not implemented in this slice and say so in a
+    typed envelope rather than pretending to succeed.
+    """
+    cwd = Path(getattr(args, "cwd", None) or os.getcwd()).resolve()
+    verb = getattr(args, "test_verb", None)
+
+    if verb is None:
+        payload = sbp_test.status_payload(cwd)
+        exit_code = EXIT_OK
+    elif verb in sbp_test.READ_ONLY_VERBS:
+        if verb == "plan":
+            payload = sbp_test.plan_payload(cwd, group=getattr(args, "group", None))
+            exit_code = EXIT_OK if payload.get("ok") else EXIT_ERROR
+        elif verb == "score":
+            # Findings are data: a scored repo full of blockers still exits ok.
+            # Nonzero is reserved for "we could not analyse" -- bad input (1) vs
+            # a repo with nothing to read (3, needs input). A refused probe joins
+            # the needs-input rung: the caller is missing an authority, not
+            # looking at a broken suite.
+            payload = sbp_test.score_payload(cwd, probe=_probe_authority(args))
+            exit_code = {
+                "ok": EXIT_OK,
+                "needs_input": EXIT_NEEDS_INPUT,
+                "error": EXIT_ERROR,
+            }[sbp_test.score_exit_class(payload)]
+        else:
+            payload = sbp_test.lint_payload(cwd)
+            # Exit ladder: a broken contract is an error; a well-formed manifest
+            # that disagrees with this host is DRIFT. EXIT_DRIFT is reserved for
+            # that mismatch and is never used for a failing test.
+            if payload.get("issues"):
+                exit_code = EXIT_ERROR
+            elif payload.get("drift"):
+                exit_code = EXIT_DRIFT
+            else:
+                exit_code = EXIT_OK
+    elif verb in sbp_test.WRITE_VERBS:
+        payload = sbp_test.capsule_payload(cwd)
+        exit_code = EXIT_OK if payload.get("ok") else EXIT_ERROR
+    elif verb in sbp_test.GATED_VERBS:
+        payload = sbp_test.deferred_payload(verb, cwd)
+        exit_code = EXIT_ERROR
+    else:
+        payload = sbp_test.unknown_verb_payload(verb, cwd)
+        exit_code = _EXIT_USAGE
+
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print("\n".join(_test_text_lines(payload)))
+    return exit_code
 
 
 def _handle_rch_report(args: argparse.Namespace, root_dir: Path) -> int:
@@ -4293,13 +4967,98 @@ def _handle_cass_evidence(args: argparse.Namespace, root_dir: Path) -> int:
     return int(proc.returncode)
 
 
+ORACLE_LANE_SCHEMA_VERSION = "2026-08-16+oracle_lane"
+
+
+def _handle_oracle_lane(args: argparse.Namespace, root_dir: Path) -> int:
+    """`manage.py oracle-lane` — report the resolved Oracle lane, read-only.
+
+    Every native Oracle surface must route through one lane contract
+    (`runtime_manager.oracle_broker.resolve_lane`), so this verb reports the
+    same resolution the request path would compute rather than reimplementing
+    it. It contacts nothing: no browser, no socket, no Oracle. A caller with no
+    Chrome installed gets the identical answer.
+
+    Only the LOCAL lane is resolvable from a CLI: the fleet lane is proven by an
+    authenticated transport peer, which exists only inside the serving process.
+    A host that has not enrolled a service-owned identity is a refusal with the
+    provisioning command in next_actions, never a silent fallback.
+    """
+    from .git_scan_cache import resolve_state_root
+    from .oracle_broker import (
+        IDENTITY_ENV_OVERRIDE_NAMES,
+        LANE_FLEET,
+        OracleBrokerError,
+        local_identity_path,
+        resolve_lane,
+    )
+
+    is_json = getattr(args, "format", "text") == "json"
+    override = getattr(args, "state_root", None)
+    state_root = (
+        host_path_to_absolute_path(root_dir, override)
+        if override
+        else resolve_state_root(root_dir)
+    )
+    identity_path = local_identity_path(state_root)
+    provision_hint = (
+        "python3 -c \"import sys; sys.path.insert(0, '.env-manager'); "
+        "from runtime_manager.oracle_broker import provision_local_identity; "
+        f"provision_local_identity('{state_root}', '<caller-id>')\""
+    )
+
+    try:
+        resolution = resolve_lane(state_root=state_root)
+    except OracleBrokerError as exc:
+        payload = exc.to_payload()
+        payload["error"]["context"] = {
+            "identity_path": str(identity_path),
+            "lane_hint": (
+                f"The {LANE_FLEET} lane is only resolvable inside the serving "
+                "process, which holds the authenticated transport peer."
+            ),
+        }
+        next_actions = (
+            [f"unset {name}" for name in sorted(IDENTITY_ENV_OVERRIDE_NAMES)]
+            if exc.code == "identity_env_override_forbidden"
+            else [f"Enroll a service-owned identity: {provision_hint}"]
+        )
+        payload["error"]["next_actions"] = next_actions
+        payload["next_actions"] = next_actions
+        if is_json:
+            emit_json(payload)
+        else:
+            print(f"oracle-lane: refused ({exc.code})", file=sys.stderr)
+            for action in next_actions:
+                print(f"  next: {action}", file=sys.stderr)
+        return EXIT_ERROR
+
+    payload = {
+        "ok": True,
+        "schema_version": ORACLE_LANE_SCHEMA_VERSION,
+        **resolution.to_payload(),
+        "identity_path": str(identity_path),
+        "next_actions": [],
+    }
+    if is_json:
+        emit_json(payload)
+    else:
+        print(f"lane      {payload['lane']}")
+        print(f"caller    {payload['caller_id']}")
+        print(f"proved by {payload['auth_method']} ({payload['reason']})")
+    return EXIT_OK
+
+
 _EARLY_COMMANDS: tuple[tuple[str, EarlyCommandHandler, str], ...] = (
     ("cass-evidence", _handle_cass_evidence, "Measure skill invocations per repo from Cass."),
     ("capabilities", _handle_capabilities, "Print the machine-readable Skillbox CLI contract."),
     ("registry-docs", _handle_registry_docs, "Render docs/API_REFERENCE.md from the command registry."),
+    ("contract-lint", _handle_contract_lint, "Report NEW cross-surface command/safety drift."),
+    ("env-inventory", _handle_env_inventory, "Read the environment-inventory contract or refresh its cache."),
     ("robot-docs", _handle_robot_docs, "Print agent-oriented in-tool documentation."),
     ("robot-triage", _handle_robot_triage, "Emit a compact JSON triage packet for agents."),
     ("pressure-report", _handle_pressure_report, "Report local disk pressure and guard posture."),
+    ("test", _handle_test, "Read this repo's .skillbox/test.yaml contract (plan/lint read-only)."),
     ("rch-report", _handle_rch_report, "Report RCH build-offload readiness without mutation."),
     ("rch-stage", _handle_rch_stage, "Prepare or run a no-sudo RCH staging lane."),
     ("sbh-report", _handle_sbh_report, "Report SBH storage guard readiness without mutation."),
@@ -4331,6 +5090,7 @@ _EARLY_COMMANDS: tuple[tuple[str, EarlyCommandHandler, str], ...] = (
     ("mmdx", _handle_mmdx, "Open or create MMDX diagrams."),
     ("structure-doctor", _handle_structure_doctor, "Run structural gates without mutating runtime state."),
     ("git-status", _handle_git_status, "Read-only risk-sorted git status across the repo estate."),
+    ("oracle-lane", _handle_oracle_lane, "Report the resolved Oracle lane and its identity provenance."),
 )
 
 
@@ -4370,11 +5130,70 @@ def _handle_sync(args: argparse.Namespace, root_dir: Path, model: dict[str, Any]
             kind="context",
         )
     )
+    # The one honest trigger for the environment-inventory cache. `sync` is the
+    # moment config intent becomes filesystem reality, so it is exactly when the
+    # cached projection of that intent stops being true — and it is already off
+    # every hot path (a picker reads the cache, it never runs sync). It is hooked
+    # HERE, in the `manage sync` handler, rather than inside `sync_runtime`,
+    # because `up`/`bootstrap`/`restart`/`focus`/`doctor --fix` also call
+    # sync_runtime and none of them asked to own a cache write.
+    records.append(refresh_environment_inventory_cache(root_dir, dry_run=args.dry_run))
     if args.format == "json":
         emit_json(_stamp_runtime_envelope({"actions": records, "dry_run": args.dry_run, "next_actions": next_actions_for_sync()}))
     else:
         print("\n".join(action_texts(records)))
     return EXIT_OK
+
+
+def _handle_dcg_reconcile(
+    args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str
+) -> int:
+    """The one agent-facing door to the DCG lifecycle contract.
+
+    install.sh, first-box, onboard, runtime-sync, box deploy, and the Makefile
+    all converge through :mod:`runtime_manager.dcg_lifecycle`; this command is
+    the operator/agent spelling of the same call, including the explicit
+    ``--remove``/``--action relinquish`` path.
+    """
+    from . import dcg_lifecycle
+
+    action = dcg_lifecycle.ACTION_RELINQUISH if args.remove else args.action
+    target = dcg_lifecycle_target(model)
+    if target is None:
+        payload = {
+            "ok": False,
+            "action": action,
+            "status": dcg_lifecycle.STATE_FAILED,
+            "marker": dcg_lifecycle.MARKER_FAILED,
+            "code": dcg_lifecycle.DCG_LIFECYCLE_MODEL_TARGET_MISSING,
+            "message": "runtime model declares no resolvable dcg-bin artifact",
+            "next_actions": ["declare a dcg-bin artifact in workspace/runtime.yaml"],
+        }
+        if args.format == "json":
+            emit_json(payload)
+        else:
+            print(f"status: {payload['status']}\nerror:  {payload['message']}")
+        return EXIT_ERROR
+
+    home, binary = target
+    payload = dcg_lifecycle.converge(
+        entrypoint=args.entrypoint,
+        scope=args.scope,
+        home=home,
+        binary=binary,
+        action=action,
+        dry_run=args.dry_run,
+        purge=args.purge,
+    )
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        print(f"marker: {payload.get('marker')}")
+        print(f"status: {payload.get('status')}")
+        print(f"home:   {payload.get('home')}")
+        for text in payload.get("operator_actions") or []:
+            print(f"operator: {text}")
+    return EXIT_OK if payload.get("ok") else EXIT_ERROR
 
 
 def _handle_context(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
@@ -4482,6 +5301,50 @@ def runtime_doctor_payload(results: Sequence[Any], root_dir: Path) -> dict[str, 
     )
 
 
+def _handle_doctor_all(
+    args: argparse.Namespace, root_dir: Path, model: dict[str, Any]
+) -> int:
+    """`manage.py doctor --all` — read-only federation over the three surfaces.
+
+    Reports only. `--fix` is refused rather than ignored: a front door that can
+    both diagnose and act is how one quietly becomes the other, and every
+    `fix_command` in the payload is display text the federation never runs.
+    """
+    from .health_federation import collect_federated_health, federation_text_lines
+
+    if getattr(args, "fix", False):
+        message = {
+            "ok": False,
+            "error": {
+                "code": "DOCTOR_ALL_IS_READ_ONLY",
+                "message": (
+                    "doctor --all federates read-only providers and never applies a "
+                    "fix. Run `doctor --fix` for the runtime doctor's own fix lane."
+                ),
+            },
+        }
+        if args.format == "json":
+            emit_json(message)
+        else:
+            print(f"doctor --all: {message['error']['message']}", file=sys.stderr)
+        return EXIT_ERROR
+
+    payload = collect_federated_health(
+        root_dir,
+        model,
+        cwd=getattr(args, "cwd", None),
+        declared_servers=_full_declared_mcp_servers(root_dir),
+    )
+    if args.format == "json":
+        emit_json(payload)
+    else:
+        for line in federation_text_lines(payload):
+            print(line)
+    # A federated report is a report: a red light is information, not a usage
+    # error, and the exit code stays 0 so a wrapper cannot mistake it for one.
+    return EXIT_OK
+
+
 def _handle_doctor(args: argparse.Namespace, root_dir: Path, model: dict[str, Any], resolved_mode: str) -> int:
     if getattr(args, "undo", None):
         return _handle_doctor_undo(
@@ -4490,6 +5353,9 @@ def _handle_doctor(args: argparse.Namespace, root_dir: Path, model: dict[str, An
             fmt=args.format,
             confirmed=bool(getattr(args, "yes", False)),
         )
+
+    if getattr(args, "all", False):
+        return _handle_doctor_all(args, root_dir, model)
 
     results = doctor_results(model, root_dir)
     if getattr(args, "fix", False):
@@ -5716,10 +6582,23 @@ def _build_fleet_skill_default_payload(
         payload["preflight"]["missing"] = []
         payload["error"] = "no repositories matched --repos/--category selectors"
     if dry_run:
-        payload["review"] = _record_fleet_skill_default_review(payload)
-        payload["next_actions"] = [
-            _skill_default_apply_command(args, include_dry_run=False),
-        ]
+        # A --dry-run that writes is a contract violation
+        # (skillbox-nominal-reads-that-write-kxm5). Recording the review marker
+        # is a deliberate act now, not a side effect of previewing: plain
+        # --dry-run reports whether consent exists, --record-review grants it.
+        # The apply gate below is unchanged, so this does not weaken consent --
+        # it stops a preview from silently granting it.
+        if getattr(args, "record_review", False):
+            payload["review"] = _record_fleet_skill_default_review(payload)
+            payload["next_actions"] = [
+                _skill_default_apply_command(args, include_dry_run=False),
+            ]
+        else:
+            payload["review"] = _fleet_skill_default_review_status(payload)
+            payload["next_actions"] = [
+                _skill_default_review_command(args),
+                _skill_default_apply_command(args, include_dry_run=False),
+            ]
     else:
         payload["review"] = _fleet_skill_default_review_status(payload)
         payload["next_actions"] = [
@@ -5745,6 +6624,11 @@ def _skill_default_apply_command(args: argparse.Namespace, *, include_dry_run: b
     if include_dry_run:
         pieces.append("--dry-run")
     return " ".join(pieces)
+
+
+def _skill_default_review_command(args: argparse.Namespace) -> str:
+    """The explicit command that records review consent for this exact plan."""
+    return f"{_skill_default_apply_command(args, include_dry_run=True)} --record-review"
 
 
 def _handle_fleet_skill_default(
@@ -5779,9 +6663,11 @@ def _handle_fleet_skill_default(
         payload["ok"] = False
         payload["preflight"]["ok"] = False
         payload["error"] = (
-            "cross-repo skill default writes require an exact dry-run first; "
-            "run the dry-run command and re-run apply without changing the target set."
+            "cross-repo skill default writes require recorded review of this exact plan; "
+            "run the dry-run with --record-review, then re-run apply without changing "
+            "the target set."
         )
+        payload["next_actions"] = [_skill_default_review_command(args)]
         return payload
     if not payload.get("would_change"):
         payload["ok"] = True
@@ -7763,6 +8649,11 @@ _MODEL_COMMANDS: tuple[tuple[str, ModelCommandHandler, str], ...] = (
     ("ports", _handle_ports, "List or resolve the active port registry."),
     ("sync", _handle_sync, "Create managed runtime directories, repos, artifacts, and skill state."),
     ("context", _handle_context, "Render managed agent context files."),
+    (
+        "dcg-reconcile",
+        _handle_dcg_reconcile,
+        "Converge, verify, or relinquish DCG hooks through the shared lifecycle contract.",
+    ),
     ("doctor", _handle_doctor, "Validate runtime graph, filesystem readiness, and skill integrity."),
     ("status", _handle_status, "Summarize repo, artifact, skill, service, log, and check state."),
     ("state-backup", _handle_state_backup, "Create, list, verify, drill, or restore state-root backups."),
@@ -8279,15 +9170,64 @@ def _emit_unknown_registered_command(command: str) -> int:
     return EXIT_ERROR
 
 
-def _dispatch_registered_command(args: argparse.Namespace, root_dir: Path, resolved_mode: str) -> int:
-    spec = _COMMAND_REGISTRY.get(str(args.command))
-    if spec is None:
-        return _emit_unknown_registered_command(str(args.command))
+def _run_registered_command(
+    spec: Any, args: argparse.Namespace, root_dir: Path, resolved_mode: str
+) -> int:
     if spec.loads_model:
         handler = _MODEL_DISPATCH.get(spec.name, spec.handler)
         return _dispatch_model_command(args, root_dir, resolved_mode, handler)
     handler = _EARLY_DISPATCH.get(spec.name, spec.handler)
     return handler(args, root_dir)
+
+
+def _emit_lease_contention(
+    args: argparse.Namespace, boundary_id: str, exc: Exception
+) -> int:
+    """Report contention. Never swallow it, never retry silently here.
+
+    A caller that cannot get the lease has NOT mutated anything, and the useful
+    thing to say is which boundary is holding and who holds it -- the timeout
+    carries that forensics, so it is surfaced rather than flattened into a
+    generic failure. Retrying is the operator's call, not the dispatcher's.
+    """
+    context = {"boundary_id": boundary_id}
+    for field in ("state_root", "lock_path", "holder", "timeout_seconds", "waited_seconds"):
+        value = getattr(exc, field, None)
+        if value is not None:
+            context[field] = value
+    error = ValidationError(
+        getattr(exc, "code", "STATE_LEASE_UNAVAILABLE"),
+        str(exc),
+        context=context,
+        next_actions=[
+            "wait for the in-flight writer to finish, then re-run",
+            "python3 .env-manager/manage.py status --format json",
+        ],
+        recoverable=True,
+    )
+    return _emit_main_exception(args, error)
+
+
+def _dispatch_registered_command(args: argparse.Namespace, root_dir: Path, resolved_mode: str) -> int:
+    spec = _COMMAND_REGISTRY.get(str(args.command))
+    if spec is None:
+        return _emit_unknown_registered_command(str(args.command))
+
+    # Single-writer gate. The boundary comes from the canonical MANIFEST, not a
+    # second table kept by hand here: a surface that is classified as a mutation
+    # is a surface that is gated, and the coverage ratchet refuses to let a new
+    # public surface ship unclassified. Reads and true dry-runs resolve to None
+    # and never reach the lock -- there is no read lock, on purpose.
+    boundary_id = state_mutation.manage_boundary_for(args)
+    if boundary_id is None:
+        return _run_registered_command(spec, args, root_dir, resolved_mode)
+    try:
+        with state_mutation.runtime_mutation_lease(
+            boundary_id, root_dir=root_dir, annotations={"command": str(args.command)}
+        ):
+            return _run_registered_command(spec, args, root_dir, resolved_mode)
+    except state_mutation.StateMutationLeaseError as exc:
+        return _emit_lease_contention(args, boundary_id, exc)
 
 
 def main(argv: list[str] | None = None) -> int:

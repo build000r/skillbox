@@ -47,6 +47,7 @@ LANE_IDS = [
     "lint",
     "shellcheck",
     "render",
+    "contract",
     "test-3.11",
     "test-3.12-coverage",
     "test-3.13",
@@ -89,8 +90,11 @@ class WorkflowTriggerContractTests(unittest.TestCase):
         self.assertEqual({"contents": "read"}, self.ci["permissions"])
 
     def test_every_hosted_job_is_retained(self) -> None:
+        # Exact, not superset: dropping a job is the regression this guards, and
+        # adding one is a deliberate edit here. `contract` is the command-
+        # contract lint, mirrored from the canonical gate's "contract" lane.
         self.assertEqual(
-            {"lint", "shellcheck", "render", "test", "compose"},
+            {"lint", "shellcheck", "render", "contract", "mutation", "test", "compose"},
             set(self.ci["jobs"]),
         )
 
@@ -192,6 +196,7 @@ class PinParityTests(unittest.TestCase):
         self.assertIn("--severity=warning scripts/*.sh install.sh", text)
         self.assertIn(".githooks/pre-commit .githooks/pre-push", text)
         self.assertIn("scripts/04-reconcile.py render", text)
+        self.assertIn("contract-lint --format json", text)
         self.assertIn("-m unittest discover -s tests", text)
         self.assertIn("--source=scripts,.env-manager", text)
         self.assertIn("docker compose --env-file .env.example", text)
@@ -257,6 +262,16 @@ if [[ "${args}" == *"-m unittest"* ]]; then
   if [[ "${plant}" == *,unit-${version},* ]]; then
     echo "planted unit failure on ${version}" >&2
     exit 1
+  fi
+  if [[ "${plant}" == *,leak-${version},* ]]; then
+    # Stand in for a suite that boots a service from runtime.yaml inside a
+    # TemporaryDirectory sandbox and never stops it: the sandbox goes away, the
+    # `sh -c` retry loop does not. The lane itself still PASSES -- that is what
+    # made this leak invisible.
+    sh -c 'while true; do sleep 30; done' >/dev/null 2>&1 &
+    echo "$!" >"${SELFTEST_LEAK_PIDFILE}"
+    echo "OK (${version}) [leaked a service]"
+    exit 0
   fi
   echo "OK (${version})"
   exit 0
@@ -387,6 +402,8 @@ class GateBehaviorTests(unittest.TestCase):
         *extra: str,
         plant: str = "",
         toolchain: Path | None = None,
+        git_hook_env: bool = False,
+        leak_pidfile: Path | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         receipts = Path(tempfile.mkdtemp(dir=self._tmp.name))
         env = dict(os.environ)
@@ -394,7 +411,12 @@ class GateBehaviorTests(unittest.TestCase):
         env["SKILLBOX_SELF_TEST_TOOLCHAIN_DIR"] = str(toolchain or self.toolchain)
         env["SKILLBOX_SELF_TEST_RECEIPT_DIR"] = str(receipts)
         env["SELFTEST_PLANT"] = plant
+        env["SELFTEST_LEAK_PIDFILE"] = str(leak_pidfile) if leak_pidfile else ""
         env.pop("SKILLBOX_STATE_ROOT", None)
+        if git_hook_env:
+            env["GIT_DIR"] = str(self.repo / ".git")
+            env["GIT_WORK_TREE"] = str(self.repo)
+            env["GIT_PREFIX"] = ""
         result = subprocess.run(
             ["bash", str(self.repo / "scripts" / "self-test.sh"), *extra],
             capture_output=True,
@@ -447,6 +469,26 @@ class GateBehaviorTests(unittest.TestCase):
             self.assertEqual(self.head_sha, receipt["commit"])
         finally:
             planted.unlink()
+
+    def test_hook_git_environment_cannot_redirect_the_isolated_checkout(self) -> None:
+        branch_before = subprocess.run(
+            ["git", "-C", str(self.repo), "symbolic-ref", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        result, receipts = self._run_gate(
+            "--trigger", "pre-push-fixture", git_hook_env=True
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("pass", self._receipt(receipts)["status"])
+        branch_after = subprocess.run(
+            ["git", "-C", str(self.repo), "symbolic-ref", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(branch_before, branch_after)
 
     def test_worktree_mode_is_marked_non_canonical(self) -> None:
         result, receipts = self._run_gate("--worktree")
@@ -501,6 +543,59 @@ class GateBehaviorTests(unittest.TestCase):
 
     def test_planted_compose_failure_fails_closed(self) -> None:
         self._assert_planted("compose", "compose")
+
+    # --- service teardown (skillbox-selftest-service-teardown-bw03) ---------
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def test_a_lane_that_leaks_a_service_is_reaped_and_recorded(self) -> None:
+        """A passing lane must not be allowed to outlive the gate.
+
+        Suites boot services declared in runtime.yaml inside TemporaryDirectory
+        sandboxes. Deleting the sandbox never signalled them, so they reparented
+        to PID 1 and piled up (~950 pairs -> load ~1267 on 8 vCPUs). The lane
+        still passes, which is why this went unnoticed; the leak is only visible
+        as a surviving process.
+        """
+        pidfile = Path(tempfile.mkdtemp(dir=self._tmp.name)) / "leaked.pid"
+        result, receipts = self._run_gate(plant="leak-3.11", leak_pidfile=pidfile)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        receipt = self._receipt(receipts)
+        # The leak must not be laundered into a lane failure: the lane passed.
+        self.assertEqual("pass", receipt["status"])
+
+        self.assertTrue(pidfile.exists(), "planted lane never recorded a service pid")
+        leaked_pid = int(pidfile.read_text(encoding="utf-8").strip())
+
+        self.assertFalse(
+            self._pid_alive(leaked_pid),
+            f"pid {leaked_pid} survived the gate: the lane's process group was not reaped",
+        )
+
+        leaking_lane = next(item for item in receipt["lanes"] if item["id"] == "test-3.11")
+        self.assertTrue(
+            leaking_lane["reaped_stray_processes"],
+            "receipt must record that this lane left processes behind",
+        )
+        self.assertIn("reaping stray processes", result.stderr)
+
+    def test_clean_lanes_are_not_reported_as_reaped(self) -> None:
+        """The reaped flag has to mean something: a well-behaved run sets none."""
+        _, receipts = self._run_gate()
+        receipt = self._receipt(receipts)
+        self.assertEqual(
+            [],
+            [lane["id"] for lane in receipt["lanes"] if lane["reaped_stray_processes"]],
+        )
 
     def test_missing_pinned_interpreter_fails_closed_instead_of_skipping(self) -> None:
         # "Python-version" planted failure: a reduced matrix is the exact
@@ -696,6 +791,48 @@ class ReceiptRetentionTests(unittest.TestCase):
     def test_gate_serializes_concurrent_runs(self) -> None:
         text = GATE.read_text(encoding="utf-8")
         self.assertIn("flock", text)
+
+
+class ContractLintLaneTests(unittest.TestCase):
+    """The contract lint belongs to the repo-owned gate, not to CI alone.
+
+    A CI-only check would be a second authority: trusted-main pushes never reach
+    Actions (skillbox-6r53), so a lint that lived only there would not run on the
+    path it most needs to guard.
+    """
+
+    def setUp(self) -> None:
+        self.gate = GATE.read_text(encoding="utf-8")
+        self.ci = CI_WORKFLOW.read_text(encoding="utf-8")
+
+    def test_the_canonical_gate_runs_the_lint_as_its_own_lane(self) -> None:
+        self.assertIn('run_lane "contract"', self.gate)
+        self.assertIn("contract-lint --format json", self.gate)
+
+    def test_the_lane_id_is_documented_in_the_usage_text(self) -> None:
+        self.assertIn("contract test-3.11", self.gate)
+
+    def test_ci_runs_the_same_command(self) -> None:
+        self.assertIn("contract-lint --format json", self.ci)
+
+    def test_ci_gained_no_push_trigger(self) -> None:
+        """The trust boundary is unchanged by adding a job."""
+        self.assertNotRegex(self.ci, r"(?m)^\s{0,2}push:")
+        self.assertIn("pull_request:", self.ci)
+        self.assertIn("workflow_dispatch:", self.ci)
+
+    def test_the_lint_lane_needs_no_docker_network_or_operator_state(self) -> None:
+        """Fresh-checkout compatible: the stop condition for this node."""
+        lane = self.gate.split('run_lane "contract"', 1)[1].split("\n\n", 1)[0]
+        for forbidden in ("docker", "ssh", "curl", "SKILLBOX_DO_TOKEN"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, lane)
+
+    def test_the_ci_job_installs_only_the_pinned_pure_python_deps(self) -> None:
+        job = self.ci.split("  contract:", 1)[1].split("\n  test:", 1)[0]
+        self.assertIn("PyYAML==${PYYAML_VERSION}", job)
+        self.assertIn("cryptography==${CRYPTOGRAPHY_VERSION}", job)
+        self.assertNotIn("docker", job)
 
 
 if __name__ == "__main__":

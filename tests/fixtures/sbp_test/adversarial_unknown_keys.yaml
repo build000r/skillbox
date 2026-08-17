@@ -1,0 +1,9 @@
+schema_version: 1
+units:
+  typo:
+    command: ["true"]
+    timeout: 30
+    retries: 3
+groups:
+  default: [typo]
+surprise: true

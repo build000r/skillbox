@@ -1,0 +1,343 @@
+{
+  "authority": {
+    "gating": "only a proven finding whose blocks denies the requested intent",
+    "likely_gates": false,
+    "omission_is_unknown": true,
+    "readiness_scope": "the v1 code subset only, never the ten-axis model",
+    "rollup": "advisory",
+    "rollup_authority_note": "the numeric rollup never gates; 'the scorer is the gate' was withdrawn post-reveal because a number an agent can optimize becomes the target",
+    "severity_gates": false,
+    "unknown_gates": false,
+    "unknown_passes": false
+  },
+  "axis_model": {
+    "axes": [
+      {
+        "codes": [
+          "TARGET_MONOLITHIC"
+        ],
+        "id": "entrypoint_clarity",
+        "ordinal": 1,
+        "question": "Are there named, non-interactive commands with stable exit semantics?",
+        "title": "Entrypoint clarity",
+        "v1_covered": true
+      },
+      {
+        "codes": [
+          "CROSS_MACHINE_PARTITION_MISSING",
+          "PACKAGE_LANES_UNENUMERATED",
+          "SERVICE_REQUIREMENT_UNDERIVED"
+        ],
+        "id": "selection_completeness",
+        "ordinal": 2,
+        "question": "Do the declared units cover the serial oracle, with explicit exclusions?",
+        "title": "Selection completeness",
+        "v1_covered": true
+      },
+      {
+        "codes": [
+          "PATH_FRAGILE"
+        ],
+        "id": "workspace_isolation",
+        "ordinal": 3,
+        "question": "Are temp/output/cache paths and repo-root assumptions per-run and portable?",
+        "title": "Workspace isolation",
+        "v1_covered": true
+      },
+      {
+        "codes": [
+          "SERVICE_FREE_LANE_MISSING"
+        ],
+        "id": "service_isolation",
+        "ordinal": 4,
+        "question": "Are databases, caches and containers namespaced, owned, health-checked and torn down?",
+        "title": "Service isolation",
+        "v1_covered": true
+      },
+      {
+        "codes": [
+          "EXTERNAL_SCHEDULER_LOCK_SEAM_MISSING",
+          "SERVICE_ENDPOINT_STATIC"
+        ],
+        "id": "concurrency_safety",
+        "ordinal": 5,
+        "question": "Do shared files, singleton locks, global ports or order dependence break concurrent runs?",
+        "title": "Concurrency safety",
+        "v1_covered": true
+      },
+      {
+        "codes": [
+          "SERVICE_IMAGES_UNPINNED"
+        ],
+        "id": "determinism",
+        "ordinal": 6,
+        "question": "Do repeated runs agree, with fixed seeds and no unpinned time/network/image inputs?",
+        "title": "Determinism",
+        "v1_covered": true
+      },
+      {
+        "codes": [],
+        "id": "resource_declaration",
+        "ordinal": 7,
+        "question": "Are OS, architecture, tooling, memory/disk, secrets and network posture declared?",
+        "title": "Resource declaration",
+        "v1_covered": false
+      },
+      {
+        "codes": [
+          "RECEIPT_NOT_COMPOSABLE"
+        ],
+        "id": "observability",
+        "ordinal": 8,
+        "question": "Are exit codes, logs, reports and artifact paths machine-readable and bounded?",
+        "title": "Observability",
+        "v1_covered": true
+      },
+      {
+        "codes": [],
+        "id": "source_fidelity",
+        "ordinal": 9,
+        "question": "Does the suite behave on a dirty tree, with generated prerequisites and pinned toolchains?",
+        "title": "Source fidelity",
+        "v1_covered": false
+      },
+      {
+        "codes": [],
+        "id": "failure_cleanup",
+        "ordinal": 10,
+        "question": "On timeout or failure, are child processes, services and workspaces actually cleaned up?",
+        "title": "Failure cleanup",
+        "v1_covered": false
+      }
+    ],
+    "axes_total": 10,
+    "not_covered_in_v1_axis_ids": [
+      "failure_cleanup",
+      "resource_declaration",
+      "source_fidelity"
+    ],
+    "v1_covered_axis_ids": [
+      "concurrency_safety",
+      "determinism",
+      "entrypoint_clarity",
+      "observability",
+      "selection_completeness",
+      "service_isolation",
+      "workspace_isolation"
+    ]
+  },
+  "codes": [
+    {
+      "axis": "selection_completeness",
+      "blocks": "optimization-only",
+      "code": "CROSS_MACHINE_PARTITION_MISSING",
+      "default_severity": "high",
+      "denied_intents": [],
+      "detects": "the big suite has no cross-machine partition vocabulary (in-process sharding is not one)",
+      "duel_origin": "SHARD_VOCAB_MISSING",
+      "fragment_safe": false,
+      "invariant": "the suite can be partitioned into disjoint subsets addressable from the CLI",
+      "recipe_id": "suite-refactor/cross-machine-partition"
+    },
+    {
+      "axis": "concurrency_safety",
+      "blocks": "parallel",
+      "code": "EXTERNAL_SCHEDULER_LOCK_SEAM_MISSING",
+      "default_severity": "high",
+      "denied_intents": [
+        "parallel"
+      ],
+      "detects": "the only entrypoint serializes itself, so an external scheduler cannot own ordering",
+      "duel_origin": "LOCK_SEAM_MISSING",
+      "fragment_safe": false,
+      "invariant": "the suite exposes a way to run its work without taking its own global lock",
+      "recipe_id": "suite-refactor/external-scheduler-seam"
+    },
+    {
+      "axis": "selection_completeness",
+      "blocks": "parallel",
+      "code": "PACKAGE_LANES_UNENUMERATED",
+      "default_severity": "medium",
+      "denied_intents": [
+        "parallel"
+      ],
+      "detects": "test packages exist that no declared entrypoint runs, so the unit union is not the suite",
+      "duel_origin": "JS_AGGREGATOR_MISSING",
+      "fragment_safe": true,
+      "invariant": "every test-bearing package is reachable from a declared aggregate entrypoint",
+      "recipe_id": "suite-refactor/enumerate-package-lanes"
+    },
+    {
+      "axis": "workspace_isolation",
+      "blocks": "remote",
+      "code": "PATH_FRAGILE",
+      "default_severity": "high",
+      "denied_intents": [
+        "remote"
+      ],
+      "detects": "../.. or absolute paths threaded through targets break the moment the tree moves",
+      "duel_origin": null,
+      "fragment_safe": true,
+      "invariant": "no target depends on an absolute path or a path that escapes the repo root",
+      "recipe_id": "suite-refactor/repo-relative-paths"
+    },
+    {
+      "axis": "observability",
+      "blocks": "parallel",
+      "code": "RECEIPT_NOT_COMPOSABLE",
+      "default_severity": "high",
+      "denied_intents": [
+        "parallel"
+      ],
+      "detects": "proof exists only whole-tree, so a fanned-out run cannot be aggregated honestly",
+      "duel_origin": null,
+      "fragment_safe": true,
+      "invariant": "proof of a run composes from per-unit evidence",
+      "recipe_id": "suite-refactor/composable-receipts"
+    },
+    {
+      "axis": "concurrency_safety",
+      "blocks": "parallel",
+      "code": "SERVICE_ENDPOINT_STATIC",
+      "default_severity": "high",
+      "denied_intents": [
+        "parallel"
+      ],
+      "detects": "a fixed port or fixed socket path makes two concurrent runs collide",
+      "duel_origin": "SERVICES_STATIC_PORT",
+      "fragment_safe": false,
+      "invariant": "service endpoints are allocated per run and injected by environment",
+      "recipe_id": "suite-refactor/dynamic-service-endpoints"
+    },
+    {
+      "axis": "service_isolation",
+      "blocks": "parallel",
+      "code": "SERVICE_FREE_LANE_MISSING",
+      "default_severity": "high",
+      "denied_intents": [
+        "parallel"
+      ],
+      "detects": "every declared lane needs a database, cache or container to start",
+      "duel_origin": "UNIT_DB_FREE_MISSING",
+      "fragment_safe": false,
+      "invariant": "at least one declared lane runs to completion with no external service",
+      "recipe_id": "suite-refactor/service-free-lane"
+    },
+    {
+      "axis": "determinism",
+      "blocks": "caching",
+      "code": "SERVICE_IMAGES_UNPINNED",
+      "default_severity": "medium",
+      "denied_intents": [
+        "caching"
+      ],
+      "detects": "a floating tag means two runs of the same tree can test different software",
+      "duel_origin": null,
+      "fragment_safe": false,
+      "invariant": "every external service image is pinned by digest",
+      "recipe_id": "suite-refactor/pin-service-images"
+    },
+    {
+      "axis": "selection_completeness",
+      "blocks": "parallel",
+      "code": "SERVICE_REQUIREMENT_UNDERIVED",
+      "default_severity": "medium",
+      "denied_intents": [
+        "parallel"
+      ],
+      "detects": "service markers are maintained by hand, so the service-free lane drifts silently",
+      "duel_origin": "MARKERS_HAND_ANNOTATED",
+      "fragment_safe": false,
+      "invariant": "a test's service requirement is derived from what it requests, not hand-labelled",
+      "recipe_id": "suite-refactor/derive-service-requirements"
+    },
+    {
+      "axis": "entrypoint_clarity",
+      "blocks": "optimization-only",
+      "code": "TARGET_MONOLITHIC",
+      "default_severity": "medium",
+      "denied_intents": [],
+      "detects": "the gate is an && chain, so a phase cannot be placed or retried on its own",
+      "duel_origin": null,
+      "fragment_safe": false,
+      "invariant": "the declared gate is separately invocable lanes, not one chain of phases",
+      "recipe_id": "suite-refactor/split-monolithic-target"
+    }
+  ],
+  "recipe_ids": [
+    "suite-refactor/composable-receipts",
+    "suite-refactor/cross-machine-partition",
+    "suite-refactor/derive-service-requirements",
+    "suite-refactor/dynamic-service-endpoints",
+    "suite-refactor/enumerate-package-lanes",
+    "suite-refactor/external-scheduler-seam",
+    "suite-refactor/pin-service-images",
+    "suite-refactor/repo-relative-paths",
+    "suite-refactor/service-free-lane",
+    "suite-refactor/split-monolithic-target"
+  ],
+  "schema": "suite-readiness/v1",
+  "schema_version": 1,
+  "vocabularies": {
+    "axis_states": [
+      "blocked",
+      "bounded",
+      "ready",
+      "not_covered_in_v1"
+    ],
+    "blocks": [
+      "any-execution",
+      "remote",
+      "parallel",
+      "caching",
+      "optimization-only"
+    ],
+    "denied_intents": {
+      "any-execution": [
+        "local",
+        "remote",
+        "parallel",
+        "caching"
+      ],
+      "caching": [
+        "caching"
+      ],
+      "optimization-only": [],
+      "parallel": [
+        "parallel"
+      ],
+      "remote": [
+        "remote"
+      ]
+    },
+    "evidence_kinds": [
+      "file",
+      "parsed_target",
+      "probe",
+      "absent"
+    ],
+    "intents": [
+      "local",
+      "remote",
+      "parallel",
+      "caching"
+    ],
+    "readiness_classes": [
+      "blocked",
+      "bounded",
+      "ready"
+    ],
+    "severities": [
+      "high",
+      "medium",
+      "low"
+    ],
+    "statuses": [
+      "proven",
+      "likely",
+      "unknown",
+      "blocked",
+      "not_applicable"
+    ]
+  }
+}

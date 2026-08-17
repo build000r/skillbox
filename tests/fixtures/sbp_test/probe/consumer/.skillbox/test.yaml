@@ -1,0 +1,8 @@
+schema_version: 1
+units:
+  unit-alpha:
+    command: [python3, -c, "print('alpha ok')"]
+  unit-beta:
+    command: [python3, -c, "print('beta ok')"]
+groups:
+  default: [unit-alpha, unit-beta]

@@ -1,0 +1,136 @@
+# Skillbox's own `sbp test` contract (schema v1) — the zeroth consumer.
+#
+# `scripts/self-test.sh` is a proto-`sbp test` already: lanes, an isolated
+# checkout of an exact SHA, a pinned 3.11/3.12/3.13 matrix, a durable
+# `skillbox.self-test.receipt/1`, a flock, and a pre-push consumer. This file
+# expresses those same lanes as an sbp-test manifest so the two formats can be
+# compared run-over-run.
+#
+# AUTHORITY: `scripts/self-test.sh` remains the release gate. It stays
+# authoritative until FIVE consecutive dual-format pre-push runs agree on the
+# verdict AND on every per-lane outcome (review repair: N is pinned at 5; an
+# operator may raise N, never lower it). `runtime_manager.sbp_test_parity`
+# enforces that ledger, so the migration cannot be declared done by assertion.
+# Until then this manifest is an observer, and the pre-push gate must not get
+# one bit flakier because of it.
+#
+# Unit ids are DELIBERATELY identical to the self-test lane ids. Parity between
+# two proof formats is only meaningful if the mapping is unambiguous, and an
+# identity mapping cannot silently drift the way a translation table can.
+#
+# Lanes are declared with no `depends_on`. self-test.sh runs them in a fixed
+# order, but that is sequencing, not dependency — recording an order as a
+# dependency would invent a constraint the gate does not actually have, and
+# would serialize units that are free to run in parallel.
+schema_version: 1
+
+units:
+  # --- static lanes -------------------------------------------------------
+  lint:
+    command: [python3, -m, ruff, check, .]
+    timeout_s: 300
+    cache: never
+    requires:
+      caps: [python]
+
+  shellcheck:
+    command:
+      [
+        shellcheck,
+        --severity=warning,
+        scripts/self-test.sh,
+        install.sh,
+        .githooks/pre-commit,
+        .githooks/pre-push,
+      ]
+    timeout_s: 300
+    cache: never
+    requires:
+      os: [linux, darwin]
+      caps: [shellcheck]
+
+  render:
+    command: [python3, scripts/04-reconcile.py, render]
+    timeout_s: 300
+    requires:
+      python: ">=3.11"
+
+  # Read-only cross-surface command contract: it introspects parsers, the
+  # registry, the Makefile and the checked-in baselines and runs nothing.
+  contract:
+    command: [python3, .env-manager/manage.py, contract-lint, --format, json]
+    timeout_s: 300
+    requires:
+      python: ">=3.11"
+
+  # --- the pinned interpreter matrix, as PARALLEL units -------------------
+  # self-test.sh walks 3.11/3.12/3.13 in a loop; here they are three
+  # independent units with no resource_group, so a wave-concurrent executor may
+  # run them at once under its slot cap. That is the whole point of expressing
+  # the matrix as units rather than as a loop.
+  test-3.11:
+    command: [python3.11, -m, unittest, discover, -s, tests]
+    timeout_s: 3600
+    requires:
+      python: ">=3.11"
+      caps: [python-3.11]
+    env: [SKILLBOX_STATE_ROOT, HOME, PATH]
+
+  test-3.12-coverage:
+    command: [python3.12, -m, coverage, run, --source=scripts,.env-manager, -m, unittest, discover, -s, tests]
+    timeout_s: 3600
+    artifacts: [coverage.xml]
+    requires:
+      python: ">=3.12"
+      caps: [python-3.12, coverage]
+    env: [SKILLBOX_STATE_ROOT, HOME, PATH]
+
+  test-3.13:
+    command: [python3.13, -m, unittest, discover, -s, tests]
+    timeout_s: 3600
+    requires:
+      python: ">=3.13"
+      caps: [python-3.13]
+    env: [SKILLBOX_STATE_ROOT, HOME, PATH]
+
+  # --- compose config -----------------------------------------------------
+  # Declared with a `docker` cap so a machine without Docker reports "cannot
+  # host this unit" instead of pretending the check passed. Deliberately NOT in
+  # `default`: fast feedback must never need a daemon.
+  compose:
+    command:
+      [
+        docker,
+        compose,
+        --env-file,
+        .env.example,
+        -f,
+        docker-compose.yml,
+        -f,
+        docker-compose.monoserver.yml,
+        config,
+        -q,
+      ]
+    timeout_s: 600
+    requires:
+      caps: [docker]
+
+groups:
+  # Fast feedback: no Docker, no interpreter matrix, no full suite.
+  default: [lint, render, contract]
+  # Everything this repo can check without Docker.
+  full: [lint, shellcheck, render, contract, test-3.11, test-3.12-coverage, test-3.13]
+  # The exact lane set scripts/self-test.sh runs — the parity target. Running
+  # this group and the canonical gate on the same commit is what produces one
+  # dual-format observation for the N=5 ledger.
+  gate:
+    [
+      lint,
+      shellcheck,
+      render,
+      contract,
+      test-3.11,
+      test-3.12-coverage,
+      test-3.13,
+      compose,
+    ]

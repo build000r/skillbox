@@ -1,0 +1,7 @@
+schema_version: 1
+units:
+  a:
+    command: ["true"]
+    depends_on: [ghost]
+groups:
+  default: [a]

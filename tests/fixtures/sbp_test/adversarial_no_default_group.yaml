@@ -1,0 +1,6 @@
+schema_version: 1
+units:
+  a:
+    command: ["true"]
+groups:
+  full: [a]

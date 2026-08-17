@@ -1,0 +1,33 @@
+{
+  "findings": [
+    {
+      "code": "unsafe_cwd",
+      "location": "cwd",
+      "message": "`cwd` escapes the repository root: '../../etc'",
+      "unit": "escapes"
+    },
+    {
+      "code": "unsafe_cwd",
+      "location": "cwd",
+      "message": "`cwd` must be repo-relative, got absolute path '/etc'",
+      "unit": "absolute"
+    },
+    {
+      "code": "unsafe_cwd",
+      "location": "cwd",
+      "message": "`cwd` escapes the repository root: 'tests/../../outside'",
+      "unit": "sneaky"
+    }
+  ],
+  "groups": {
+    "default": [
+      "escapes"
+    ]
+  },
+  "manifest_parsed": true,
+  "unit_ids": [
+    "absolute",
+    "escapes",
+    "sneaky"
+  ]
+}

@@ -1,0 +1,70 @@
+# family/v1 — the sweet-potato family.
+#
+# A family is the set of co-deployed repos, services, data mounts, and external
+# enrollments that move together. This is the layer above BoxProfile, which
+# carries exactly one repo.
+#
+# Validated by runtime_manager.family_schema. Declaration only: snapshot, pause,
+# and resume execution live in sibling beads, and nothing reads this file to
+# start or stop anything.
+#
+# SANITIZED for a public remote. Member paths are repo-relative rather than
+# operator-absolute, and no host, address, or identity material appears — the
+# schema refuses L3 keys (machine_id, node_key, auth tokens) outright, because a
+# resumed family must come up with a fresh identity rather than impersonate its
+# ancestor. Pin `commit` per member when a snapshot is taken; null means "track
+# the branch".
+schema: family/v1
+name: sweet-potato
+
+members:
+  - repo: sweet-potato
+    path: repos/sweet-potato
+    branch: main
+    commit: null
+  - repo: htma
+    path: repos/htma
+    branch: main
+    commit: null
+  - repo: htma_server
+    path: repos/htma_server
+    branch: main
+    commit: null
+  - repo: cycle-chef
+    path: repos/cycle-chef
+    branch: main
+    commit: null
+  - repo: recipe-ios
+    path: repos/recipe-ios
+    branch: main
+    commit: null
+
+# What must come to rest before a data mount is snapshotted. `quiesce: none` is
+# a declaration, never an omission: a snapshot taken under an active writer is a
+# torn one, so silence must not be readable as "nothing to do".
+services:
+  - id: postgres
+    kind: database
+    quiesce: drain
+    version: null
+  - id: redis
+    kind: cache
+    quiesce: flush
+    version: null
+
+# L2 — the only layer that is actually snapshotted.
+data_mounts:
+  - id: pgdata
+    path: /srv/data/postgres
+  - id: uploads
+    path: /srv/data/uploads
+
+# External identity. Revoked on pause and re-issued fresh on resume; never
+# captured into a receipt.
+enrollments:
+  - id: tailscale
+    kind: tailscale
+    revoke_on_pause: true
+  - id: public-dns
+    kind: dns
+    revoke_on_pause: true

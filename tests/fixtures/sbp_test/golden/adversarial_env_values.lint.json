@@ -1,0 +1,25 @@
+{
+  "findings": [
+    {
+      "code": "env_value_supplied",
+      "location": "env",
+      "message": "`env` carries names only, never values; got 'TOKEN=hunter2'. A version-controlled manifest must not become a secret store.",
+      "unit": "leaky"
+    },
+    {
+      "code": "invalid_env_name",
+      "location": "env",
+      "message": "'lowercase' is not a valid environment variable name",
+      "unit": "leaky"
+    }
+  ],
+  "groups": {
+    "default": [
+      "leaky"
+    ]
+  },
+  "manifest_parsed": true,
+  "unit_ids": [
+    "leaky"
+  ]
+}

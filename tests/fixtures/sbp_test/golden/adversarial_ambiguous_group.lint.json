@@ -1,0 +1,19 @@
+{
+  "findings": [
+    {
+      "code": "ambiguous_group_membership",
+      "location": "groups.default",
+      "message": "group 'default' lists unit 'a' more than once; membership must be unambiguous",
+      "unit": "a"
+    }
+  ],
+  "groups": {
+    "default": [
+      "a"
+    ]
+  },
+  "manifest_parsed": true,
+  "unit_ids": [
+    "a"
+  ]
+}

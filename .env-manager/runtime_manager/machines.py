@@ -26,6 +26,12 @@ Path operations (all on :class:`MachinesConfig` / module helpers):
                                    machine's roots than ``machine``.
     ``classify_path(path)``        which machine(s)/roots a path lives under.
 
+Selection (on :class:`MachinesConfig`):
+    ``select_by_caps(required, ...)``     every profile declaring those caps.
+    ``require_one_by_caps(required, ...)`` the single match, or raise. Lets a
+                                   caller name a role instead of a host, so
+                                   fleet identity stays in the private config.
+
 Data classes:
     :class:`MachineProfile`, :class:`MachinesConfig`, :class:`MachineAlias`.
 """
@@ -331,6 +337,69 @@ class MachinesConfig:
         if machine in machines:
             return False
         return True
+
+    # -- selection -------------------------------------------------------
+
+    def select_by_caps(
+        self,
+        required: Iterable[str],
+        *,
+        trust: Iterable[str] | None = None,
+    ) -> tuple[MachineProfile, ...]:
+        """Every profile declaring all of ``required`` (and an allowed trust).
+
+        Selection by capability rather than by machine id is what lets a caller
+        name a *role* ("the WSL box") without hard-coding a host. That keeps
+        real fleet identity in the private ``machines.yaml`` instead of in the
+        tracked tree, which is the same reason the clipboard registry ships
+        sanitized ``.example`` targets.
+
+        Matching is exact on closed cap tokens; unknown tokens in ``required``
+        match nothing, because a typo must narrow to zero rather than silently
+        widen to everything.
+        """
+        wanted = frozenset(str(token).strip() for token in required if str(token).strip())
+        allowed_trust = (
+            None
+            if trust is None
+            else frozenset(str(value).strip() for value in trust if str(value).strip())
+        )
+        matches = []
+        for machine_id in sorted(self.machines):
+            profile = self.machines[machine_id]
+            if not wanted <= frozenset(profile.caps):
+                continue
+            if allowed_trust is not None and (profile.trust or "") not in allowed_trust:
+                continue
+            matches.append(profile)
+        return tuple(matches)
+
+    def require_one_by_caps(
+        self,
+        required: Iterable[str],
+        *,
+        trust: Iterable[str] | None = None,
+    ) -> MachineProfile:
+        """The single profile matching ``required``, or raise.
+
+        Zero matches and several matches are both errors: a fleet target that
+        resolves ambiguously is exactly the drift this selection exists to
+        catch, so it must never silently pick the first one.
+        """
+        matches = self.select_by_caps(required, trust=trust)
+        wanted = ", ".join(sorted(str(token) for token in required)) or "(none)"
+        if not matches:
+            raise MachinesConfigError(
+                f"No machine declares caps [{wanted}]. "
+                f"Declared machines: {', '.join(sorted(self.machines)) or '(none)'}."
+            )
+        if len(matches) > 1:
+            found = ", ".join(profile.machine_id for profile in matches)
+            raise MachinesConfigError(
+                f"Caps [{wanted}] match several machines ({found}); "
+                "narrow the requirement so the target resolves to exactly one."
+            )
+        return matches[0]
 
 
 # ---------------------------------------------------------------------------

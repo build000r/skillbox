@@ -39,7 +39,7 @@ DEV_SHIM_BINS := npm pnpm yarn vite next astro
 
 E2E_SMOKE_ARGS := $(if $(strip $(FORMAT)),--format $(FORMAT),) $(if $(filter 1 true yes,$(STRICT)),--strict,) $(ARGS)
 
-.PHONY: help bootstrap-env install-hooks self-test self-test-worktree self-test-refresh render doctor acceptance runtime-render runtime-sync runtime-status runtime-skills runtime-skill-audit runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity e2e-smoke git-estate-e2e python-cov-xml wrappers-install dev-shims-install build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles box-register box-unregister
+.PHONY: help bootstrap-env install-hooks self-test self-test-worktree self-test-refresh render doctor acceptance runtime-render runtime-sync runtime-status runtime-skills runtime-skill-audit runtime-bootstrap runtime-up runtime-down runtime-restart runtime-logs onboard first-box context dev-sanity dcg-reconcile dcg-verify dcg-relinquish e2e-smoke git-estate-e2e python-cov-xml wrappers-install dev-shims-install build up up-surfaces down shell logs pulse-start pulse-stop pulse-status swimmers-install swimmers-start swimmers-stop swimmers-restart swimmers-status swimmers-logs swimmers-runtime-status box-up box-down box-status box-list box-ssh box-profiles box-register box-unregister
 
 help:
 	@printf "  make bootstrap-env  Seed .skillbox-state/operator/.env from .env.example if missing\n"
@@ -85,7 +85,7 @@ help:
 	@printf "  make swimmers-logs           Tail swimmers server logs inside the workspace container\n"
 	@printf "  make swimmers-runtime-status Summarize the runtime-manager swimmers overlay state\n"
 	@printf "  make box-up         Create a DO+Tailscale box (BOX=id PROFILE=dev-small DEPLOY_MANIFEST=path; default BLUEPRINT=SPAPS auth)\n"
-	@printf "  make box-down       Drain and destroy a box (BOX=id)\n"
+	@printf "  make box-down       Drain and destroy a box (BOX=id; DRY_RUN=1 to preview, CONFIRM=id for real teardown)\n"
 	@printf "  make box-status     Check health of a box (BOX=id, omit for all)\n"
 	@printf "  make box-list       List all active boxes\n"
 	@printf "  make box-ssh        SSH into a box (BOX=id)\n"
@@ -94,8 +94,10 @@ help:
 	@printf "  make box-unregister Remove a registered shared box from local inventory (BOX=id)\n"
 
 bootstrap-env: install-hooks
-	@mkdir -p $(_STATE_ROOT)/operator
-	@test -f $(_STATE_ROOT)/operator/.env || test -f ./.env || cp .env.example $(_STATE_ROOT)/operator/.env
+	@# Delegated so the write happens under the single-writer state-root lease:
+	@# a recipe cannot take it, and this is the one Make target that mutates the
+	@# state root. The script preserves the previous semantics exactly.
+	@python3 scripts/bootstrap-operator-env.py
 
 install-hooks:
 	@if git rev-parse --git-dir >/dev/null 2>&1; then \
@@ -170,6 +172,24 @@ dev-sanity:
 
 e2e-smoke:
 	@./scripts/e2e-smoke.sh $(E2E_SMOKE_ARGS)
+
+# DCG lifecycle. One contract, shared with install.sh, first-box, onboard,
+# runtime-sync, and box deploy; the shell never re-implements convergence.
+# Exits nonzero when the Codex hook still needs operator trust (exit 3).
+dcg-reconcile:
+	@PYTHONPATH=.env-manager:scripts python3 -m runtime_manager.dcg_lifecycle \
+		apply --entrypoint box-deploy --scope host --from-model . $(DCG_ARGS)
+
+dcg-verify:
+	@PYTHONPATH=.env-manager:scripts python3 -m runtime_manager.dcg_lifecycle \
+		verify --entrypoint box-deploy --scope host --from-model . $(DCG_ARGS)
+
+# Explicit removal path. Removes ONLY DCG-owned hook entries and marker-stamped
+# policy; safe to run twice (the second run is "unchanged", not an error).
+dcg-relinquish:
+	@PYTHONPATH=.env-manager:scripts python3 -m runtime_manager.dcg_lifecycle \
+		relinquish --entrypoint box-deploy --scope host --from-model . $(DCG_ARGS)
+
 
 git-estate-e2e:
 	@./scripts/git-estate-e2e.sh
@@ -251,8 +271,15 @@ BOX_ARGS := $(if $(strip $(BOX)),$(BOX),)
 box-up:
 	@python3 scripts/box.py up $(BOX_ARGS) --profile $(or $(PROFILE),dev-small) $(DEPLOY_MANIFEST_ARGS) $(BLUEPRINT_ARGS) $(SET_ARGS) $(RESUME_ARGS)
 
+# box-down is a pass-through, never a gate. DRY_RUN selects the preview flag and
+# CONFIRM forwards the operator-supplied identity verbatim; scripts/box.py still
+# decides, and it only accepts --confirm when the value equals the box id. There
+# is deliberately no YES=1 shortcut: a bare truthy flag would let a caller
+# confirm a teardown without ever naming the box it destroys.
+BOX_DOWN_ARGS := $(strip $(if $(strip $(DRY_RUN)),--dry-run) $(if $(strip $(CONFIRM)),--confirm $(strip $(CONFIRM))))
+
 box-down:
-	@python3 scripts/box.py down $(BOX_ARGS)
+	@python3 scripts/box.py down $(BOX_ARGS) $(BOX_DOWN_ARGS)
 
 box-status:
 	@python3 scripts/box.py status $(BOX_ARGS)

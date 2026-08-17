@@ -166,6 +166,30 @@ should feel durable, legible, and agent-friendly.
 | Operator MCP tools | Fleet lifecycle exposed to coding agents with structured outputs and server-side safety gates. | [API reference](docs/API_REFERENCE.md) |
 | In-box MCP tools | **Deprecated and frozen.** Use the robot CLI (`manage.py <command> --format json`) plus skills instead. | [Deprecation record](docs/ARCHITECTURE.md#9-deprecations) |
 
+## Destructive Command Guard (DCG)
+
+Skillbox converges a pinned `dcg` PreToolUse hook for Claude, Codex, and Grok, so
+an agent's shell command is judged before it runs. Setup is one idempotent
+command, and removal is explicit:
+
+```bash
+make dcg-reconcile     # converge binary + policy + hooks
+make dcg-verify        # read-only convergence verdict
+make dcg-relinquish    # remove DCG-owned hooks and policy
+```
+
+**What it does not cover, stated up front:** a command you type into a **direct
+shell** never passes through an agent hook, Codex `unified_exec` keeps a session
+open where the hook sees the invocation but not each command inside it, and a
+Codex hook the operator has not trusted does not run at all. A `healthy` verdict
+means the hook contract is converged — not that nothing runs unguarded.
+
+Codex trust is a human step (`CODEX_HOOK_TRUST_REQUIRED`, exit 3): trust the hook
+in Codex's own review modal. Never pass `--dangerously-bypass-hook-trust`.
+
+Details, upgrade/rollback behaviour, and uninstall:
+[docs/operations.md](docs/operations.md#dcg-destructive-command-guard).
+
 ## Documentation Map
 
 | Topic | Start here |
@@ -175,6 +199,7 @@ should feel durable, legible, and agent-friendly.
 | Client init, focus, first-box, projection, opening, and publish flows | [docs/clients.md](docs/clients.md) |
 | Skill repos, lockfiles, visibility, forge, and distribution | [docs/skills.md](docs/skills.md) |
 | Focus, pulse, workers, swimmers, fleet operations, and MCP operations | [docs/operations.md](docs/operations.md) |
+| DCG setup, verify semantics, Codex trust, upgrade, rollback, uninstall | [docs/operations.md](docs/operations.md#dcg-destructive-command-guard) |
 | Troubleshooting and known limitations | [docs/troubleshooting.md](docs/troubleshooting.md) |
 | Product stance and common questions | [docs/faq.md](docs/faq.md) |
 | Tailnet-only lifecycle and recovery | [docs/tailnet-only-lifecycle.md](docs/tailnet-only-lifecycle.md) |

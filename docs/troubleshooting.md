@@ -169,8 +169,70 @@ operator who has already proven a non-proxy route
 - Paste the returned path into chat, or repair the one-key path with
   `clipboard-paste doctor`.
 
+## DCG recovery
+
+Full setup, verify semantics, upgrade and uninstall live in
+[operations.md](operations.md#dcg-destructive-command-guard). This section is
+the "it is not healthy, now what" path.
+
+Start with the read-only verdict — it never changes anything:
+
+```bash
+python3 .env-manager/manage.py dcg-reconcile --action verify --format json
+python3 .env-manager/manage.py doctor --format json      # `dcg` check, read `dcg_status`
+```
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| exit 3, `codex_trust: absent` (**CODEX_HOOK_TRUST_REQUIRED**) | Codex has never trusted the hook | Start Codex in this home and trust the `dcg` hook in its review modal |
+| exit 3, `codex_trust: stale` | the hook changed since it was trusted | Re-trust it in the same modal; the persisted hash no longer matches |
+| `BINARY_VERSION_MISMATCH` | installed `dcg` differs from the pin | Re-run `make dcg-reconcile`; never "fix" it by installing latest |
+| `POLICY_FAIL_OPEN` | policy lost `fail_closed = true` | Re-run `make dcg-reconcile` to re-render the policy |
+| `HOOK_DUPLICATE` | a second DCG entry was added by hand | Re-run `make dcg-reconcile`; it de-duplicates DCG-owned entries |
+| Hooks look right but nothing is guarded | the command never reached a hook | Expected for a **direct shell** or `unified_exec` — see the coverage table |
+
+Rules that matter more than any individual fix:
+
+- **Never hand-edit `~/.claude/settings.json`, `~/.codex/hooks.json`,
+  `~/.grok/hooks/dcg.json` or the rendered policy to make a check pass.** A
+  hand-edited hook drifts on the next converge, and the edit is invisible to the
+  ledger, so `rollback` cannot undo it. Re-run `make dcg-reconcile` instead.
+- **Never pass `--dangerously-bypass-hook-trust`.** It yields a host that
+  advertises a hook while nothing enforces it.
+- **Never install an unpinned or `latest` build to clear a version mismatch.**
+  The pin is the contract; convergence verifies against it.
+
+If convergence made something worse, `runtime_manager.dcg_reconcile.rollback()`
+restores the bytes from the last mutating run. It depends on the ledger and
+backup set, so a prior `--purge` removes that option.
+
+To verify a fix end to end without touching your real home, use a disposable
+one — this is the flow the operator docs are tested against:
+
+```bash
+python3 - <<'PY'
+import sys, tempfile
+from pathlib import Path
+sys.path.insert(0, ".env-manager")
+from runtime_manager import dcg_reconcile as R
+home = Path(tempfile.mkdtemp()) / "home"; home.mkdir(parents=True)
+print(R.apply(home)["status"])      # needs-operator-action (Codex trust is absent)
+print(R.verify(home)["status"])     # still needs-operator-action
+PY
+```
+
+It reports `needs-operator-action` until the Codex hook is trusted, and
+`healthy` afterwards. That transition is the point: trust is a human step, and
+nothing in Skillbox forges it.
+
 ## Limitations
 
+- **DCG does not guard every command.** It is a PreToolUse hook, so a command
+  typed into a **direct shell** never reaches it, and Codex `unified_exec` keeps
+  a session open where DCG sees the invocation but not each subsequent command.
+  A `healthy` DCG check means the hook contract is converged — not that nothing
+  runs unguarded. `manage.py doctor` prints these limitations on every run,
+  healthy included, for exactly that reason.
 - This is not a hosted control plane or a multi-user workspace platform.
 - Skill distribution is still private and explicit: local publisher, preview,
   sync, and rollback primitives are implemented, but a hosted distributor

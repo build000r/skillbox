@@ -125,6 +125,8 @@ __all__ = [
     "READ_ONLY_GIT_ENV",
     "STASH_HEAVY_THRESHOLD",
     "ScanResult",
+    "UpstreamMismatch",
+    "effective_ahead_behind",
     "default_scan_roots",
     "discover_repos",
     "primary_class_counts",
@@ -188,6 +190,9 @@ ALL_CLASSES = frozenset(
         "diverged-clean",
         "mid-op",
         "no-remote",
+        # A branch with no upstream inside a store that HAS a remote. Distinct
+        # from no-remote on purpose: the work has somewhere to go.
+        "unpublished-branch",
         "clean-current",
         "blocked",
     }
@@ -200,6 +205,7 @@ PRIMARY_CLASSES = (
     "dirty",
     "stash-heavy",
     "no-remote",
+    "unpublished-branch",
     "diverged-clean",
     "behind-clean",
     "ahead-clean",
@@ -239,6 +245,29 @@ _MID_OP_MARKERS: tuple[tuple[str, str, bool], ...] = (
 
 
 @dataclass(frozen=True)
+class UpstreamMismatch:
+    """A branch whose configured upstream is not the ref that holds its commits.
+
+    ``ahead_vs_same_name == 0`` is the whole claim: every local commit is
+    already present on ``same_name``, so the ahead/behind measured against
+    ``configured`` describes a config artifact, not unpublished work.
+    """
+
+    configured: str
+    same_name: str
+    ahead_vs_same_name: int
+    behind_vs_same_name: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "configured": self.configured,
+            "same_name": self.same_name,
+            "ahead_vs_same_name": self.ahead_vs_same_name,
+            "behind_vs_same_name": self.behind_vs_same_name,
+        }
+
+
+@dataclass(frozen=True)
 class GitRepoRecord:
     """One read-only classification of a single repository.
 
@@ -255,6 +284,15 @@ class GitRepoRecord:
     * ``branch_scan_note``: non-``None`` when the unpushed-branch scan was
       skipped (e.g. ``"branch scan skipped: 73 local branches"`` past
       :data:`BRANCH_SCAN_LIMIT`); doubles as the skipped flag.
+    * ``upstream_mismatch``: set when the branch's configured upstream is not
+      the ref holding its commits (see :func:`_probe_upstream_mismatch`). The
+      row's own ``ahead``/``behind`` stay as measured against the CONFIGURED
+      upstream; banding reads :func:`effective_ahead_behind` instead.
+    * ``remotes``: configured remotes as ``(name, url)`` pairs, read from
+      local config only (``to_dict`` projects ``[{"name", "url"}]``). This is
+      a *configuration* read, never a network one: no fetch, no ls-remote, so
+      it stays inside the read-only glance boundary. Ownership and push policy
+      are derived from these URLs one layer up, in ``git_estate``.
     * ``git_dir`` / ``common_dir``: this checkout's own git dir and the
       physical store it shares (both absolute and symlink-resolved, so
       aliases collapse to one key); ``None`` on a blocked probe or a git too
@@ -279,6 +317,8 @@ class GitRepoRecord:
     mid_op: str | None = None
     unpushed_branches: tuple[tuple[str, int], ...] = ()
     branch_scan_note: str | None = None
+    remotes: tuple[tuple[str, str], ...] = ()
+    upstream_mismatch: "UpstreamMismatch | None" = None
     bare: bool = False
     git_dir: str | None = None
     common_dir: str | None = None
@@ -306,6 +346,10 @@ class GitRepoRecord:
                 for name, ahead in self.unpushed_branches
             ],
             "branch_scan_note": self.branch_scan_note,
+            "remotes": [{"name": name, "url": url} for name, url in self.remotes],
+            "upstream_mismatch": (
+                self.upstream_mismatch.to_dict() if self.upstream_mismatch else None
+            ),
             "bare": self.bare,
             "git_dir": self.git_dir,
             "common_dir": self.common_dir,
@@ -564,9 +608,20 @@ def _parse_track_ahead(track: str) -> int:
 
 
 def _probe_unpushed_branches(
-    repo: str, head_branch: str, clock: _ProbeClock
+    repo: str,
+    head_branch: str,
+    clock: _ProbeClock,
+    *,
+    include_head: bool = False,
 ) -> tuple[tuple[tuple[str, int], ...], str | None]:
-    """(unpushed non-HEAD branches as (name, ahead) pairs, skip note).
+    """(unpushed branches as (name, ahead) pairs, skip note).
+
+    The HEAD branch is normally excluded: its own ahead/behind ride the record
+    directly. ``include_head=True`` puts it back in when it has NO upstream,
+    for the one case where nothing else would report it -- a store-backed
+    linked worktree, whose band no longer says ``no-remote`` and whose
+    upstream-less HEAD therefore has no other surface. Without this, demoting
+    that band would trade an overstatement for a silent omission.
 
     At most TWO subprocesses per repo, whatever the branch count:
 
@@ -607,7 +662,9 @@ def _probe_unpushed_branches(
         tip = parts[1].strip() if len(parts) > 1 else ""
         upstream = parts[2].strip() if len(parts) > 2 else ""
         track = parts[3].strip() if len(parts) > 3 else ""
-        if not name or name == head_branch:
+        if not name:
+            continue
+        if name == head_branch and not (include_head and not upstream):
             continue
         if upstream and track != "[gone]":
             ahead = _parse_track_ahead(track)
@@ -704,6 +761,32 @@ def _parse_status_v2(stdout: str) -> tuple[str, str | None, int, int, int, int, 
     return branch, upstream, ahead, behind, staged, unstaged, untracked
 
 
+def _probe_remotes(repo: str, clock: _ProbeClock) -> tuple[tuple[str, str], ...]:
+    """Configured remotes as sorted ``(name, url)`` pairs.
+
+    ``git remote -v`` reads local config and contacts nothing -- the glance
+    boundary forbids a fetch, and this keeps it. Only the ``(fetch)`` side is
+    kept: a push URL that differs is a publishing detail, and taking both would
+    make ownership derivation depend on which line came back first. A repo with
+    no remotes, or a git that fails the call, yields ``()`` and the caller
+    degrades to ownership-unknown rather than guessing.
+    """
+    proc = _run_git(repo, ["remote", "-v"], clock.call_timeout())
+    if proc.returncode != 0:
+        return ()
+    seen: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        if not line.endswith("(fetch)"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        name, url = parts[0].strip(), parts[1].strip()
+        if name and url and name not in seen:
+            seen[name] = url
+    return tuple(sorted(seen.items()))
+
+
 def _probe_upstream(repo: str, clock: _ProbeClock) -> tuple[str | None, int, int]:
     """(upstream, ahead, behind); upstream is None when HEAD has no upstream."""
     proc = _run_git(
@@ -727,6 +810,94 @@ def _probe_upstream(repo: str, clock: _ProbeClock) -> tuple[str | None, int, int
     return upstream, ahead, behind
 
 
+def _same_name_ref(branch: str, configured: str) -> str | None:
+    """``<remote>/<branch>`` for a branch whose upstream is NOT its own ref.
+
+    The remote is taken from the configured upstream rather than hard-coded to
+    ``origin``, so a fork whose branch tracks ``upstream/main`` is compared
+    against ``upstream/<branch>`` -- the ref that would actually explain its
+    commits. Returns ``None`` when there is nothing to compare: a detached
+    HEAD, an unparseable upstream, or an upstream that already IS the
+    same-name ref (the overwhelming majority, which therefore costs nothing).
+    """
+    if not branch or branch == BRANCH_DETACHED or "/" not in configured:
+        return None
+    remote = configured.split("/", 1)[0].strip()
+    if not remote:
+        return None
+    candidate = f"{remote}/{branch}"
+    return None if candidate == configured else candidate
+
+
+def _probe_upstream_mismatch(
+    repo: str,
+    branch: str,
+    configured: str,
+    ahead: int,
+    clock: _ProbeClock,
+) -> UpstreamMismatch | None:
+    """Detect a branch measured against the WRONG ref. One subprocess, no network.
+
+    The 2026-08-15 live run had ``cfo-qbo-control-plane`` sitting at the top of
+    the risk table as diverged 3/58 for months. Its 3 commits were already on
+    ``origin/codex/qbo-control-plane`` at identical SHA -- the branch's
+    configured upstream was ``origin/main``, so ahead/behind measured against a
+    ref that was never going to contain them. The scan trusted
+    ``branch.<name>.merge`` blindly; one local comparison exposes it.
+
+    Only runs when the row claims local commits (``ahead > 0``): with nothing
+    to explain there is no false divergence to kill, and normal repos pay
+    nothing. The comparison uses the last-fetched remote-tracking ref exactly
+    like every other count here -- no fetch, no ls-remote.
+
+    Returns ``None`` unless the same-name ref exists AND fully explains the
+    local commits (``ahead_vs_same_name == 0``). A branch that is genuinely
+    ahead of both refs is genuinely ahead, and is left alone.
+    """
+    if ahead <= 0:
+        return None
+    same_name = _same_name_ref(branch, configured)
+    if not same_name:
+        return None
+    # A missing ref makes rev-list fail; that IS the existence check, so the
+    # probe stays one subprocess instead of a verify + a count.
+    counts = _run_git(
+        repo,
+        ["rev-list", "--left-right", "--count", f"HEAD...{same_name}"],
+        clock.call_timeout(),
+    )
+    parts = counts.stdout.split()
+    if counts.returncode != 0 or len(parts) != 2:
+        return None
+    try:
+        ahead_vs, behind_vs = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if ahead_vs != 0:
+        return None
+    return UpstreamMismatch(
+        configured=configured,
+        same_name=same_name,
+        ahead_vs_same_name=ahead_vs,
+        behind_vs_same_name=behind_vs,
+    )
+
+
+def effective_ahead_behind(record: "GitRepoRecord") -> tuple[int, int]:
+    """Ahead/behind to BAND on: the same-name ref's numbers when the configured
+    upstream is misconfigured, the record's own otherwise.
+
+    ``record.ahead``/``record.behind`` stay honest about what the configured
+    upstream says -- that is a real fact about the repo's config, and rewriting
+    it would hide the misconfiguration instead of reporting it. Banding reads
+    through here so the RISK shown is the risk that exists.
+    """
+    mismatch = record.upstream_mismatch
+    if mismatch is None:
+        return record.ahead, record.behind
+    return mismatch.ahead_vs_same_name, mismatch.behind_vs_same_name
+
+
 def _classify(
     *,
     mid_op: str | None,
@@ -735,8 +906,23 @@ def _classify(
     upstream: str | None,
     ahead: int,
     behind: int,
+    linked_worktree: bool = False,
+    has_remote: bool = False,
 ) -> tuple[frozenset[str], str]:
-    """(class set, primary class) -- primary ranking matches repo_inventory.sh."""
+    """(class set, primary class) -- primary ranking matches repo_inventory.sh.
+
+    ``no-remote`` is the scariest non-blocked band: it reads as "this work
+    exists nowhere else". For a LINKED WORKTREE whose shared store has a
+    remote, that reading is false -- the commits are one ``git push`` from
+    safety, and the 2026-08-15 live run proved it by pushing four such
+    "orphaned" branches trivially once they were reclassified. So a linked
+    worktree backed by a store with a remote never takes the ``no-remote``
+    class; its band falls out of its own checkout state instead.
+
+    A linked worktree whose store genuinely has NO remote still bands
+    ``no-remote``, because then the reading is true.
+    """
+    store_backed = linked_worktree and has_remote
     classes: set[str] = set()
     if mid_op:
         classes.add("mid-op")
@@ -744,8 +930,12 @@ def _classify(
         classes.add("dirty")
     if stash_count >= 1:
         classes.add("stash")
-    if upstream is None:
+    if upstream is None and not store_backed:
         classes.add("no-remote")
+    elif upstream is None:
+        # Truth preserved without the scary band: the branch is unpublished,
+        # but the store it lives in has somewhere to publish to.
+        classes.add("unpublished-branch")
     else:
         if ahead > 0:
             classes.add("ahead")
@@ -762,8 +952,10 @@ def _classify(
         primary = "dirty"
     elif stash_count >= STASH_HEAVY_THRESHOLD:
         primary = "stash-heavy"
-    elif upstream is None:
+    elif upstream is None and not store_backed:
         primary = "no-remote"
+    elif upstream is None:
+        primary = "unpublished-branch"
     elif ahead > 0 and behind > 0:
         primary = "diverged-clean"
     elif behind > 0:
@@ -876,6 +1068,16 @@ def _probe(repo: str, clock: _ProbeClock) -> GitRepoRecord:
         upstream, ahead, behind = _probe_upstream(repo, clock)
 
     mid_op = _probe_mid_op(git_dir)
+    remotes = _probe_remotes(repo, clock)
+    resolved_git_dir = _resolve_git_path(repo, git_dir)
+    # Git's own definition of a linked worktree: its per-worktree git dir is
+    # not the shared store. Same rule the amp campaign guard uses, so the guard
+    # and the scan can never disagree about what is a worktree. Determined here
+    # (not down in _classify) because the branch scan below needs it too.
+    linked_worktree = bool(
+        resolved_git_dir and common_dir and resolved_git_dir != common_dir
+    )
+    store_backed = linked_worktree and bool(remotes)
     stash_count, stash_newest, stash_oldest = _probe_stash(repo, clock)
     # Bare repos are skipped: they usually ARE the remote, and "work parked on
     # a forgotten local branch" is a working-checkout risk, not a bare one.
@@ -883,17 +1085,31 @@ def _probe(repo: str, clock: _ProbeClock) -> GitRepoRecord:
     branch_scan_note: str | None = None
     if not bare:
         unpushed_branches, branch_scan_note = _probe_unpushed_branches(
-            repo, branch, clock
+            repo, branch, clock, include_head=store_backed and upstream is None
         )
 
     dirty = (staged + unstaged + untracked) > 0
+    # Kill the false-diverged class before classifying: a branch measured
+    # against the wrong ref must not reach the top of the risk table.
+    upstream_mismatch = None
+    if upstream and not bare:
+        upstream_mismatch = _probe_upstream_mismatch(
+            repo, branch, upstream, ahead, clock
+        )
+    band_ahead, band_behind = (
+        (upstream_mismatch.ahead_vs_same_name, upstream_mismatch.behind_vs_same_name)
+        if upstream_mismatch
+        else (ahead, behind)
+    )
     classes, primary = _classify(
         mid_op=mid_op,
         dirty=dirty,
         stash_count=stash_count,
         upstream=upstream,
-        ahead=ahead,
-        behind=behind,
+        ahead=band_ahead,
+        behind=band_behind,
+        linked_worktree=linked_worktree,
+        has_remote=bool(remotes),
     )
     return GitRepoRecord(
         path=repo,
@@ -912,8 +1128,10 @@ def _probe(repo: str, clock: _ProbeClock) -> GitRepoRecord:
         mid_op=mid_op,
         unpushed_branches=unpushed_branches,
         branch_scan_note=branch_scan_note,
+        remotes=remotes,
+        upstream_mismatch=upstream_mismatch,
         bare=bare,
-        git_dir=_resolve_git_path(repo, git_dir),
+        git_dir=resolved_git_dir,
         common_dir=common_dir,
         error=None,
     )

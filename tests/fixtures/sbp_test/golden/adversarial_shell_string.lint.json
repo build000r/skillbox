@@ -1,0 +1,15 @@
+{
+  "findings": [
+    {
+      "code": "command_not_argv",
+      "location": "command",
+      "message": "`command` must be an argv list, not a shell string; write ['pytest', ...] so execution needs no shell",
+      "unit": "shelly"
+    }
+  ],
+  "groups": {
+    "default": []
+  },
+  "manifest_parsed": true,
+  "unit_ids": []
+}

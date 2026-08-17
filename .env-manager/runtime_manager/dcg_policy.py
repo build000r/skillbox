@@ -320,9 +320,30 @@ class DcgSitePolicy:
         }
 
 
+# `sbp test` verb classification (skillbox-sbp-test-front-door-1y29).
+#
+# `sbp test`, `sbp test plan` and `sbp test lint` only read
+# `.skillbox/test.yaml`, so they are allowed by NOT being blocked -- this module
+# keeps no permissive default allowlist, and adding an allow rule for a verb
+# nothing blocks would spend a capped escape hatch on a no-op.
+#
+# `run` and `dispatch` will execute test units and fan work across the compute
+# fabric. They are blocked from day one, BEFORE an executor exists, so the guard
+# fails closed the moment that lands rather than inheriting an implicit allow.
+# `sbp testing`/`sbp test-plan` must not trip this, hence the anchored verb.
+SBP_TEST_EXECUTION_PATTERN = r"(?i)\bsbp\s+test\s+(?:run|dispatch)\b"
+SBP_TEST_EXECUTION_REASON = (
+    "`sbp test run` / `sbp test dispatch` execute or fan out test units and are "
+    "gated. Read the repo's test contract first with `sbp test --format json`, "
+    "`sbp test plan --format json`, or `sbp test lint --format json`, which are "
+    "read-only. Execution is not implemented in this slice; when it lands it "
+    "arrives with its own preview and confirmation contract."
+)
+
 DEFAULT_BLOCK_RULES: tuple[DcgBlockRule, ...] = (
     DcgBlockRule(TMUX_CAPTURE_PANE_PATTERN, TMUX_CAPTURE_PANE_REASON),
     DcgBlockRule(AGENT_MEMORY_WRITE_PATTERN, AGENT_MEMORY_WRITE_REASON),
+    DcgBlockRule(SBP_TEST_EXECUTION_PATTERN, SBP_TEST_EXECUTION_REASON),
 )
 
 

@@ -70,6 +70,8 @@ if str(SCRIPT_DIR) not in sys.path:
 from lib.opslib import (  # noqa: E402
     MARKER_SESSION_SCOPE_SESSION,
     MARKER_SOURCE_OPERATOR_MCP,
+    StateLeaseUnavailable,
+    active_state_lease,
     box_exec_marker_key as _opslib_box_exec_marker_key,
     classify_box_exec_command,
     command_hash,
@@ -78,6 +80,7 @@ from lib.opslib import (  # noqa: E402
     normalize_command,
     resolve_inventory_path,
     run_checked,
+    state_root_lease,
     validate_host,
     validate_identifier,
     validate_ssh_user,
@@ -900,6 +903,27 @@ def run_script(
             rc, stdout_text, stderr_text = in_process
             return _finalize_script_result(script, rc, stdout_text, redact_diagnostic_text(stderr_text))
 
+    if script == BOX_PY and active_state_lease() is not None:
+        # `box.py` acquires the same single-writer lease on the same canonical
+        # root. Holding it across a SUBPROCESS child cannot be reused the way an
+        # in-process nested owner is -- the child has its own registry and its
+        # own file description -- so it would block until the timeout and
+        # surface as a mystery hang. Refusing names the bug instead.
+        return False, -1, {
+            "error": {
+                "type": "state_lease_held_across_child",
+                "message": (
+                    "refusing to spawn box.py while this process holds the state-root "
+                    "mutation lease; the child would deadlock waiting for it"
+                ),
+                "recoverable": False,
+                "recovery_hint": (
+                    "Release the lease before delegating: the wrapper is not the final "
+                    "mutation owner, box.py is."
+                ),
+            }
+        }
+
     cmd = [sys.executable, str(script)] + args
     result = run_checked(cmd, timeout=timeout, cwd=REPO_ROOT)
     if result.get("error_code") == "TIMEOUT":
@@ -1197,6 +1221,8 @@ def handle_operator_teardown(params: dict) -> dict:
 
     args = ["down", box_id_param, "--format", "json"]
     if dry_run_param:
+        # Preview carries no confirmation: --dry-run is the one path box.py lets
+        # through unconfirmed, so stamping a confirmation here would be a lie.
         args.append("--dry-run")
     elif not _has_dryrun_marker("operator_teardown", box_id_param):
         return _dry_run_required_error(
@@ -1206,6 +1232,13 @@ def handle_operator_teardown(params: dict) -> dict:
             "python3 scripts/box.py down <box-id> --dry-run --format json",
             marker_status=_dryrun_marker_rejection_status("operator_teardown", box_id_param),
         )
+    else:
+        # A real run only reaches here behind a marker bound to this box id, so
+        # the wrapper can satisfy the CLI's identity-bound gate by naming the
+        # same box. --confirm <box-id> (never --yes) keeps box.py's exact-match
+        # check meaningful: a wrong box_id fails there instead of being waved
+        # through by a blanket flag.
+        args.extend(["--confirm", box_id_param])
 
     ok, _code, data = run_script(BOX_PY, args, timeout=300)
     emit_event("operator.teardown", box_id_param, {"ok": ok, "dry_run": dry_run_param})
@@ -1842,6 +1875,51 @@ def _gc_expired_dryrun_markers(*, skip_path: Path | None = None) -> None:
             pass
 
 
+#: Marker tool name -> the manifest boundary that owns its local write. Closed
+#: on purpose: an unmapped tool means a new authorizing write shipped without an
+#: inventory row, and that must be a loud refusal rather than an ungated write.
+_MARKER_BOUNDARIES = {
+    "operator_provision": "operator_mcp.operator_provision",
+    "operator_teardown": "operator_mcp.operator_teardown",
+    "operator_box_exec": "operator_mcp.operator_box_exec",
+    "operator_compose_down": "operator_mcp.operator_compose_down",
+}
+
+
+def _marker_boundary(tool_name: str) -> str:
+    boundary = _MARKER_BOUNDARIES.get(str(tool_name))
+    if boundary is None:
+        raise StateLeaseUnavailable(
+            f"no state-mutation boundary is declared for marker tool {tool_name!r}; "
+            "refusing to write an authorizing marker ungated"
+        )
+    return boundary
+
+
+@contextlib.contextmanager
+def _marker_mutation_lease(boundary_id: str) -> Any:
+    """Hold the state-root lease for one direct, local marker write.
+
+    These are the only writes this server performs itself; everything else it
+    does is delegated to `box.py`, which is its own final mutation owner. So the
+    lease is taken HERE and held for exactly the length of the marker write --
+    never across the child (see `run_script`).
+
+    A marker is small, but it is the thing that authorizes a destructive run.
+    Two servers minting or consuming one concurrently is precisely the race the
+    single-writer contract exists to remove.
+    """
+    try:
+        with state_root_lease(
+            boundary_id, repo_root=REPO_ROOT, annotations={"surface": "operator_mcp"}
+        ) as held:
+            yield held
+    except StateLeaseUnavailable:
+        # Fail closed on the authorizing write: no marker is better than a
+        # marker minted outside the contract that is supposed to serialize it.
+        raise
+
+
 def _stamp_dryrun_marker(tool_name: str, box_id: str) -> None:
     """Create a temp marker so the PreToolUse hook knows a dry-run was done.
 
@@ -1850,6 +1928,7 @@ def _stamp_dryrun_marker(tool_name: str, box_id: str) -> None:
     `box.py` mints session-agnostic markers on purpose — see the marker contract
     in ``lib.opslib``, which owns the payload shape for BOTH writers.
     """
+    boundary = _marker_boundary(tool_name)
     _gc_expired_dryrun_markers()
     marker = _dryrun_marker_path(tool_name, box_id)
     marker.parent.mkdir(parents=True, exist_ok=True)
@@ -1860,7 +1939,8 @@ def _stamp_dryrun_marker(tool_name: str, box_id: str) -> None:
         created_at=_utc_timestamp(),
         session=_dryrun_session_id(),
     )
-    marker.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    with _marker_mutation_lease(boundary):
+        marker.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _dryrun_marker_status(tool_name: str, box_id: str) -> dict[str, Any]:
@@ -1899,13 +1979,22 @@ def _dryrun_marker_rejection_status(tool_name: str, box_id: str) -> dict[str, An
 
 
 def _clear_dryrun_marker(tool_name: str, box_id: str) -> None:
-    """Remove the dry-run marker after a successful real operation."""
-    try:
-        marker = _dryrun_marker_path(tool_name, box_id)
-        marker.unlink(missing_ok=True)
-        _DRYRUN_MARKER_STATUS_CACHE.pop(_dryrun_marker_cache_key(tool_name, box_id), None)
-    except (OSError, ValueError):
-        pass
+    """Remove the dry-run marker after a successful real operation.
+
+    Consumption is gated for the same reason minting is: a marker consumed by
+    one writer while another is deciding whether it is still valid is the race,
+    not the write itself. A lease failure propagates -- it is never swallowed
+    into the best-effort OSError branch below, because failing to serialize is
+    not the same class of problem as a marker that was already gone.
+    """
+    boundary = _marker_boundary(tool_name)
+    with _marker_mutation_lease(boundary):
+        try:
+            marker = _dryrun_marker_path(tool_name, box_id)
+            marker.unlink(missing_ok=True)
+            _DRYRUN_MARKER_STATUS_CACHE.pop(_dryrun_marker_cache_key(tool_name, box_id), None)
+        except (OSError, ValueError):
+            pass
 
 
 # ---------------------------------------------------------------------------

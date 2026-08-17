@@ -1,0 +1,14 @@
+# a -> b -> c -> a
+schema_version: 1
+units:
+  a:
+    command: ["true"]
+    depends_on: [b]
+  b:
+    command: ["true"]
+    depends_on: [c]
+  c:
+    command: ["true"]
+    depends_on: [a]
+groups:
+  default: [a]

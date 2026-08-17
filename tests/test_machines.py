@@ -560,5 +560,112 @@ class MachineCapsTrustTests(unittest.TestCase):
         self.assertFalse(m.is_closed_cap(""))
 
 
+FLEET_FIXTURE_YAML = """
+version: 1
+
+machines:
+  mac-laptop:
+    hostnames: [operator-mac]
+    home: /Users/operator
+    caps: [os:darwin, arch:arm64, xcode, durable]
+    trust: local
+
+  devbox-linux:
+    hostnames: [devbox.example]
+    home: /home/skillbox
+    caps: [os:linux, arch:amd64, docker, tailnet, durable]
+    trust: allowlisted
+
+  prod-linux:
+    hostnames: [prod.example]
+    home: /home/aiops
+    caps: [os:linux, durable]
+    trust: allowlisted
+
+  conference1-wsl:
+    hostnames: [conference1-wsl]
+    home: /home/worker
+    caps: [os:wsl, arch:amd64, docker, durable]
+    trust: allowlisted
+"""
+
+
+@unittest.skipUnless(_HAVE_YAML, "PyYAML required to parse machines.yaml")
+class MachineCapSelectionTests(unittest.TestCase):
+    """Selecting a machine by role, so callers never hard-code a hostname."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        path = Path(self._tmp.name) / "machines.yaml"
+        path.write_text(FLEET_FIXTURE_YAML.strip() + "\n", encoding="utf-8")
+        self.config = m.load_machines_config(path)
+
+    def test_select_returns_every_profile_declaring_all_caps(self) -> None:
+        matches = self.config.select_by_caps(["os:linux"])
+        self.assertEqual(
+            [profile.machine_id for profile in matches],
+            ["devbox-linux", "prod-linux"],
+        )
+
+    def test_selection_is_sorted_by_machine_id_for_determinism(self) -> None:
+        matches = self.config.select_by_caps(["durable"])
+        self.assertEqual(
+            [profile.machine_id for profile in matches],
+            sorted(profile.machine_id for profile in matches),
+        )
+
+    def test_all_required_caps_must_be_present(self) -> None:
+        self.assertEqual(
+            [p.machine_id for p in self.config.select_by_caps(["os:linux", "tailnet"])],
+            ["devbox-linux"],
+        )
+        self.assertEqual(self.config.select_by_caps(["os:linux", "xcode"]), ())
+
+    def test_empty_requirement_matches_everything(self) -> None:
+        self.assertEqual(len(self.config.select_by_caps([])), 4)
+
+    def test_an_unknown_cap_narrows_to_zero_rather_than_widening(self) -> None:
+        """A typo must not silently select the whole fleet."""
+        self.assertEqual(self.config.select_by_caps(["os:linuxx"]), ())
+        self.assertEqual(self.config.select_by_caps(["tailscale"]), ())
+
+    def test_trust_filter_is_applied(self) -> None:
+        self.assertEqual(
+            [
+                p.machine_id
+                for p in self.config.select_by_caps(["durable"], trust=["local"])
+            ],
+            ["mac-laptop"],
+        )
+        self.assertEqual(
+            self.config.select_by_caps(["os:wsl"], trust=["local"]),
+            (),
+        )
+
+    def test_require_one_returns_the_single_match(self) -> None:
+        profile = self.config.require_one_by_caps(
+            ["os:wsl", "docker"], trust=["allowlisted"]
+        )
+        self.assertEqual(profile.machine_id, "conference1-wsl")
+
+    def test_require_one_refuses_zero_matches(self) -> None:
+        with self.assertRaises(m.MachinesConfigError):
+            self.config.require_one_by_caps(["os:plan9"])
+
+    def test_require_one_refuses_an_ambiguous_requirement(self) -> None:
+        """Two candidates is the drift this check exists to catch."""
+        with self.assertRaises(m.MachinesConfigError) as caught:
+            self.config.require_one_by_caps(["os:linux"])
+        self.assertIn("devbox-linux", str(caught.exception))
+        self.assertIn("prod-linux", str(caught.exception))
+
+    def test_blank_tokens_are_ignored_not_treated_as_a_cap(self) -> None:
+        self.assertEqual(
+            [p.machine_id for p in self.config.select_by_caps(["os:wsl", "", "  "])],
+            ["conference1-wsl"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

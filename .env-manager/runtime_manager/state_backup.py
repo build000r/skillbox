@@ -808,6 +808,54 @@ def drill_state_backup(
     return payload
 
 
+def _assert_restore_root_is_leased(source_root: Path) -> None:
+    """Refuse a restore whose root is not the one the caller's lease guards.
+
+    Restore replaces an entire state root by rename. The single-writer lease
+    makes that safe *because* its lock lives on a stable sibling
+    (``<parent>/<name>.mutation-lease.lock``), so the rename and rmtree cannot
+    move the inode a holder is flocked to -- one lease spans the whole swap.
+
+    That guarantee only holds if the lease being held is the lease for THIS
+    root. ``restore`` resolves its root from an explicit argument or the model,
+    while dispatch leases the canonical repo-relative root; when those disagree
+    the command would be replacing a directory nothing is guarding while holding
+    a lock over a directory nothing is touching. There is no honest way to guess
+    which one the operator meant, so this refuses and names both.
+
+    A caller holding no lease at all is also refused: an ungated root swap is
+    never the degrade path.
+    """
+    from . import state_mutation  # noqa: PLC0415
+
+    # Ask the LOCK REGISTRY, not a convenience variable: what matters is whether
+    # this process actually holds the flock for this root, however it was taken
+    # (dispatch's runtime lease, a raw lease, doctor_fix's gate). Keying on one
+    # helper's bookkeeping would call a genuinely-held lease ungated.
+    held_roots = set(state_mutation.held_lease_roots())
+    canonical = str(state_mutation.canonical_state_root(source_root))
+    if not held_roots:
+        raise StateBackupError(
+            "STATE_BACKUP_RESTORE_UNGATED",
+            "state-backup restore must run under the state-root mutation lease; "
+            "this process holds none.",
+            next_actions=[
+                "python3 .env-manager/manage.py state-backup restore <manifest> "
+                "--i-understand-data-loss --format json",
+            ],
+        )
+    if canonical not in held_roots:
+        raise StateBackupError(
+            "STATE_BACKUP_RESTORE_ROOT_MISMATCH",
+            "state-backup restore would replace a state root no held lease guards: "
+            f"restoring={canonical!r} held={sorted(held_roots)!r}.",
+            next_actions=[
+                "re-run with SKILLBOX_STATE_ROOT set to the root being restored",
+                "python3 .env-manager/manage.py state-backup verify <manifest> --format json",
+            ],
+        )
+
+
 def restore_state_backup(
     target: str | os.PathLike[str] | None = None,
     *,
@@ -829,6 +877,8 @@ def restore_state_backup(
     manifest_path = _target_or_latest_manifest(target, backup_root=backup_root)
     manifest_path, manifest = _load_manifest(manifest_path)
     archive_path = _archive_path_from_manifest(manifest_path, manifest)
+
+    _assert_restore_root_is_leased(source_root)
 
     _raise_if_pulse_running(source_root, model)
     verification = verify_state_backup(manifest_path)

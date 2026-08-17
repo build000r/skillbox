@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+markers = [
+  "db: requires postgres",
+]
+addopts = "-n auto --junitxml=reports/pytest.xml"
+testpaths = ["tests"]

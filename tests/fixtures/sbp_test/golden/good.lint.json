@@ -1,0 +1,20 @@
+{
+  "findings": [],
+  "groups": {
+    "default": [
+      "lint",
+      "unit-fast"
+    ],
+    "full": [
+      "lint",
+      "unit-fast",
+      "integration"
+    ]
+  },
+  "manifest_parsed": true,
+  "unit_ids": [
+    "integration",
+    "lint",
+    "unit-fast"
+  ]
+}

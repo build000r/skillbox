@@ -87,6 +87,42 @@ printf 'local\n' > "${ESTATE}/c-ahead/local.txt"
 git -C "${ESTATE}/c-ahead" add local.txt
 git -C "${ESTATE}/c-ahead" commit -q -m "local work"
 
+# h-external: ahead of an EXTERNAL upstream (registered as external). Cloned
+# from a local origin so the ahead count is real and offline, then repointed at
+# a github URL owned by somebody else. Nothing fetches: ahead/behind read the
+# local remote-tracking ref, which survives the URL swap. Without the ownership
+# join this row's advice is `git push` — straight at a repo the operator does
+# not own, which is what the 2026-08-15 live run would have been told 3 times.
+make_clone "h-external"
+printf 'external\n' > "${ESTATE}/h-external/local.txt"
+git -C "${ESTATE}/h-external" add local.txt
+git -C "${ESTATE}/h-external" commit -q -m "work on somebody else's repo"
+git -C "${ESTATE}/h-external" remote set-url origin \
+  "https://github.com/tetsuo-ai/agenc-core.git"
+
+# i-misconfigured: the cfo-qbo-control-plane shape (live evidence 2026-08-15).
+# Its branch tracks origin/main while its commits are already on
+# origin/codex/qbo at identical SHA, so git itself reports a divergence that
+# does not exist. Without the mismatch probe this row sits at the TOP of the
+# risk table with a reconcile handoff for nothing.
+make_clone "i-misconfigured"
+git -C "${ESTATE}/i-misconfigured" checkout -q -b codex/qbo
+printf 'w1\n' > "${ESTATE}/i-misconfigured/w1.txt"
+git -C "${ESTATE}/i-misconfigured" add w1.txt
+git -C "${ESTATE}/i-misconfigured" commit -q -m "published work 1"
+printf 'w2\n' > "${ESTATE}/i-misconfigured/w2.txt"
+git -C "${ESTATE}/i-misconfigured" add w2.txt
+git -C "${ESTATE}/i-misconfigured" commit -q -m "published work 2"
+# Published at identical SHA (a branch the origin does not have checked out)...
+git -C "${ESTATE}/i-misconfigured" push -q origin codex/qbo
+# ...but pointed at the wrong ref.
+git -C "${ESTATE}/i-misconfigured" branch -q --set-upstream-to=origin/main codex/qbo
+# Advance origin/main so the row also looks "behind", completing the shape.
+printf 'moved on\n' > "${ORIGINS}/i-misconfigured-origin/mainline.txt"
+git -C "${ORIGINS}/i-misconfigured-origin" add mainline.txt
+git -C "${ORIGINS}/i-misconfigured-origin" commit -q -m "origin main moves on"
+git -C "${ESTATE}/i-misconfigured" fetch -q origin
+
 # e-midop: merge conflict in flight (registered).
 make_repo "${ESTATE}/e-midop"
 git -C "${ESTATE}/e-midop" checkout -q -b feature
@@ -170,11 +206,21 @@ import sys
 
 estate, config = sys.argv[1], sys.argv[2]
 payload = {
+    # metadata.owner is the operator account ownership derivation compares
+    # remote URLs against; the estate model declares it, Python does not.
+    "metadata": {"owner": "build000r"},
     "repos": [
         {"id": "a-clean", "path": f"{estate}/a-clean"},
         {"id": "b-dirty", "path": f"{estate}/b-dirty"},
         {"id": "c-ahead", "path": f"{estate}/c-ahead"},
         {"id": "e-midop", "path": f"{estate}/e-midop"},
+        {"id": "i-misconfigured", "path": f"{estate}/i-misconfigured"},
+        {
+            "id": "h-external",
+            "path": f"{estate}/h-external",
+            "ownership": "external-upstream",
+            "note": "no-push fixture: upstream belongs to another account",
+        },
         {"id": "gone", "path": f"{estate}/gone-checkout"},
         {
             "id": "sand",
@@ -188,7 +234,7 @@ payload = {
 with open(f"{config}/registry/repos.yaml", "w", encoding="utf-8") as handle:
     json.dump(payload, handle)
 EOF
-assert_ok "fixture estate built (5 scannable repos, 1 ignored, 2 stale entries)"
+assert_ok "fixture estate built (7 scannable repos, 1 ignored, 2 stale entries)"
 
 run_sbp() {
   # Receipts store and amp guard scripts are pinned at nonexistent paths:
@@ -231,9 +277,9 @@ EOF
 log "PHASE: sbp git (text view)"
 TEXT_OUT="${WORK}/git.txt"
 run_sbp git "${SCAN_ARGS[@]}" > "${TEXT_OUT}"
-grep -q "estate: 5 repos under ${ESTATE}" "${TEXT_OUT}" \
-  || { cat "${TEXT_OUT}"; fail "text view must report 5 scanned repos"; }
-assert_ok "text view reports 5 scanned repos"
+grep -q "estate: 7 repos under ${ESTATE}" "${TEXT_OUT}" \
+  || { cat "${TEXT_OUT}"; fail "text view must report 7 scanned repos"; }
+assert_ok "text view reports 7 scanned repos"
 grep -q "1 ignored by registry rules" "${TEXT_OUT}" \
   || { cat "${TEXT_OUT}"; fail "text view must report the ignore-rule hit"; }
 assert_ok "ignore-rule hit is reported"
@@ -268,11 +314,11 @@ JSON_OUT="${WORK}/git.json"
 run_sbp git --json "${SCAN_ARGS[@]}" > "${JSON_OUT}"
 json_assert "${JSON_OUT}" "envelope schema is sbp-git/v1" \
   'payload["schema"] == "sbp-git/v1"'
-json_assert "${JSON_OUT}" "repo_count is 5" 'payload["repo_count"] == 5'
+json_assert "${JSON_OUT}" "repo_count is 7" 'payload["repo_count"] == 7'
 json_assert "${JSON_OUT}" "ignored_count is 1" 'payload["ignored_count"] == 1'
 json_assert "${JSON_OUT}" "registry join applied" 'payload["registry_applied"] is True'
-json_assert "${JSON_OUT}" "registration summary counts 4 registered / 1 unregistered / 2 stale" \
-  'payload["registration_summary"] == {"registered": 4, "unregistered": 1, "unknown": 0, "stale_registered": 2}'
+json_assert "${JSON_OUT}" "registration summary counts 6 registered / 1 unregistered / 2 stale" \
+  'payload["registration_summary"] == {"registered": 6, "unregistered": 1, "unknown": 0, "stale_registered": 2}'
 json_assert "${JSON_OUT}" "stale entries name the gone checkout and sand" \
   '[e["id"] for e in payload["stale_registered"]] == ["gone", "sand"]'
 json_assert "${JSON_OUT}" "located stale entry carries located/note and verify-there fix" \
@@ -281,7 +327,7 @@ json_assert "${JSON_OUT}" "unannotated stale entry keeps remove-or-repoint and n
   '"located" not in payload["stale_registered"][0] and payload["stale_registered"][0]["fix"][0].startswith("remove or repoint")'
 json_assert "${JSON_OUT}" "amp guard absent adds nothing" '"amp" not in payload'
 json_assert "${JSON_OUT}" "rows are risk-sorted (mid-op first, clean last)" \
-  '[r["risk_band"] for r in payload["repos"]] == ["mid-op", "dirty", "ahead", "no-remote", "clean"]'
+  '[r["risk_band"] for r in payload["repos"]] == ["mid-op", "dirty", "ahead", "ahead", "no-remote", "clean", "clean"]'
 
 # ---------------------------------------------------------------------------
 # PHASE: sbp gs / sbp git status aliases
@@ -321,6 +367,89 @@ json_assert "${DIRTY_OUT}" "--only dirty keeps exactly the dirty rows (mid-op co
 json_assert "${DIRTY_OUT}" "--only dirty rows all carry the dirty class" \
   'all("dirty" in r["classes"] for r in payload["repos"])'
 json_assert "${DIRTY_OUT}" "--only dirty echoes its filter" 'payload["filters"] == ["dirty"]'
+
+# ---------------------------------------------------------------------------
+# PHASE: lane plan (the envelope hands over the division)
+# ---------------------------------------------------------------------------
+log "PHASE: lane plan"
+json_assert "${JSON_OUT}" "the envelope carries a lane plan" \
+  'isinstance(payload.get("lanes"), list) and len(payload["lanes"]) > 0'
+json_assert "${JSON_OUT}" "every lane carries the full contract" \
+  'all(set(("id","kind","repos","write_scope","rationale","suggested_concurrency")) <= set(l) for l in payload["lanes"])'
+json_assert "${JSON_OUT}" "lane ids are sequential" \
+  '[l["id"] for l in payload["lanes"]] == ["L%d" % (i+1) for i in range(len(payload["lanes"]))]'
+json_assert "${JSON_OUT}" "no lane emits an undeclared kind" \
+  'all(l["kind"] in ("withheld","diverged","dirty-behind","converge","push-ahead","unregistered-dirty","small-dirty","mechanical-cluster") for l in payload["lanes"])'
+json_assert "${JSON_OUT}" "no lane ends in a side ref" \
+  'not any(w in l["kind"] for l in payload["lanes"] for w in ("safety","backup","snapshot"))'
+json_assert "${JSON_OUT}" "every issue row is placed exactly once" \
+  'sorted(p for l in payload["lanes"] for p in l["repos"]) == sorted(set(p for l in payload["lanes"] for p in l["repos"]))'
+json_assert "${JSON_OUT}" "the mid-op row is withheld as a judgment block" \
+  'any(l["kind"] == "withheld" and any(w["path"].endswith("/e-midop") for w in l.get("withheld") or []) for l in payload["lanes"])'
+json_assert "${JSON_OUT}" "a withheld lane is not dispatchable work" \
+  'all(l["suggested_concurrency"] == 0 for l in payload["lanes"] if l["kind"] == "withheld")'
+json_assert "${JSON_OUT}" "the external-upstream row is never dispatched to push" \
+  'not any(l["kind"] == "push-ahead" and any(p.endswith("/h-external") for p in l["repos"]) for l in payload["lanes"])'
+json_assert "${JSON_OUT}" "write_scope is a superset of repos in every lane" \
+  'all(set(l["repos"]) <= set(l["write_scope"]) for l in payload["lanes"])'
+grep -qE "^lanes: [0-9]+ " "${TEXT_OUT}" \
+  && assert_ok "tty carries one lane summary line" \
+  || fail "tty lane line missing"
+test "$(grep -c '^lanes:' "${TEXT_OUT}")" -eq 1 \
+  && assert_ok "tty gained exactly one line, no table bloat" \
+  || fail "tty lane output is more than one line"
+
+# ---------------------------------------------------------------------------
+# PHASE: misconfigured-upstream detection (the false-diverged class)
+# ---------------------------------------------------------------------------
+log "PHASE: misconfigured upstream"
+MIS='next(r for r in payload["repos"] if r["path"].endswith("/i-misconfigured"))'
+json_assert "${JSON_OUT}" "the misconfigured row is detected" \
+  "${MIS}[\"upstream_mismatch\"] is not None"
+json_assert "${JSON_OUT}" "it names the configured ref and the same-name ref" \
+  "${MIS}[\"upstream_mismatch\"][\"configured\"] == \"origin/main\" and ${MIS}[\"upstream_mismatch\"][\"same_name\"] == \"origin/codex/qbo\""
+json_assert "${JSON_OUT}" "the same-name ref explains every local commit" \
+  "${MIS}[\"upstream_mismatch\"][\"ahead_vs_same_name\"] == 0"
+json_assert "${JSON_OUT}" "git itself still reported a divergence (the premise)" \
+  "${MIS}[\"ahead\"] > 0 and ${MIS}[\"behind\"] > 0"
+json_assert "${JSON_OUT}" "but the row does NOT band diverged" \
+  "${MIS}[\"risk_band\"] != \"diverged\""
+json_assert "${JSON_OUT}" "the fix repairs the upstream" \
+  "any(\"--set-upstream-to origin/codex/qbo\" in f for f in ${MIS}[\"fix\"])"
+json_assert "${JSON_OUT}" "the fix is NOT a reconcile handoff" \
+  "not any(\"do not hand-merge\" in f for f in ${MIS}[\"fix\"])"
+json_assert "${JSON_OUT}" "no OTHER row was reclassified" \
+  'sum(1 for r in payload["repos"] if r["upstream_mismatch"]) == 1'
+grep -q "\[upstream-misconfigured\]" "${TEXT_OUT}" \
+  && assert_ok "tty marks the misconfigured row" \
+  || fail "tty did not mark the misconfigured row"
+
+# ---------------------------------------------------------------------------
+# PHASE: ownership + push policy join (the no-push contract)
+# ---------------------------------------------------------------------------
+log "PHASE: ownership + push policy"
+json_assert "${JSON_OUT}" "every row carries the ownership join" \
+  'all(set(("ownership", "ownership_source", "push_policy", "push_policy_reason")) <= set(r) for r in payload["repos"])'
+json_assert "${JSON_OUT}" "the external row is external-upstream from the registry" \
+  'next(r for r in payload["repos"] if r["path"].endswith("/h-external"))["ownership"] == "external-upstream"'
+json_assert "${JSON_OUT}" "the external row resolves via the registry, not a guess" \
+  'next(r for r in payload["repos"] if r["path"].endswith("/h-external"))["ownership_source"] == "registry"'
+json_assert "${JSON_OUT}" "the external row is no-push" \
+  'next(r for r in payload["repos"] if r["path"].endswith("/h-external"))["push_policy"] == "no-push"'
+json_assert "${JSON_OUT}" "the external row is genuinely ahead (the advice mattered)" \
+  'next(r for r in payload["repos"] if r["path"].endswith("/h-external"))["ahead"] > 0'
+json_assert "${JSON_OUT}" "NO row is ever advised to push against a no-push policy" \
+  'not any(any("git push" in f or f.endswith(" push") for f in r["fix"]) for r in payload["repos"] if r["push_policy"] != "push")'
+json_assert "${JSON_OUT}" "the external row still shows how to inspect the commits" \
+  'any("log --oneline" in f for f in next(r for r in payload["repos"] if r["path"].endswith("/h-external"))["fix"])'
+json_assert "${JSON_OUT}" "the engine captured remote URLs (the schema-additive probe)" \
+  'any(r.get("remotes") for r in payload["repos"])'
+grep -q "\[no-push\]" "${TEXT_OUT}" \
+  && assert_ok "tty marks the no-push row" \
+  || fail "tty did not mark the no-push row"
+grep -qv "PUSH_POLICY" "${TEXT_OUT}" \
+  && assert_ok "tty gained no push-policy column" \
+  || fail "tty grew a column"
 
 # ---------------------------------------------------------------------------
 # PHASE: sbp git --only unregistered

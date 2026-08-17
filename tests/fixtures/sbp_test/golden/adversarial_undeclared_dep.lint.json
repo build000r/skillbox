@@ -1,0 +1,19 @@
+{
+  "findings": [
+    {
+      "code": "undeclared_dependency",
+      "location": "depends_on",
+      "message": "unit 'a' depends on undeclared unit 'ghost'",
+      "unit": "a"
+    }
+  ],
+  "groups": {
+    "default": [
+      "a"
+    ]
+  },
+  "manifest_parsed": true,
+  "unit_ids": [
+    "a"
+  ]
+}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
 import subprocess
 import sys
 import tempfile
@@ -190,3 +191,73 @@ class BoxInventoryIntegrityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InventoryLeaseOwnershipTests(unittest.TestCase):
+    """`save_inventory` is a subordinate primitive, not a second lock owner."""
+
+    def setUp(self) -> None:
+        from lib import opslib
+
+        self.opslib = opslib
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name).resolve()
+        (self.repo / ".skillbox-state").mkdir(parents=True)
+        self.state_root = self.repo / ".skillbox-state"
+        self.inventory = self.state_root / "boxes.json"
+        self.addCleanup(setattr, self.opslib, "_ACTIVE_STATE_LEASE", None)
+
+    def test_no_owner_is_reported_outside_a_gated_command(self) -> None:
+        self.assertIsNone(BOX.inventory_lease_owner())
+
+    def test_exactly_one_owner_is_reported_under_a_command_lease(self) -> None:
+        with mock.patch.dict(os.environ, {"SKILLBOX_STATE_ROOT": str(self.repo / ".skillbox-state")}):
+            with self.opslib.state_root_lease("box.register", repo_root=self.repo) as held:
+                self.assertEqual(BOX.inventory_lease_owner(), held.operation_id)
+                # A nested owner REUSES the same lease object rather than
+                # registering a second one; that identity is what "exactly one
+                # final owner" means in practice. (The lease stamps a fresh
+                # operation id per nested span, so identity is the invariant,
+                # not the id.)
+                with self.opslib.state_root_lease("box.register", repo_root=self.repo):
+                    self.assertIs(self.opslib.active_state_lease(), held)
+                self.assertIs(self.opslib.active_state_lease(), held)
+        self.assertIsNone(BOX.inventory_lease_owner())
+
+    def test_repeated_saves_under_one_lease_do_not_deadlock(self) -> None:
+        """The nested-save case: the command holds the root lease and the
+        inventory writer runs many times inside it."""
+        boxes = [BOX.Box(id="alpha", profile="dev-small", state="ready")]
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SKILLBOX_STATE_ROOT": str(self.repo / ".skillbox-state"),
+                "SKILLBOX_BOX_INVENTORY": str(self.inventory),
+                "SKILLBOX_BOX_JOURNAL": str(self.state_root / "journal.jsonl"),
+            },
+        ):
+            with self.opslib.state_root_lease("box.register", repo_root=self.repo):
+                for _ in range(5):
+                    BOX.save_inventory(boxes, reason="nested save")
+                self.assertEqual(
+                    [b["id"] for b in json.loads(self.inventory.read_text())["boxes"]],
+                    ["alpha"],
+                )
+
+    def test_the_inventory_writer_takes_no_second_root_lease(self) -> None:
+        """If it did, the lease would refuse it as un-proved ambient reuse."""
+        boxes = [BOX.Box(id="beta", profile="dev-small", state="ready")]
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SKILLBOX_STATE_ROOT": str(self.repo / ".skillbox-state"),
+                "SKILLBOX_BOX_INVENTORY": str(self.inventory),
+                "SKILLBOX_BOX_JOURNAL": str(self.state_root / "journal.jsonl"),
+            },
+        ):
+            with mock.patch.object(
+                self.opslib, "state_root_lease", side_effect=AssertionError("second lease")
+            ):
+                BOX.save_inventory(boxes, reason="ungated primitive")
+            self.assertTrue(self.inventory.is_file())

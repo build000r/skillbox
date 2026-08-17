@@ -1,0 +1,33 @@
+# A well-formed manifest exercising every v1 field.
+schema_version: 1
+
+units:
+  lint:
+    command: [ruff, check, .]
+    timeout_s: 120
+    cache: never
+    env: [CI, NO_COLOR]
+
+  unit-fast:
+    command: [python3, -m, unittest, discover, -s, tests]
+    cwd: tests
+    timeout_s: 600
+    requires:
+      os: [linux, darwin]
+      python: ">=3.11"
+      caps: [python]
+    artifacts: [junit.xml]
+    resource_group: cpu
+    exclusivity: shared
+
+  integration:
+    command: [python3, -m, pytest, -q, integration]
+    depends_on: [unit-fast]
+    services: [postgres, redis]
+    resource_group: db
+    exclusivity: exclusive
+    timeout_s: 1800
+
+groups:
+  default: [lint, unit-fast]
+  full: [lint, unit-fast, integration]

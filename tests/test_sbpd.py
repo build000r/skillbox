@@ -6,6 +6,7 @@ import http.client
 import importlib.util
 import io
 import json
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -346,6 +347,51 @@ class SbpdHttpTests(unittest.TestCase):
 
 
 class SbpdDelegateTests(unittest.TestCase):
+    def test_real_orb_kit_ships_no_real_fleet_identity(self) -> None:
+        """skillbox-97fz: the kit is the publication vector out of the tailnet.
+
+        ``test_orb_kit_has_exact_members_and_is_deterministic`` builds from a
+        fixture tree, so it can never see the real bytes. This one builds from
+        the actual repo and reads every shipped member, which is what a remote
+        Orb would receive. Fake tailnet IPs live in 100.100.0.0/16; anything
+        else in the tailnet CGNAT range is real fleet identity.
+        """
+        fleet_ip = re.compile(
+            r"\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b"
+        )
+        tailnet_id = re.compile(r"\btail[0-9a-f]{4,}\.ts\.net\b")
+
+        kit = SBPD.build_orb_kit(ROOT_DIR)
+        leaks: list[str] = []
+        with tarfile.open(fileobj=io.BytesIO(kit), mode="r:gz") as archive:
+            for member in archive.getmembers():
+                handle = archive.extractfile(member)
+                if handle is None:
+                    continue
+                try:
+                    body = handle.read().decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                for line_no, line in enumerate(body.splitlines(), start=1):
+                    for match in fleet_ip.finditer(line):
+                        if match.group(0).startswith("100.100."):
+                            continue
+                        if line[match.end() : match.end() + 3] == "/10":
+                            continue  # the CGNAT range literal itself
+                        leaks.append(f"{member.name}:{line_no}: fleet ip")
+                    if tailnet_id.search(line):
+                        leaks.append(f"{member.name}:{line_no}: tailnet id")
+
+        self.assertEqual(
+            [],
+            leaks,
+            msg=(
+                "the orb kit would ship real fleet identity to every Orb; use a "
+                "100.100.0.0/16 placeholder and source the real endpoint from "
+                "SKILLBOX_BOX_HEALTH_URL"
+            ),
+        )
+
     def test_orb_kit_has_exact_members_and_is_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -61,6 +61,8 @@ if str(ENV_MANAGER_DIR) not in sys.path:
 
 from runtime_manager import git_estate  # noqa: E402
 
+from tests import helpers  # noqa: E402
+
 GOLDENS_DIR = ROOT / "tests" / "goldens"
 UPDATE_ENV = "UPDATE_GOLDENS"
 
@@ -212,9 +214,7 @@ class GitEstateGoldenTests(unittest.TestCase):
                 # Hermetic joins: the goldens pin the store-less/guard-less
                 # envelope, so a real receipts store or reconcile-skill
                 # checkout on the host must never leak into the scan.
-                "SKILLBOX_RECONCILE_RECEIPTS_DIR": str(cls.tmp / "no-receipts"),
-                "SKILLBOX_AMP_CAPSULE_GUARD": str(cls.tmp / "no-capsule-guard"),
-                "SKILLBOX_AMP_CAMPAIGN_GUARD": str(cls.tmp / "no-campaign-guard"),
+                **helpers.hermetic_join_env(cls.tmp),
             },
         )
         env_patcher.start()

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import difflib
 import hashlib
 import json
@@ -42,6 +43,7 @@ from lib import dcglib as _dcglib  # noqa: E402
 from lib.redaction import redact_text as redact_diagnostic_text  # noqa: E402
 from lib.opslib import (  # noqa: E402
     MARKER_SOURCE_BOX_CLI,
+    StateLeaseUnavailable,
     SSH_READ_RETRY_POLICY,
     RetryPolicy,
     box_exec_marker_key,
@@ -50,8 +52,10 @@ from lib.opslib import (  # noqa: E402
     command_hash,
     dryrun_marker_payload,
     locked_inventory_update,
+    active_state_lease,
     resolve_inventory_path,
     run_checked,
+    state_root_lease,
     validate_box_id,
     validate_host,
     validate_profile_name,
@@ -311,6 +315,11 @@ def build_remote_env_command(argv: list[str], env_vars: dict[str, str] | None = 
 
 
 def build_deploy_command(profile: "BoxProfile") -> str:
+    # `make dcg-reconcile` is the same lifecycle contract install.sh, first-box,
+    # onboard, and runtime-sync call -- the deploy shell does not re-implement
+    # convergence. It is last so it runs against a built, started box, and the
+    # `&&` chain makes a reconciler failure (or an untrusted Codex hook, exit 3)
+    # fail the deploy instead of leaving a box that looks deployed but unguarded.
     return " && ".join([
         "cd",
         shell_join(["git", "clone", "--branch", profile.skillbox_branch, profile.skillbox_repo, "skillbox"]),
@@ -318,6 +327,7 @@ def build_deploy_command(profile: "BoxProfile") -> str:
         shell_join(["cp", ".env.example", ".env"]),
         shell_join(["make", "build"]),
         shell_join(["make", "up"]),
+        shell_join(["make", "dcg-reconcile"]),
     ])
 
 
@@ -2211,6 +2221,22 @@ def rebuild_inventory_from_journal() -> list[Box]:
     return [boxes_by_id[box_id] for box_id in sorted(boxes_by_id)]
 
 
+def inventory_lease_owner() -> str | None:
+    """The operation id of the lease covering inventory writes, or ``None``.
+
+    ``save_inventory`` deliberately does NOT take the state-root lease. The
+    command that called it already holds it, and a second acquisition would be
+    refused outright by the lease (implicit ambient reuse is not allowed) or,
+    with a naive re-entrant lock, would be the classic nested-save deadlock.
+    So the per-file ``locked_inventory_update`` stays exactly what it always
+    was -- the subordinate atomic-publication primitive -- and this reports the
+    owner above it so "exactly one final owner" is observable rather than
+    asserted.
+    """
+    lease = active_state_lease()
+    return None if lease is None else str(getattr(lease, "operation_id", "") or "") or None
+
+
 def save_inventory(
     boxes: list[Box],
     *,
@@ -2841,19 +2867,115 @@ def firewall_allows_public_ssh(firewall: dict[str, Any]) -> bool:
     return False
 
 
+class LockdownOutcome(str, Enum):
+    """Semantic result of one lockdown attempt.
+
+    Lockdown is the gate between "the box has a tailnet identity" and "the box
+    may be deployed to". Every way it can end is enumerated here so the stage
+    maps to one deterministic state and one stable error type instead of a
+    stringly-typed ``RuntimeError`` the caller has to pattern-match.
+    """
+
+    LOCKED_DOWN = "locked-down"
+    ALREADY_LOCKED_DOWN = "already-locked-down"
+    NOT_REQUIRED = "not-required"
+    TAILNET_IDENTITY_MISSING = "tailnet-identity-missing"
+    TAILNET_UNREACHABLE = "tailnet-unreachable"
+    FIREWALL_MISSING = "firewall-missing"
+    UPDATE_FAILED = "update-failed"
+    REREAD_FAILED = "reread-failed"
+    IDENTITY_MISMATCH = "identity-mismatch"
+    PUBLIC_SSH_OPEN = "public-ssh-open"
+
+
+#: Outcomes that prove the box is safe to deploy to. Anything else is a failure.
+LOCKDOWN_PROVEN_OUTCOMES = frozenset(
+    {
+        LockdownOutcome.LOCKED_DOWN,
+        LockdownOutcome.ALREADY_LOCKED_DOWN,
+        LockdownOutcome.NOT_REQUIRED,
+    }
+)
+
+#: One stable error type per failing outcome. Agents branch on these, so they
+#: are contract: renaming one is a breaking change to the box up JSON payload.
+LOCKDOWN_ERROR_TYPES = {
+    LockdownOutcome.TAILNET_IDENTITY_MISSING: "tailnet_identity_missing",
+    LockdownOutcome.TAILNET_UNREACHABLE: "tailnet_unreachable",
+    LockdownOutcome.FIREWALL_MISSING: "cloud_firewall_missing",
+    LockdownOutcome.UPDATE_FAILED: "cloud_firewall_update_failed",
+    LockdownOutcome.REREAD_FAILED: "cloud_firewall_reread_failed",
+    LockdownOutcome.IDENTITY_MISMATCH: "cloud_firewall_identity_mismatch",
+    LockdownOutcome.PUBLIC_SSH_OPEN: "cloud_firewall_public_ssh_open",
+}
+
+
+class BoxLockdownError(RuntimeError):
+    """A lockdown attempt that must not advance the box toward deploy.
+
+    Carries the typed outcome so ``_run_box_up_stage`` can emit a deterministic
+    error type, and so a resume can tell "the proof is not available yet" from
+    "the proof failed".
+    """
+
+    def __init__(
+        self,
+        outcome: LockdownOutcome,
+        message: str,
+        *,
+        next_actions: list[str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.outcome = outcome
+        self.error_type = LOCKDOWN_ERROR_TYPES.get(outcome, "lockdown_failed")
+        self.next_actions = next_actions
+
+
 def assert_cloud_firewall_locked_down(firewall_id: str, *, posture: str) -> None:
-    """Re-read a firewall after lockdown and fail closed unless public SSH is gone."""
+    """Re-read a firewall after lockdown and fail closed unless public SSH is gone.
+
+    Retained as the narrow public assertion; ``_verify_cloud_firewall_lockdown``
+    is the typed form the lockdown stage uses.
+    """
+    outcome, detail = _verify_cloud_firewall_lockdown(firewall_id, posture=posture)
+    if outcome not in LOCKDOWN_PROVEN_OUTCOMES:
+        raise BoxLockdownError(outcome, detail)
+
+
+def _verify_cloud_firewall_lockdown(
+    firewall_id: str,
+    *,
+    posture: str,
+) -> tuple[LockdownOutcome, str]:
+    """Re-read a firewall and classify what the read proves.
+
+    Reads are the only evidence that counts here: the update call returning 200
+    says the API accepted a request, not that port 22 is shut. A read that comes
+    back for a *different* firewall id proves nothing about this box, so it is
+    its own outcome rather than being folded into a generic read failure.
+    """
     firewall = do_get_firewall(firewall_id)
     if firewall is None:
-        raise RuntimeError(
+        return (
+            LockdownOutcome.REREAD_FAILED,
             f"Cloud firewall {firewall_id} could not be re-read after lockdown; refusing to "
-            f"advance under {posture} posture while port 22 may still be world-reachable."
+            f"advance under {posture} posture while port 22 may still be world-reachable.",
+        )
+    observed_id = str(firewall.get("id") or "").strip()
+    if observed_id != str(firewall_id).strip():
+        return (
+            LockdownOutcome.IDENTITY_MISMATCH,
+            f"Cloud firewall re-read returned id {observed_id or '(unset)'!r} when {firewall_id!r} "
+            f"was requested; refusing to advance under {posture} posture on evidence that does "
+            f"not describe this box.",
         )
     if firewall_allows_public_ssh(firewall):
-        raise RuntimeError(
+        return (
+            LockdownOutcome.PUBLIC_SSH_OPEN,
             f"Cloud firewall {firewall_id} still allows inbound SSH from {' or '.join(FIREWALL_ANY_CIDRS)} "
-            f"after lockdown; refusing to advance under {posture} posture."
+            f"after lockdown; refusing to advance under {posture} posture.",
         )
+    return (LockdownOutcome.LOCKED_DOWN, f"cloud firewall {firewall_id} verified closed to public SSH")
 
 
 # ---------------------------------------------------------------------------
@@ -2966,11 +3088,14 @@ def _run_box_up_stage(
         if failure_state is not None:
             update_box(context.box, state=failure_state)
             save_inventory(context.boxes)
+        # An exception that classified itself (BoxLockdownError, and any future
+        # typed lifecycle error) is more specific than the stage's default, so
+        # its type and recovery hints win.
         _emit_box_up_failure(
             context,
-            error_type=error_type,
+            error_type=str(getattr(exc, "error_type", "") or error_type),
             message=str(exc),
-            next_actions=next_actions,
+            next_actions=getattr(exc, "next_actions", None) or next_actions,
         )
         return False
 
@@ -3256,57 +3381,210 @@ def _enroll_box_tailscale(context: BoxUpContext, *, ts_authkey: str) -> str:
     )
     if result.returncode != 0:
         raise RuntimeError(f"Tailscale enrollment failed (exit {result.returncode}): {result.stderr[-500:]}")
-    ts_ip = extract_tailscale_ipv4(result.stdout)
-    if not ts_ip:
-        ts_ip_result = ssh_cmd("root", context.ip, "tailscale ip -4", timeout=15)
-        ts_ip = ts_ip_result.stdout.strip().split("\n")[0] if ts_ip_result.returncode == 0 else None
+    # Enrollment ends here. Everything that closes public SSH is the lockdown
+    # stage: a box whose tailnet identity is unproven must never reach the code
+    # that mutates a firewall, and a box that IS enrolled must still be proved
+    # locked down before deploy, even on a resume that skips this stage.
+    ts_ip = _require_enrolled_tailnet_identity(context, result.stdout)
     update_box(context.box, tailscale_ip=ts_ip, state="lockdown")
     save_inventory(context.boxes)
-    if posture_requires_host_ssh_lockdown(posture):
-        ufw_check = ssh_cmd("root", context.ip, "ufw status numbered 2>/dev/null || true", timeout=15)
-        context.steps.append({
-            "stage": "host_firewall_verify",
-            "posture": posture,
-            "tailnet_only_ssh": tailnet_only_ssh,
-            "ufw_output": ufw_check.stdout[:500] if ufw_check.returncode == 0 else "ufw check failed",
-        })
-    if posture_requires_cloud_firewall(posture):
-        fw_id = str(context.box.cloud_firewall_id or "").strip()
-        if not fw_id:
-            # Fail closed: no firewall means nothing was ever locked down and
-            # port 22 is still open to the world from the bootstrap rules.
-            raise RuntimeError(
-                f"No cloud firewall is associated with this box under {posture} posture; "
-                f"refusing to advance while port 22 may be world-reachable. "
-                f"Run box down {context.box_id} and re-provision."
-            )
-        droplet_id_str = str(context.box.droplet_id or "")
-        try:
-            do_update_firewall_lockdown(
-                fw_id,
-                f"skillbox-{context.box_id}",
-                [droplet_id_str],
-            )
-        except Exception as exc:
-            context.steps.append({
-                "stage": "cloud_firewall_lockdown",
-                "error": str(exc)[:200],
-                "posture": posture,
-            })
-            raise RuntimeError(
-                f"Cloud firewall lockdown failed under {posture} posture; refusing to advance "
-                f"while port 22 is world-reachable: {exc}"
-            ) from exc
-        assert_cloud_firewall_locked_down(fw_id, posture=posture)
+    return f"tailscale {context.ts_hostname} at {ts_ip}"
+
+
+def _require_enrolled_tailnet_identity(context: BoxUpContext, enroll_stdout: str) -> str:
+    """Return the enrolled Tailnet IPv4, or refuse to advance.
+
+    ``scripts/02-install-tailscale.sh`` exits non-zero unless it can print
+    ``TAILSCALE_IPV4=``, so that marker is the enrollment's own evidence. There
+    is deliberately no ``tailscale ip -4`` fallback: a second, unrelated read
+    that happens to answer would let a box advance on evidence the enrollment
+    never produced.
+
+    A stale ``tailscale_ip`` is cleared on refusal. Leaving it behind is the
+    whole legacy bypass — a later resume would read it as proof of an
+    enrollment that just failed.
+    """
+    ts_ip = extract_tailscale_ipv4(enroll_stdout)
+    if not ts_ip:
+        _clear_unproven_tailnet_identity(context)
+        raise BoxLockdownError(
+            LockdownOutcome.TAILNET_IDENTITY_MISSING,
+            "Tailscale enrollment reported success but printed no TAILSCALE_IPV4 evidence; "
+            "refusing to advance without a proven tailnet identity.",
+            next_actions=[f"box ssh {context.box_id}", f"box down {context.box_id}"],
+        )
+    if not is_tailscale_ipv4(ts_ip):
+        _clear_unproven_tailnet_identity(context)
+        raise BoxLockdownError(
+            LockdownOutcome.TAILNET_IDENTITY_MISSING,
+            f"Tailscale enrollment reported {ts_ip!r}, which is not a Tailnet address "
+            f"(100.64.0.0/10); refusing to advance on an unproven identity.",
+            next_actions=[f"box ssh {context.box_id}", f"box down {context.box_id}"],
+        )
+    return ts_ip
+
+
+def _clear_unproven_tailnet_identity(context: BoxUpContext) -> None:
+    if context.box.tailscale_ip:
+        update_box(context.box, tailscale_ip=None)
+        save_inventory(context.boxes)
+
+
+def _prove_legacy_box_enrollment(context: BoxUpContext) -> str:
+    """Accept an inventory Tailnet IP as enrollment evidence, then hand off to lockdown.
+
+    A box left in ``ssh-ready`` with a Tailnet IP is the shape that used to skip
+    straight past lockdown to deploy. The IP is real evidence of *enrollment*,
+    so it is honoured — but only by walking the declared transitions into
+    ``lockdown``, so the lockdown proof still has to run.
+    """
+    ts_ip = str(context.box.tailscale_ip or "").strip()
+    if not is_tailscale_ipv4(ts_ip):
+        raise BoxLockdownError(
+            LockdownOutcome.TAILNET_IDENTITY_MISSING,
+            f"Inventory records tailscale_ip={ts_ip!r} for {context.box_id}, which is not a "
+            f"Tailnet address (100.64.0.0/10); refusing to treat it as enrollment evidence.",
+            next_actions=[f"box status {context.box_id}", f"box down {context.box_id}"],
+        )
+    update_box(context.box, state="enrolling", validate_transition=True)
+    update_box(context.box, state="lockdown", validate_transition=True)
+    save_inventory(context.boxes)
+    return f"existing tailnet identity {ts_ip} accepted; lockdown still required"
+
+
+def _prove_operator_tailnet_reachability(context: BoxUpContext, ts_ip: str) -> None:
+    """Prove the operator can reach the box over the Tailnet — before closing port 22.
+
+    Order is the safety property: verifying reachability *after* the firewall
+    update would mean discovering the tailnet path is dead at the moment the
+    public path is already gone. If this cannot be proven the box stays in
+    ``lockdown`` with public SSH still open, which is recoverable; the inverse
+    is not.
+    """
+    probe = ssh_cmd(context.profile.ssh_user, ts_ip, "true", timeout=30)
+    context.steps.append({
+        "stage": "tailnet_reachability",
+        "tailscale_ip": ts_ip,
+        "reachable": probe.returncode == 0,
+    })
+    if probe.returncode != 0:
+        raise BoxLockdownError(
+            LockdownOutcome.TAILNET_UNREACHABLE,
+            f"Operator-side Tailnet SSH to {ts_ip} failed (exit {probe.returncode}); refusing to "
+            f"close public SSH while the Tailnet path is unproven. The box stays in lockdown with "
+            f"public SSH intact.",
+            next_actions=[
+                "tailscale status",
+                f"box status {context.box_id}",
+                f"box up {context.box_id} --resume",
+            ],
+        )
+
+
+def _lock_down_box_cloud_firewall(context: BoxUpContext, *, posture: str) -> LockdownOutcome:
+    fw_id = str(context.box.cloud_firewall_id or "").strip()
+    if not fw_id:
+        # Fail closed: no firewall means nothing was ever locked down and
+        # port 22 is still open to the world from the bootstrap rules.
+        raise BoxLockdownError(
+            LockdownOutcome.FIREWALL_MISSING,
+            f"No cloud firewall is associated with this box under {posture} posture; "
+            f"refusing to advance while port 22 may be world-reachable. "
+            f"Run box down {context.box_id} and re-provision.",
+            next_actions=[f"box down {context.box_id}", f"box status {context.box_id}"],
+        )
+
+    # Read before writing. A resume must re-prove lockdown, but re-proving is a
+    # read; blindly re-issuing the mutation on every resume is exactly the
+    # blind retry this stage exists to avoid.
+    already = do_get_firewall(fw_id)
+    if already is not None and str(already.get("id") or "").strip() == fw_id and not firewall_allows_public_ssh(already):
         context.steps.append({
             "stage": "cloud_firewall_lockdown",
             "firewall_id": fw_id,
             "posture": posture,
+            "outcome": LockdownOutcome.ALREADY_LOCKED_DOWN.value,
             "verified": True,
         })
-    update_box(context.box, state="deploying")
+        return LockdownOutcome.ALREADY_LOCKED_DOWN
+
+    try:
+        do_update_firewall_lockdown(fw_id, f"skillbox-{context.box_id}", [str(context.box.droplet_id or "")])
+    except Exception as exc:
+        context.steps.append({
+            "stage": "cloud_firewall_lockdown",
+            "error": str(exc)[:200],
+            "posture": posture,
+            "outcome": LockdownOutcome.UPDATE_FAILED.value,
+        })
+        raise BoxLockdownError(
+            LockdownOutcome.UPDATE_FAILED,
+            f"Cloud firewall lockdown failed under {posture} posture; refusing to advance "
+            f"while port 22 is world-reachable: {exc}",
+            next_actions=[f"box status {context.box_id}", f"box up {context.box_id} --resume"],
+        ) from exc
+
+    outcome, detail = _verify_cloud_firewall_lockdown(fw_id, posture=posture)
+    if outcome not in LOCKDOWN_PROVEN_OUTCOMES:
+        context.steps.append({
+            "stage": "cloud_firewall_lockdown",
+            "firewall_id": fw_id,
+            "posture": posture,
+            "outcome": outcome.value,
+            "verified": False,
+        })
+        raise BoxLockdownError(
+            outcome,
+            detail,
+            next_actions=[f"box status {context.box_id}", f"box up {context.box_id} --resume"],
+        )
+    context.steps.append({
+        "stage": "cloud_firewall_lockdown",
+        "firewall_id": fw_id,
+        "posture": posture,
+        "outcome": outcome.value,
+        "verified": True,
+    })
+    return outcome
+
+
+def _lock_down_box_network(context: BoxUpContext) -> str:
+    """Prove the box is closed to the public internet, then release it to deploy.
+
+    Every refusal here leaves the box in ``lockdown``. That is the point: the
+    old failure path reset to ``ssh-ready``, and a resume from ``ssh-ready``
+    with a Tailnet IP on record skipped enrollment *and* lockdown and went
+    straight to deploy.
+    """
+    posture = resolve_network_posture(context.box)
+    ts_ip = str(context.box.tailscale_ip or "").strip()
+    if not is_tailscale_ipv4(ts_ip):
+        raise BoxLockdownError(
+            LockdownOutcome.TAILNET_IDENTITY_MISSING,
+            f"Lockdown requires a proven Tailnet identity; inventory records "
+            f"tailscale_ip={ts_ip or '(unset)'!r} for {context.box_id}.",
+            next_actions=[f"box status {context.box_id}", f"box down {context.box_id}"],
+        )
+
+    outcome = LockdownOutcome.NOT_REQUIRED
+    if posture_requires_host_ssh_lockdown(posture) or posture_requires_cloud_firewall(posture):
+        _prove_operator_tailnet_reachability(context, ts_ip)
+
+    if posture_requires_host_ssh_lockdown(posture):
+        ufw_check = ssh_cmd("root", ts_ip, "ufw status numbered 2>/dev/null || true", timeout=15)
+        context.steps.append({
+            "stage": "host_firewall_verify",
+            "posture": posture,
+            "tailnet_only_ssh": "true",
+            "ufw_output": ufw_check.stdout[:500] if ufw_check.returncode == 0 else "ufw check failed",
+        })
+
+    if posture_requires_cloud_firewall(posture):
+        outcome = _lock_down_box_cloud_firewall(context, posture=posture)
+
+    update_box(context.box, state="deploying", validate_transition=True)
     save_inventory(context.boxes)
-    return f"tailscale {context.ts_hostname} at {ts_ip or 'unknown'}"
+    return f"{posture} lockdown {outcome.value} at {ts_ip}"
 
 
 def _resolve_deploy_target(context: BoxUpContext) -> str:
@@ -3572,13 +3850,28 @@ def _emit_box_up_success(context: BoxUpContext, *, resumed: bool = False) -> int
     return EXIT_OK
 
 
+def _resumed_enroll_preview(box: "Box") -> str:
+    """What the resumed enroll stage would do, decided the same way it decides."""
+    if box.state in ENROLLMENT_PROVEN_STATES:
+        return f"would skip; already enrolled at {box.tailscale_ip}"
+    if is_tailscale_ipv4(str(box.tailscale_ip or "").strip()):
+        return f"would accept existing tailnet identity {box.tailscale_ip} and still require lockdown"
+    return "would re-enroll; no proven tailnet identity on record"
+
+
+def _resumed_lockdown_preview(box: "Box") -> str:
+    if box.state in LOCKDOWN_PROVEN_STATES:
+        return f"would skip; lockdown already proven ({box.state})"
+    return "would prove tailnet reachability, then host and cloud firewall posture"
+
+
 def _emit_resumed_box_up_dry_run(context: BoxUpContext) -> int:
     _record_box_up_step(context, "create", "skip", f"would resume droplet {context.box.droplet_id or 'unknown'}")
     _record_box_up_step(context, "storage", "skip", "would reuse attached state root")
     _record_box_up_step(context, "bootstrap", "skip", "would reuse existing host")
     _record_box_up_step(context, "ssh-ready", "skip", "would verify existing SSH")
-    _record_box_up_step(context, "enroll", "skip", "would enroll only if Tailscale IP is missing")
-    _record_box_up_step(context, "lockdown", "skip", "would verify host and cloud firewall posture")
+    _record_box_up_step(context, "enroll", "skip", _resumed_enroll_preview(context.box))
+    _record_box_up_step(context, "lockdown", "skip", _resumed_lockdown_preview(context.box))
     _record_box_up_step(context, "deploy", "skip", "would reinstall pinned release")
     _record_box_up_step(context, "contract", "skip", "would write remote .env and .mcp.json contract")
     _record_box_up_step(context, "launch", "skip", "would build and start remote workspace")
@@ -3601,10 +3894,55 @@ def _emit_resumed_box_up_dry_run(context: BoxUpContext) -> int:
     return EXIT_OK
 
 
+#: States a box can only be in because enrollment already produced a validated
+#: Tailnet identity. Reaching one of these is the evidence; the stored IP is not.
+ENROLLMENT_PROVEN_STATES = frozenset({"lockdown", "deploying", "acceptance", "onboarding"})
+
+#: States a box can only be in because lockdown already proved the public path
+#: is shut. `lockdown` is deliberately absent: that is the state a *failed*
+#: lockdown lands in, so it must always re-prove.
+LOCKDOWN_PROVEN_STATES = frozenset({"deploying", "acceptance", "onboarding"})
+
+
+def _box_lockdown_stage(context: BoxUpContext) -> BoxUpStage:
+    """The lockdown stage, wired so every failure stays in ``lockdown``.
+
+    ``failure_state="lockdown"`` is the fix for the bypass: the old code reset a
+    failed lockdown to ``ssh-ready``, and resume treated ``ssh-ready`` plus a
+    stored Tailnet IP as "already enrolled, nothing to do".
+    """
+    box_id = context.box_id
+    return BoxUpStage(
+        "lockdown",
+        "lockdown_failed",
+        lambda: _lock_down_box_network(context),
+        "lockdown",
+        [f"box status {box_id}", f"box up {box_id} --resume"],
+    )
+
+
 def _run_resumed_enroll_stage(context: BoxUpContext) -> bool:
-    if context.box.tailscale_ip:
+    """Decide enrollment from durable state, never from a leftover Tailnet IP.
+
+    Three cases, in the order a resume actually meets them: the box is past
+    enrollment (skip), the box is back at ``ssh-ready`` but carries a valid
+    Tailnet identity (accept it as legacy evidence and hand off to lockdown), or
+    there is nothing to trust and it re-enrolls.
+    """
+    if context.box.state in ENROLLMENT_PROVEN_STATES:
         _record_box_up_step(context, "enroll", "skip", f"already enrolled at {context.box.tailscale_ip}")
         return True
+
+    if is_tailscale_ipv4(str(context.box.tailscale_ip or "").strip()):
+        return _run_box_up_stage(
+            context,
+            stage_name="enroll",
+            error_type="tailscale_failed",
+            action=lambda: _prove_legacy_box_enrollment(context),
+            failure_state="ssh-ready",
+            next_actions=[f"box status {context.box_id}", f"box down {context.box_id}"],
+        )
+
     try:
         ts_authkey = require_env("SKILLBOX_TS_AUTHKEY")
     except RuntimeError as exc:
@@ -3623,6 +3961,22 @@ def _run_resumed_enroll_stage(context: BoxUpContext) -> bool:
         action=lambda: _enroll_box_tailscale(context, ts_authkey=ts_authkey),
         failure_state="ssh-ready",
         next_actions=[f"box ssh {context.box_id}", f"box down {context.box_id}"],
+    )
+
+
+def _run_resumed_lockdown_stage(context: BoxUpContext) -> bool:
+    """Re-prove lockdown unless a later state already proves it happened."""
+    if context.box.state in LOCKDOWN_PROVEN_STATES:
+        _record_box_up_step(context, "lockdown", "skip", f"lockdown already proven ({context.box.state})")
+        return True
+    stage = _box_lockdown_stage(context)
+    return _run_box_up_stage(
+        context,
+        stage_name=stage.name,
+        error_type=stage.error_type,
+        action=stage.action,
+        failure_state=stage.failure_state,
+        next_actions=stage.next_actions,
     )
 
 
@@ -3691,6 +4045,8 @@ def _run_resumed_box_up(
         return EXIT_ERROR
 
     if not _run_resumed_enroll_stage(context):
+        return EXIT_ERROR
+    if not _run_resumed_lockdown_stage(context):
         return EXIT_ERROR
     if not _run_box_up_stages(context, _remaining_box_up_stages(context, deploy_down_action=f"box status {box_id}")):
         return EXIT_ERROR
@@ -3846,6 +4202,7 @@ def _new_box_up_stages(context: BoxUpContext, *, ssh_key_id: str, ts_authkey: st
             "ssh-ready",
             [f"box ssh {box_id}", f"box down {box_id}"],
         ),
+        _box_lockdown_stage(context),
         *_remaining_box_up_stages(context, deploy_down_action=f"box down {box_id}"),
     ]
 
@@ -4241,6 +4598,52 @@ def _upgrade_marker_key(box_id: str, deploy_manifest: str) -> str:
     return f"{box_id}.{digest.hexdigest()[:16]}"
 
 
+#: Command -> the manifest boundary that command owns when it mutates. A
+#: command absent here never takes the lease; that is the read/dry-run set.
+BOX_COMMAND_BOUNDARIES = {
+    "up": "box.up",
+    "down": "box.down",
+    "upgrade": "box.upgrade",
+    "status": "box.status",
+    "inventory-rebuild": "box.inventory-rebuild",
+    "ssh": "box.ssh",
+    "exec": "box.exec",
+    "compose-up": "box.compose-up",
+    "compose-down": "box.compose-down",
+    "register": "box.register",
+    "import": "box.register",
+    "unregister": "box.unregister",
+}
+
+
+def box_lease_boundary(args: Any, *, down_confirmed: bool = False) -> str | None:
+    """The boundary this invocation owns, or ``None`` when it writes nothing.
+
+    Deciding here -- from the parsed arguments, before dispatch -- is what makes
+    "exactly one final owner" checkable: there is a single place that answers
+    whether a given command line mutates, and the answer is the same one the
+    state-mutation inventory records for that surface.
+
+    A ``--dry-run`` selects no boundary. That is required, not merely nice: the
+    acceptance contract says a true dry-run stays available while a writer
+    holds, and a dry run that queued behind the lease would not be available.
+    """
+    command = str(getattr(args, "command", "") or "")
+    boundary = BOX_COMMAND_BOUNDARIES.get(command)
+    if boundary is None:
+        return None
+    if getattr(args, "dry_run", False):
+        return None
+    if command == "down" and not down_confirmed:
+        # An unconfirmed teardown prints the confirmation contract and writes
+        # nothing; it must not serialize behind a real writer.
+        return None
+    if command == "status" and not getattr(args, "write_cache", False):
+        # Only the cache-writing status path mutates. Plain status is a read.
+        return None
+    return boundary
+
+
 def stamp_cli_dryrun_marker(tool_name: str, key: str) -> None:
     """Mint a session-AGNOSTIC dry-run marker (see opslib's marker contract).
 
@@ -4362,7 +4765,14 @@ def _emit_box_down_dry_run(box: Box, box_id: str, steps: list[dict[str, Any]], *
         _box_down_step(steps, is_json, "volume", "skip", f"would detach/delete volume {volume_label}")
     else:
         _box_down_step(steps, is_json, "volume", "skip", "no volume id")
-    payload: dict[str, Any] = {"box_id": box_id, "dry_run": True, "steps": steps, "next_actions": [f"box down {box_id}"]}
+    payload: dict[str, Any] = {
+        "box_id": box_id,
+        "dry_run": True,
+        "steps": steps,
+        # The preview's whole purpose is to be followed by the real run, so
+        # hand back the identity-bound form rather than one that refuses.
+        "next_actions": [f"box down {box_id} --confirm {box_id}"],
+    }
     if is_json:
         emit_json(payload)
     return EXIT_OK
@@ -4568,13 +4978,13 @@ def _emit_box_down_destroy_failure(box: Box, box_id: str, steps: list[dict[str, 
         "box_id": box_id,
         "dry_run": False,
         "steps": steps,
-        "next_actions": [f"box status {box_id}", f"box down {box_id}"],
+        "next_actions": [f"box status {box_id}", f"box down {box_id} --confirm {box_id}"],
     }
     payload.update(
         structured_error(
             message,
             error_type="destroy_failed",
-            next_actions=[f"box status {box_id}", f"box down {box_id}"],
+            next_actions=[f"box status {box_id}", f"box down {box_id} --confirm {box_id}"],
         )
     )
     if is_json:
@@ -4640,7 +5050,7 @@ def _emit_box_down_volume_failure(boxes: list[Box], box: Box, box_id: str, steps
         "box_id": box_id,
         "dry_run": False,
         "steps": steps,
-        "next_actions": [f"box status {box_id}", f"box down {box_id}", "box list"],
+        "next_actions": [f"box status {box_id}", f"box down {box_id} --confirm {box_id}", "box list"],
     }
     payload.update(
         structured_error(
@@ -4650,7 +5060,7 @@ def _emit_box_down_volume_failure(boxes: list[Box], box: Box, box_id: str, steps
                 "Inspect the volume warning, then retry box down after confirming the "
                 "volume can be detached or deleted safely."
             ),
-            next_actions=[f"box status {box_id}", f"box down {box_id}", "box list"],
+            next_actions=[f"box status {box_id}", f"box down {box_id} --confirm {box_id}", "box list"],
         )
     )
     if is_json:
@@ -5146,7 +5556,14 @@ def box_health(box: Box, *, probe: bool = True) -> dict[str, Any]:
                 "reason": "droplet confirmed gone but volume cleanup did not complete",
                 "billing_risk": False,
             }
-        status["next_actions"] = [f"box down {box.id}", f"box status {box.id}", "box list"]
+        # The retry hint must be the command that actually works: `box down`
+        # is identity-bound, so a bare `box down <id>` here would hand the
+        # operator a line that refuses with confirmation_required.
+        status["next_actions"] = [
+            f"box down {box.id} --confirm {box.id}",
+            f"box status {box.id}",
+            "box list",
+        ]
         return status
 
     ssh_target = resolve_box_ssh_target(box, max_wait=5, interval=1, prefer_public=box.state == "ssh-ready")
@@ -5922,7 +6339,7 @@ def _teardown_pending_hint(box: Box) -> dict[str, Any] | None:
             "state": box.state,
             "reason": "droplet delete requested but not yet confirmed absent via API read",
             "billing_risk": True,
-            "next_action": f"box down {box.id}",
+            "next_action": f"box down {box.id} --confirm {box.id}",
         }
     if box.state == "volume-cleanup-failed":
         return {
@@ -5930,7 +6347,7 @@ def _teardown_pending_hint(box: Box) -> dict[str, Any] | None:
             "state": box.state,
             "reason": "droplet confirmed gone but volume cleanup did not complete",
             "billing_risk": False,
-            "next_action": f"box down {box.id}",
+            "next_action": f"box down {box.id} --confirm {box.id}",
         }
     return None
 
@@ -6474,200 +6891,228 @@ def main(argv: list[str] | None = None) -> int:
         load_operator_secret(".env.box")
 
     try:
-        if args.command == "capabilities":
-            emit_json(box_capabilities_payload())
-            return EXIT_OK
-        if args.command == "robot-docs":
-            guide = box_robot_docs_guide()
-            if args.format == "json":
-                emit_json({"ok": True, "topic": args.topic, "guide": guide})
-            else:
-                print(guide.rstrip())
-            return EXIT_OK
-        if args.command == "robot-triage":
-            emit_json(box_robot_triage_payload())
-            return EXIT_OK
-        if args.command == "up":
-            if not args.dry_run:
-                # Parity with MCP operator_provision: real provisioning (spends
-                # money, enrolls tailnet) requires a fresh dry-run preview.
-                refused = cli_mutation_gate(
-                    "operator_provision",
+        # Single-writer gate. The final mutation owner for a box command is
+        # this dispatch: everything the command writes -- inventory, journal,
+        # markers, runtime state -- happens inside one lease on one canonical
+        # root, acquired exactly once here rather than per helper. Reads and
+        # true dry-runs select no boundary and stay unlocked, so `status` and
+        # `--dry-run` remain available while a writer holds.
+        with contextlib.ExitStack() as _mutation_stack:
+            _boundary = box_lease_boundary(args, down_confirmed=down_confirmed)
+            if _boundary is not None:
+                _mutation_stack.enter_context(
+                    state_root_lease(
+                        _boundary,
+                        repo_root=REPO_ROOT,
+                        annotations={"command": str(args.command)},
+                    )
+                )
+            if args.command == "capabilities":
+                emit_json(box_capabilities_payload())
+                return EXIT_OK
+            if args.command == "robot-docs":
+                guide = box_robot_docs_guide()
+                if args.format == "json":
+                    emit_json({"ok": True, "topic": args.topic, "guide": guide})
+                else:
+                    print(guide.rstrip())
+                return EXIT_OK
+            if args.command == "robot-triage":
+                emit_json(box_robot_triage_payload())
+                return EXIT_OK
+            if args.command == "up":
+                if not args.dry_run:
+                    # Parity with MCP operator_provision: real provisioning (spends
+                    # money, enrolls tailnet) requires a fresh dry-run preview.
+                    refused = cli_mutation_gate(
+                        "operator_provision",
+                        args.box_id,
+                        fmt=args.format,
+                        command_hint=(
+                            f"python3 scripts/box.py up {args.box_id} "
+                            f"--profile {args.profile} --dry-run --format json"
+                        ),
+                    )
+                    if refused is not None:
+                        return refused
+                result = cmd_up(
+                    args.box_id,
+                    profile_name=args.profile,
+                    blueprint=args.blueprint,
+                    set_args=args.set,
+                    deploy_manifest=args.deploy_manifest,
+                    resume=args.resume,
+                    dry_run=args.dry_run,
+                    fmt=args.format,
+                )
+                if args.dry_run and result == EXIT_OK:
+                    stamp_cli_dryrun_marker("operator_provision", args.box_id)
+                elif not args.dry_run:
+                    # CONSUME-ON-DISPATCH: the gate passed and the real run was
+                    # issued, so the marker is spent whatever the exit code. A
+                    # half-provisioned box is exactly the state a fresh preview
+                    # exists to describe.
+                    clear_cli_dryrun_marker("operator_provision", args.box_id)
+                return result
+            if args.command == "down":
+                if not args.dry_run and down_confirmed:
+                    refused = cli_mutation_gate(
+                        "operator_teardown",
+                        args.box_id,
+                        fmt=args.format,
+                        command_hint=f"python3 scripts/box.py down {args.box_id} --dry-run --format json",
+                    )
+                    if refused is not None:
+                        return refused
+                result = cmd_down(
+                    args.box_id,
+                    dry_run=args.dry_run,
+                    fmt=args.format,
+                    confirmed=down_confirmed,
+                    confirmation_mismatch=confirmation_mismatch,
+                )
+                if args.dry_run and result == EXIT_OK:
+                    stamp_cli_dryrun_marker("operator_teardown", args.box_id)
+                elif not args.dry_run and down_confirmed:
+                    # CONSUME-ON-DISPATCH: a teardown that failed partway (droplet
+                    # deleted, volume cleanup stuck) has still destroyed state; the
+                    # retry must be previewed against the NEW state, not authorized
+                    # by the marker the first attempt already spent.
+                    clear_cli_dryrun_marker("operator_teardown", args.box_id)
+                return result
+            if args.command == "upgrade":
+                upgrade_key = _upgrade_marker_key(args.box_id, args.deploy_manifest)
+                if not args.dry_run:
+                    refused = cli_mutation_gate(
+                        "operator_upgrade",
+                        upgrade_key,
+                        display=args.box_id,
+                        fmt=args.format,
+                        command_hint=(
+                            f"python3 scripts/box.py upgrade {args.box_id} "
+                            f"--deploy-manifest {args.deploy_manifest} --dry-run --format json"
+                        ),
+                    )
+                    if refused is not None:
+                        return refused
+                result = cmd_upgrade(
+                    args.box_id,
+                    deploy_manifest=args.deploy_manifest,
+                    dry_run=args.dry_run,
+                    fmt=args.format,
+                )
+                if args.dry_run and result == EXIT_OK:
+                    stamp_cli_dryrun_marker("operator_upgrade", upgrade_key)
+                elif not args.dry_run:
+                    # CONSUME-ON-DISPATCH: a failed upgrade leaves the box between
+                    # releases, so the retry is a new mutating action.
+                    clear_cli_dryrun_marker("operator_upgrade", upgrade_key)
+                return result
+            if args.command == "status":
+                return cmd_status(
                     args.box_id,
                     fmt=args.format,
-                    command_hint=(
-                        f"python3 scripts/box.py up {args.box_id} "
-                        f"--profile {args.profile} --dry-run --format json"
-                    ),
+                    write_cache=args.write_cache,
+                    history=args.history,
+                    probe=not args.no_probe,
                 )
-                if refused is not None:
-                    return refused
-            result = cmd_up(
-                args.box_id,
-                profile_name=args.profile,
-                blueprint=args.blueprint,
-                set_args=args.set,
-                deploy_manifest=args.deploy_manifest,
-                resume=args.resume,
-                dry_run=args.dry_run,
-                fmt=args.format,
-            )
-            if args.dry_run and result == EXIT_OK:
-                stamp_cli_dryrun_marker("operator_provision", args.box_id)
-            elif not args.dry_run:
-                # CONSUME-ON-DISPATCH: the gate passed and the real run was
-                # issued, so the marker is spent whatever the exit code. A
-                # half-provisioned box is exactly the state a fresh preview
-                # exists to describe.
-                clear_cli_dryrun_marker("operator_provision", args.box_id)
-            return result
-        if args.command == "down":
-            if not args.dry_run and down_confirmed:
-                refused = cli_mutation_gate(
-                    "operator_teardown",
+            if args.command == "inventory-rebuild":
+                return cmd_inventory_rebuild(from_journal=args.from_journal, fmt=args.format)
+            if args.command == "posture-proof":
+                return cmd_posture_proof(args.box_id, fmt=args.format)
+            if args.command == "ssh":
+                return cmd_ssh(args.box_id)
+            if args.command == "exec":
+                plan = box_exec_plan(args.box_id, list(args.remote_command or []))
+                mutating = plan["classification"]["verdict"] != "read-only"
+                if not args.dry_run and mutating:
+                    # Parity with MCP operator_box_exec: a mutating/unknown command
+                    # needs a fresh preview of the IDENTICAL command (marker bound
+                    # to box id + command hash) from a committed tree.
+                    refused = cli_mutation_gate(
+                        BOX_EXEC_MARKER_TOOL,
+                        plan["marker_key"],
+                        display=f"{args.box_id}: {plan['command']}",
+                        fmt=args.format,
+                        command_hint=box_exec_command_hint(args.box_id, plan["command"]),
+                    )
+                    if refused is not None:
+                        return refused
+                result = cmd_exec(
                     args.box_id,
+                    command_argv=list(args.remote_command or []),
+                    dry_run=args.dry_run,
+                    timeout=args.timeout,
                     fmt=args.format,
-                    command_hint=f"python3 scripts/box.py down {args.box_id} --dry-run --format json",
                 )
-                if refused is not None:
-                    return refused
-            result = cmd_down(
-                args.box_id,
-                dry_run=args.dry_run,
-                fmt=args.format,
-                confirmed=down_confirmed,
-                confirmation_mismatch=confirmation_mismatch,
-            )
-            if args.dry_run and result == EXIT_OK:
-                stamp_cli_dryrun_marker("operator_teardown", args.box_id)
-            elif not args.dry_run and down_confirmed:
-                # CONSUME-ON-DISPATCH: a teardown that failed partway (droplet
-                # deleted, volume cleanup stuck) has still destroyed state; the
-                # retry must be previewed against the NEW state, not authorized
-                # by the marker the first attempt already spent.
-                clear_cli_dryrun_marker("operator_teardown", args.box_id)
-            return result
-        if args.command == "upgrade":
-            upgrade_key = _upgrade_marker_key(args.box_id, args.deploy_manifest)
-            if not args.dry_run:
-                refused = cli_mutation_gate(
-                    "operator_upgrade",
-                    upgrade_key,
-                    display=args.box_id,
+                if args.dry_run and result == EXIT_OK:
+                    stamp_cli_dryrun_marker(BOX_EXEC_MARKER_TOOL, plan["marker_key"])
+                # The marker is consumed inside cmd_exec at the dispatch moment
+                # (CONSUME-ON-DISPATCH), not here on a successful exit — a mutating
+                # command that fails after mutating must not stay replayable.
+                return result
+            if args.command == "compose-up":
+                # No mutation gate on purpose: constructive, reversible by the gated
+                # compose-down. See _box_agent_command("compose-up")["gate_policy"].
+                return cmd_compose_up(
+                    build=args.build,
+                    surfaces=args.surfaces,
+                    dry_run=args.dry_run,
                     fmt=args.format,
-                    command_hint=(
-                        f"python3 scripts/box.py upgrade {args.box_id} "
-                        f"--deploy-manifest {args.deploy_manifest} --dry-run --format json"
-                    ),
                 )
-                if refused is not None:
-                    return refused
-            result = cmd_upgrade(
-                args.box_id,
-                deploy_manifest=args.deploy_manifest,
-                dry_run=args.dry_run,
-                fmt=args.format,
-            )
-            if args.dry_run and result == EXIT_OK:
-                stamp_cli_dryrun_marker("operator_upgrade", upgrade_key)
-            elif not args.dry_run:
-                # CONSUME-ON-DISPATCH: a failed upgrade leaves the box between
-                # releases, so the retry is a new mutating action.
-                clear_cli_dryrun_marker("operator_upgrade", upgrade_key)
-            return result
-        if args.command == "status":
-            return cmd_status(
-                args.box_id,
-                fmt=args.format,
-                write_cache=args.write_cache,
-                history=args.history,
-                probe=not args.no_probe,
-            )
-        if args.command == "inventory-rebuild":
-            return cmd_inventory_rebuild(from_journal=args.from_journal, fmt=args.format)
-        if args.command == "posture-proof":
-            return cmd_posture_proof(args.box_id, fmt=args.format)
-        if args.command == "ssh":
-            return cmd_ssh(args.box_id)
-        if args.command == "exec":
-            plan = box_exec_plan(args.box_id, list(args.remote_command or []))
-            mutating = plan["classification"]["verdict"] != "read-only"
-            if not args.dry_run and mutating:
-                # Parity with MCP operator_box_exec: a mutating/unknown command
-                # needs a fresh preview of the IDENTICAL command (marker bound
-                # to box id + command hash) from a committed tree.
-                refused = cli_mutation_gate(
-                    BOX_EXEC_MARKER_TOOL,
-                    plan["marker_key"],
-                    display=f"{args.box_id}: {plan['command']}",
+            if args.command == "compose-down":
+                if not args.dry_run:
+                    refused = cli_mutation_gate(
+                        COMPOSE_DOWN_MARKER_TOOL,
+                        COMPOSE_DOWN_MARKER_KEY,
+                        display="the local compose stack",
+                        fmt=args.format,
+                        command_hint="python3 scripts/box.py compose-down --dry-run --format json",
+                    )
+                    if refused is not None:
+                        return refused
+                result = cmd_compose_down(dry_run=args.dry_run, fmt=args.format)
+                if args.dry_run and result == EXIT_OK:
+                    stamp_cli_dryrun_marker(COMPOSE_DOWN_MARKER_TOOL, COMPOSE_DOWN_MARKER_KEY)
+                # Consumption happens inside cmd_compose_down at the dispatch moment
+                # (CONSUME-ON-DISPATCH), so a failed `down` cannot be replayed.
+                return result
+            if args.command in ("register", "import"):
+                return cmd_register(
+                    args.box_id,
+                    host=args.host,
+                    profile_name=args.profile,
+                    ssh_user=args.ssh_user,
+                    force=args.force,
+                    probe=not args.no_probe,
                     fmt=args.format,
-                    command_hint=box_exec_command_hint(args.box_id, plan["command"]),
                 )
-                if refused is not None:
-                    return refused
-            result = cmd_exec(
-                args.box_id,
-                command_argv=list(args.remote_command or []),
-                dry_run=args.dry_run,
-                timeout=args.timeout,
-                fmt=args.format,
-            )
-            if args.dry_run and result == EXIT_OK:
-                stamp_cli_dryrun_marker(BOX_EXEC_MARKER_TOOL, plan["marker_key"])
-            # The marker is consumed inside cmd_exec at the dispatch moment
-            # (CONSUME-ON-DISPATCH), not here on a successful exit — a mutating
-            # command that fails after mutating must not stay replayable.
-            return result
-        if args.command == "compose-up":
-            # No mutation gate on purpose: constructive, reversible by the gated
-            # compose-down. See _box_agent_command("compose-up")["gate_policy"].
-            return cmd_compose_up(
-                build=args.build,
-                surfaces=args.surfaces,
-                dry_run=args.dry_run,
-                fmt=args.format,
-            )
-        if args.command == "compose-down":
-            if not args.dry_run:
-                refused = cli_mutation_gate(
-                    COMPOSE_DOWN_MARKER_TOOL,
-                    COMPOSE_DOWN_MARKER_KEY,
-                    display="the local compose stack",
+            if args.command == "unregister":
+                return cmd_unregister(args.box_id, fmt=args.format)
+            if args.command == "list":
+                return cmd_list(fmt=args.format, machine=getattr(args, "machine", None))
+            if args.command == "place":
+                return cmd_place(
+                    needs=list(args.needs or []),
+                    need_trust=args.need_trust,
+                    allow_provision=args.allow_provision,
+                    allow_unverified=args.allow_unverified,
                     fmt=args.format,
-                    command_hint="python3 scripts/box.py compose-down --dry-run --format json",
                 )
-                if refused is not None:
-                    return refused
-            result = cmd_compose_down(dry_run=args.dry_run, fmt=args.format)
-            if args.dry_run and result == EXIT_OK:
-                stamp_cli_dryrun_marker(COMPOSE_DOWN_MARKER_TOOL, COMPOSE_DOWN_MARKER_KEY)
-            # Consumption happens inside cmd_compose_down at the dispatch moment
-            # (CONSUME-ON-DISPATCH), so a failed `down` cannot be replayed.
-            return result
-        if args.command in ("register", "import"):
-            return cmd_register(
-                args.box_id,
-                host=args.host,
-                profile_name=args.profile,
-                ssh_user=args.ssh_user,
-                force=args.force,
-                probe=not args.no_probe,
-                fmt=args.format,
-            )
-        if args.command == "unregister":
-            return cmd_unregister(args.box_id, fmt=args.format)
-        if args.command == "list":
-            return cmd_list(fmt=args.format, machine=getattr(args, "machine", None))
-        if args.command == "place":
-            return cmd_place(
-                needs=list(args.needs or []),
-                need_trust=args.need_trust,
-                allow_provision=args.allow_provision,
-                allow_unverified=args.allow_unverified,
-                fmt=args.format,
-            )
-        if args.command == "profiles":
-            return cmd_profiles(fmt=args.format)
+            if args.command == "profiles":
+                return cmd_profiles(fmt=args.format)
+    except StateLeaseUnavailable as exc:
+        # An ungated mutation is never the degrade path: if the single-writer
+        # lease cannot be reached, refuse rather than write anyway.
+        emit_json(structured_error(
+            str(exc),
+            error_type="state_lease_unavailable",
+            recovery_hint=(
+                "Run from the repo root so runtime_manager.state_mutation is importable, "
+                "then retry."
+            ),
+        ))
+        return EXIT_ERROR
     except InventoryCorruptError as exc:
         emit_json(exc.payload)
         return EXIT_ERROR

@@ -1,0 +1,6 @@
+{
+  "name": "@sp/api",
+  "scripts": {
+    "test": "node --test"
+  }
+}

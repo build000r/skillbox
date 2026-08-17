@@ -207,6 +207,39 @@ one into an Amp thread, NTM message, Bead, issue comment, result artifact,
 setup log, or shell command literal. Automatic redaction is defense in depth,
 not a delivery mechanism.
 
+On 2026-07-30 a `tag:orb` auth key was embedded in an `amp -x` prompt and had to
+be rotated. A key on a command line lands in the shell history, the process
+table, and the agent transcript at the same instant, and none of those can be
+retracted — which is why rotation, not redaction, was the only remedy.
+
+`scripts/secret-prompt-guard` mechanizes this rule. Put it in front of any
+command whose arguments an agent composed:
+
+```bash
+scripts/secret-prompt-guard -- amp -x "…"
+scripts/secret-prompt-guard -- ntm send …
+```
+
+A clean command is `exec`'d unchanged and keeps its own exit code. An argument
+matching a credential shape (`tskey-auth-`, `sk-`, `AKIA`, `ghp_`,
+`Bearer …`) is refused with exit **3** before the command runs. The refusal
+names the shape, the argv index, and a SHA-256 fingerprint — never the value,
+because a guard that echoes what it caught copies the secret into the transcript
+it exists to protect.
+
+`SKILLBOX_ALLOW_SECRET_PROMPT=1` downgrades a block to a warning for a genuine
+false positive. It still prints the finding, so an override is visible in the
+transcript rather than silent; there is no silent-pass mode.
+
+The guard reads argv, which is what leaked. A command that reads a secret from a
+file descriptor itself is outside what argv inspection can observe: this narrows
+a well-attested hole, it does not close the category.
+
+`scripts/dcg-packs/secrets-prompt-guard.yaml` carries the same five shapes as a
+DCG external pack, for the Bash/PreToolUse path. It is **not loaded yet** —
+loading needs `[packs].custom_paths` in the generated `.dcg.toml`. Both halves
+are needed: DCG never sees a human typing `amp -x` in a terminal.
+
 ## Operator device access + key lifecycle
 
 Run every API step in this section only from the trusted Mac lane. The examples
@@ -223,8 +256,16 @@ every operator-owned device full access to d3, verified 2026-07-31: a Mac
 The tailnet has exactly one member (other identities are shared-in, not
 members), so `autogroup:member` adds nothing here either.
 
+> **Addresses in this page are placeholders.** `100.100.1.3` stands in for d3
+> throughout; the whole `100.100.0.0/16` range is reserved here for fake tailnet
+> IPs so no real fleet address enters the public tree. Substitute the real value
+> from the private fleet registry (`SKILLBOX_CLIPBOARD_HOSTS`, or
+> `SKILLBOX_BOX_HEALTH_URL` for `scripts/orb/join-tailnet.sh`) when you run these
+> commands, and never paste it back into this file.
+
 Only if operator devices ever lose that blanket self-grant, append this object
-to the top-level `grants` array (d3's tailnet IP is `100.100.1.3`):
+to the top-level `grants` array (substituting d3's real tailnet IP for the
+`100.100.1.3` placeholder):
 
 ```json
 {
@@ -559,6 +600,10 @@ substitute.
   dummy-addr step, `systemctl restart tailscaled`, then
   `tailscale up --authkey=...`. Wake preamble should be:
   `curl -s --max-time 8 http://<box>:8443/healthz || <full re-join>`.
+  `scripts/orb/join-tailnet.sh --resume` implements exactly that, but it can
+  only reach `<box>` when `SKILLBOX_BOX_HEALTH_URL` (or `--box-health-url`)
+  supplies the real endpoint; its built-in default is the placeholder address
+  and therefore always falls through to the full re-join.
 - **Standalone client needs the bundle verifier.** `scripts/lib/sbp_client.py`
   cass verbs are stdlib-only, but `skill pull` lazily imports
   `runtime_manager.distribution.bundle` (pure-stdlib module, ~10KB) for

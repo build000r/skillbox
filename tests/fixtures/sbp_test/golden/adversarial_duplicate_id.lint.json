@@ -1,0 +1,11 @@
+{
+  "findings": [
+    {
+      "code": "duplicate_unit_id",
+      "message": "duplicate key 'dupe'; PyYAML would silently keep the last one"
+    }
+  ],
+  "groups": {},
+  "manifest_parsed": false,
+  "unit_ids": []
+}

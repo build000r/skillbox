@@ -1,0 +1,12 @@
+schema_version: 1
+units:
+  unit:
+    command: [pytest, -q, tests/unit]
+    artifacts: [reports/unit.xml]
+  integration:
+    command: [pytest, -q, tests/integration]
+    services: [postgres]
+    artifacts: [reports/integration.xml]
+groups:
+  default: [unit]
+  full: [unit, integration]

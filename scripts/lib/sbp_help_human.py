@@ -134,6 +134,13 @@ def atlas(w: str) -> list[Group]:
             Cmd(f"{w} beads status|init|sync", "check or initialize repo-local beads state", ("mut",)),
             Cmd(f"{w} evidence --repo P", "skill invocations per repo from Cass, joined to current policy", ("json",)),
         ]),
+        Group("TESTS", "this repo's .skillbox/test.yaml contract", [
+            Cmd(f"{w} test", "summarize the repo's declared test contract; writes nothing", ("json",)),
+            Cmd(f"{w} test plan [--group G]", "resolve the units a run would execute; read-only", ("json",)),
+            Cmd(f"{w} test lint", "validate .skillbox/test.yaml units and groups; read-only", ("json",)),
+            Cmd(f"{w} test capsule", "capture the working tree; stamps tree-oid + manifest + archive sha", ("mut", "json")),
+            Cmd(f"{w} test run|dispatch", "execute/fan out units — DCG-gated, not implemented in this slice"),
+        ]),
         Group("AGENTS & AUTOMATION", "spawn, schedule, gate", [
             Cmd(f"{w} launch DIR... --request '...'", "launch one Swimmers agent per dir (alias: bulk)", ("mut", "dry", "json")),
             Cmd(f"{w} oracle \"question\"", "ask GPT-5 Pro; answer on stdout (--model instant while iterating)", ("remote",)),

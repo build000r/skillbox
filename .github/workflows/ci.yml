@@ -92,6 +92,67 @@ jobs:
       - name: Render outer model
         run: python scripts/04-reconcile.py render >/tmp/skillbox-render.json
 
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: .github/workflows/ci.yml
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --disable-pip-version-check \
+            "PyYAML==${PYYAML_VERSION}" \
+            "cryptography==${CRYPTOGRAPHY_VERSION}"
+
+      # The SAME command the canonical local gate runs (scripts/self-test.sh,
+      # lane "contract"). This job is the hosted copy for pull requests, not a
+      # second authority: it must never diverge from that lane. Read-only, so a
+      # fresh checkout with no Docker, no network and no operator state is all
+      # it needs.
+      - name: Lint the cross-surface command contract
+        run: python .env-manager/manage.py contract-lint --format json
+
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: .github/workflows/ci.yml
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --disable-pip-version-check \
+            "PyYAML==${PYYAML_VERSION}" \
+            "cryptography==${CRYPTOGRAPHY_VERSION}"
+
+      # The single-mutator contract: the inventory ratchet (every public surface
+      # classified) plus the cross-surface proof (one canonical root, one
+      # writer, and every mutating boundary gated or reviewed). Both spawn only
+      # local subprocesses against throwaway roots -- no Docker, no network, no
+      # operator state -- so a fresh checkout is all this job needs.
+      - name: Prove the single-mutator state-root contract
+        run: |
+          python -m unittest \
+            tests.test_state_mutation_inventory \
+            tests.test_state_mutation_integration
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15

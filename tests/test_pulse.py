@@ -1182,5 +1182,124 @@ class PulseStartAndTickCostTests(unittest.TestCase):
         listeners.assert_called_once_with(cache=PULSE_MODULE._listener_scan_cache)  # noqa: SLF001
 
 
+class PulseMutationWindowTests(unittest.TestCase):
+    """pulse is a daemon: it takes the lease per window, never for its lifetime.
+
+    Contention is exercised from a real SECOND PROCESS. That is not ceremony --
+    flock is per open file description, and a same-thread re-acquisition is a
+    programming error (the lease raises ``Nesting`` for it, loudly and on
+    purpose). Only another process produces the bounded ``Timeout`` a live pulse
+    would actually meet.
+    """
+
+    def setUp(self) -> None:
+        from runtime_manager import state_mutation as SM
+
+        self.SM = SM
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name).resolve()
+        (self.repo / ".skillbox-state").mkdir(parents=True)
+        self.addCleanup(setattr, SM, "_ACTIVE_RUNTIME_LEASE", None)
+
+    def _hold_root_elsewhere(self):
+        """Hold the canonical root from another process until cleanup."""
+        root = self.SM.canonical_runtime_state_root(self.repo)
+        ready = self.repo / "holder-ready"
+        source = (
+            "import sys, time\n"
+            f"sys.path.insert(0, {str(ENV_MANAGER_DIR)!r})\n"
+            "from runtime_manager import state_mutation as SM\n"
+            f"with SM.state_mutation_lease({str(root)!r}, 'manage.sync'):\n"
+            f"    open({str(ready)!r}, 'w').close()\n"
+            "    time.sleep(30)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", source],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        def stop() -> None:
+            proc.kill()
+            proc.communicate()
+
+        self.addCleanup(stop)
+        deadline = time.time() + 30
+        while time.time() < deadline and not ready.exists():
+            if proc.poll() is not None:
+                self.fail(f"holder exited early: {proc.communicate()[1]}")
+            time.sleep(0.02)
+        self.assertTrue(ready.exists(), "holder never acquired the root")
+
+    def test_the_window_is_bounded_and_short(self) -> None:
+        """An unbounded wait is an explicit non-goal of this contract."""
+        self.assertGreater(PULSE_MODULE.PULSE_LEASE_TIMEOUT_SECONDS, 0)
+        self.assertLessEqual(PULSE_MODULE.PULSE_LEASE_TIMEOUT_SECONDS, 30.0)
+
+    def test_a_window_acquires_and_releases(self) -> None:
+        with PULSE_MODULE.pulse_mutation_window("pulse.run", self.repo) as held:
+            self.assertTrue(held.held)
+            self.assertIsNotNone(self.SM.active_runtime_lease())
+        self.assertIsNone(self.SM.active_runtime_lease())
+
+    def test_a_busy_root_raises_contention_not_a_generic_error(self) -> None:
+        self._hold_root_elsewhere()
+        with self.assertRaises(PULSE_MODULE.PulseLeaseContention) as raised:
+            with PULSE_MODULE.pulse_mutation_window("pulse.run", self.repo, timeout=0.3):
+                self.fail("the window body must not run while the root is held")
+        self.assertEqual(raised.exception.boundary_id, "pulse.run")
+        self.assertTrue(raised.exception.code)
+
+    def test_a_contended_tick_is_skipped_without_mutating(self) -> None:
+        """Skipping is safe precisely because the body never ran."""
+        self._hold_root_elsewhere()
+        state = PULSE_MODULE.PulseState()
+        ran: list[int] = []
+        try:
+            with PULSE_MODULE.pulse_mutation_window("pulse.run", self.repo, timeout=0.3):
+                ran.append(1)
+        except PULSE_MODULE.PulseLeaseContention as exc:
+            state.lease_contentions += 1
+            PULSE_MODULE.log_lease_contention("cycle", exc)
+        self.assertEqual(ran, [], "a contended tick must mutate nothing")
+        self.assertEqual(state.lease_contentions, 1)
+
+    def test_contention_is_visible_in_the_snapshot_not_only_the_log(self) -> None:
+        state = PULSE_MODULE.PulseState()
+        self.assertEqual(state.to_dict()["lease_contentions"], 0)
+        state.lease_contentions += 2
+        self.assertEqual(state.to_dict()["lease_contentions"], 2)
+
+    def test_a_same_thread_reacquisition_stays_a_loud_bug_not_contention(self) -> None:
+        """Nesting without proving ownership is a programming error, not a queue."""
+        with self.SM.runtime_mutation_lease("pulse.run", root_dir=self.repo):
+            root = self.SM.canonical_runtime_state_root(self.repo)
+            with self.assertRaises(self.SM.StateMutationLeaseNesting):
+                with self.SM.state_mutation_lease(root, "pulse.run"):
+                    pass
+
+    def test_the_stale_pid_cleanup_defers_rather_than_forcing(self) -> None:
+        """`pulse status` stays answerable while a writer holds the root."""
+        pid_path = PULSE_MODULE.pulse_pid_path(self.repo)
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text("999999\n", encoding="utf-8")
+        self._hold_root_elsewhere()
+        with mock.patch.object(PULSE_MODULE, "process_is_running", return_value=False):
+            with mock.patch.object(PULSE_MODULE, "PULSE_LEASE_TIMEOUT_SECONDS", 0.3):
+                self.assertIsNone(PULSE_MODULE.existing_pid(self.repo))
+        # Deferred, not forced: the answer is unchanged and the file survives.
+        self.assertTrue(pid_path.exists())
+
+    def test_the_stale_pid_cleanup_happens_when_the_root_is_free(self) -> None:
+        pid_path = PULSE_MODULE.pulse_pid_path(self.repo)
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text("999999\n", encoding="utf-8")
+        with mock.patch.object(PULSE_MODULE, "process_is_running", return_value=False):
+            self.assertIsNone(PULSE_MODULE.existing_pid(self.repo))
+        self.assertFalse(pid_path.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

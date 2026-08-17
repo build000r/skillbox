@@ -11,6 +11,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -1542,6 +1543,16 @@ except RuntimeError as exc:
 
         # `_handle_sync` emits `.actions` as OBJECTS. `sync_runtime_records` is the
         # structured producer; context actions are normalized into the same schema.
+        # The environment-inventory refresh is hooked onto the tail of sync and is
+        # a real writer, so it is stubbed here for the same reason the other two
+        # producers are: this case asserts the record list, not the filesystem.
+        cache_record = {
+            "id": "environment-inventory-cache",
+            "kind": "inventory",
+            "ok": True,
+            "wrote": True,
+            "text": "refreshed environment-inventory cache: /srv/cache.json",
+        }
         with (
             mock.patch.object(
                 CLI,
@@ -1550,6 +1561,9 @@ except RuntimeError as exc:
             ),
             mock.patch.object(CLI, "sync_context", return_value=["write-context: home/.claude/CLAUDE.md"]),
             mock.patch.object(CLI, "resolve_context_dir", return_value=None),
+            mock.patch.object(
+                CLI, "refresh_environment_inventory_cache", return_value=dict(cache_record)
+            ),
             mock.patch.object(CLI, "emit_json", side_effect=emitted.append),
         ):
             self.assertEqual(CLI._handle_sync(_ns(context_dir=None, format="json"), root, model, "reuse"), CLI.EXIT_OK)
@@ -1558,6 +1572,11 @@ except RuntimeError as exc:
             [
                 ("box", "repo", "exists: /srv/box"),
                 ("home-claude-claude-md", "context", "write-context: home/.claude/CLAUDE.md"),
+                (
+                    "environment-inventory-cache",
+                    "inventory",
+                    "refreshed environment-inventory cache: /srv/cache.json",
+                ),
             ],
         )
 
@@ -1569,14 +1588,21 @@ except RuntimeError as exc:
             ),
             mock.patch.object(CLI, "sync_context", return_value=["write-context: home/.claude/CLAUDE.md"]),
             mock.patch.object(CLI, "resolve_context_dir", return_value=None),
+            mock.patch.object(
+                CLI, "refresh_environment_inventory_cache", return_value=dict(cache_record)
+            ) as refresh,
             redirect_stdout(StringIO()) as sync_stdout,
         ):
             self.assertEqual(CLI._handle_sync(_ns(context_dir=None, format="text"), root, model, "reuse"), CLI.EXIT_OK)
         # Text output stays the verbatim human-readable lines, not record reprs.
         self.assertEqual(
             sync_stdout.getvalue(),
-            "exists: /srv/box\nwrite-context: home/.claude/CLAUDE.md\n",
+            "exists: /srv/box\nwrite-context: home/.claude/CLAUDE.md\n"
+            "refreshed environment-inventory cache: /srv/cache.json\n",
         )
+        # The hook forwards sync's own dry-run, which is what keeps
+        # `sync --dry-run` a true dry run rather than a preview that writes.
+        self.assertEqual({"dry_run": False}, refresh.call_args.kwargs)
 
         with (
             mock.patch.object(CLI, "sync_context", return_value=["context"]),
@@ -2543,6 +2569,357 @@ class ExitCodeLadderContractTests(unittest.TestCase):
         self.assertEqual(usage.returncode, CLI.EXIT_USAGE, usage.stdout)
         self.assertEqual(json.loads(usage.stdout)["error"]["code"], "USAGE_ERROR")
         self.assertNotEqual(drift.returncode, usage.returncode)
+
+
+class SkillDefaultDryRunIsWriteFreeTests(unittest.TestCase):
+    """`skill default --repos/--category --dry-run` must not write.
+
+    It used to stamp the review marker that authorizes the matching apply, so a
+    preview silently granted its own consent (skillbox-nominal-reads-that-write-kxm5).
+    Recording is now an explicit act via --record-review; the apply gate itself
+    is unchanged, so consent is no weaker -- just no longer a side effect.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.state_root = Path(self._tmp.name)
+        patcher = mock.patch.dict(
+            os.environ, {"SKILLBOX_STATE_ROOT": str(self.state_root)}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _review_files(self) -> list[Path]:
+        review_dir = self.state_root / "skill-default-previews"
+        if not review_dir.is_dir():
+            return []
+        return sorted(review_dir.glob("*.json"))
+
+    def _payload(self, *, record_review: bool) -> dict:
+        args = _ns(
+            skill_name="wiki",
+            default_action="on",
+            cwd=str(self.state_root),
+            default_repos="alpha",
+            default_category=None,
+            record_review=record_review,
+            dry_run=True,
+        )
+        with mock.patch.object(CLI, "resolve_skill_default_targets", return_value=[]):
+            return CLI._build_fleet_skill_default_payload(args, {}, dry_run=True)
+
+    def test_plain_dry_run_writes_nothing(self) -> None:
+        payload = self._payload(record_review=False)
+
+        self.assertEqual([], self._review_files(), "a --dry-run must not write a marker")
+        # Not even the directory: mkdir is a write too.
+        self.assertFalse((self.state_root / "skill-default-previews").exists())
+
+        review = payload["review"]
+        self.assertFalse(review.get("recorded", False))
+        self.assertFalse(review["present"])
+        self.assertTrue(review["required_for_apply"])
+
+    def test_plain_dry_run_teaches_how_to_record_review(self) -> None:
+        payload = self._payload(record_review=False)
+        self.assertTrue(
+            any("--record-review" in action for action in payload["next_actions"]),
+            f"dry-run must point at the consent step, got {payload['next_actions']}",
+        )
+
+    def test_record_review_opt_in_still_writes_the_marker(self) -> None:
+        payload = self._payload(record_review=True)
+
+        written = self._review_files()
+        self.assertEqual(1, len(written), "--record-review must record consent")
+        self.assertTrue(payload["review"]["recorded"])
+        self.assertEqual(
+            payload["review"]["plan_sha256"], written[0].stem,
+            "marker must be bound to the plan sha it authorizes",
+        )
+
+    def test_marker_is_plan_bound_so_consent_does_not_transfer(self) -> None:
+        """Consent is per-plan: a different plan must not inherit it."""
+        first = self._payload(record_review=True)
+        args = _ns(
+            skill_name="cass",  # different skill => different plan
+            default_action="on",
+            cwd=str(self.state_root),
+            default_repos="alpha",
+            default_category=None,
+            record_review=False,
+            dry_run=True,
+        )
+        with mock.patch.object(CLI, "resolve_skill_default_targets", return_value=[]):
+            second = CLI._build_fleet_skill_default_payload(args, {}, dry_run=True)
+
+        self.assertNotEqual(first["review"]["plan_sha256"], second["review"]["plan_sha256"])
+        self.assertFalse(second["review"]["present"])
+
+
+class ContractLintCommandTests(unittest.TestCase):
+    """The CLI surface: dispatch, formats, and the exit code CI gates on."""
+
+    def _run(self, payload, fmt="json"):
+        args = argparse.Namespace(format=fmt)
+        buffer = StringIO()
+        with mock.patch.object(CLI, "contract_lint_payload", return_value=payload):
+            with redirect_stdout(buffer):
+                code = CLI._handle_contract_lint(args, ROOT_DIR)  # noqa: SLF001
+        return code, buffer.getvalue()
+
+    @staticmethod
+    def _payload(*, ok=True, gaps=(), findings=(), resolved=()):
+        return {
+            "ok": ok,
+            "schema": "skillbox.contract-lint.v1",
+            "counts": {
+                "commands": 150,
+                "registry_specs": 51,
+                "gaps": 82,
+                "new_gaps": len(gaps),
+                "policy_findings": 1,
+                "new_policy_findings": len(findings),
+                "resolved_baseline_entries": len(resolved),
+            },
+            "new_gaps": list(gaps),
+            "new_policy_findings": list(findings),
+            "resolved_baseline_entries": list(resolved),
+            "next_actions": ["no new contract drift"] if ok else ["fix it"],
+        }
+
+    def test_it_is_registered_as_a_dispatchable_command(self) -> None:
+        names = {entry[0] for entry in CLI._EARLY_COMMANDS}  # noqa: SLF001
+        self.assertIn("contract-lint", names)
+
+    def test_the_parser_accepts_json_and_text(self) -> None:
+        parser = CLI._build_parser()  # noqa: SLF001
+        self.assertEqual(parser.parse_args(["contract-lint"]).format, "json")
+        self.assertEqual(
+            parser.parse_args(["contract-lint", "--format", "text"]).format, "text"
+        )
+        with self.assertRaises(SystemExit):
+            with redirect_stderr(StringIO()):
+                parser.parse_args(["contract-lint", "--format", "yaml"])
+
+    def test_a_clean_tree_exits_zero_with_a_json_payload(self) -> None:
+        code, out = self._run(self._payload())
+        self.assertEqual(code, CLI.EXIT_OK)
+        self.assertTrue(json.loads(out)["ok"])
+
+    def test_drift_exits_nonzero_so_ci_can_gate(self) -> None:
+        code, out = self._run(
+            self._payload(
+                ok=False,
+                gaps=[{"id": "runtime:x", "kind": "live_command_unregistered", "detail": "d"}],
+            )
+        )
+        self.assertNotEqual(code, CLI.EXIT_OK)
+        self.assertEqual(code, CLI.EXIT_DRIFT)
+        self.assertFalse(json.loads(out)["ok"])
+
+    def test_the_text_form_names_the_owner_and_the_fix(self) -> None:
+        code, out = self._run(
+            self._payload(
+                ok=False,
+                findings=[
+                    {
+                        "surface": "box:nuke",
+                        "source": "scripts/box.py:build_parser",
+                        "owner": "scripts/box.py",
+                        "invariant": "destructive_preview_available",
+                        "detail": "no preview",
+                        "fix": "add --dry-run",
+                    }
+                ],
+            ),
+            fmt="text",
+        )
+        self.assertEqual(code, CLI.EXIT_DRIFT)
+        self.assertIn("DRIFT", out)
+        self.assertIn("box:nuke", out)
+        self.assertIn("scripts/box.py", out)
+        self.assertIn("add --dry-run", out)
+
+    def test_the_text_form_stays_quiet_when_clean(self) -> None:
+        code, out = self._run(self._payload(), fmt="text")
+        self.assertEqual(code, CLI.EXIT_OK)
+        self.assertIn("contract-lint ok", out)
+        self.assertNotIn("DRIFT", out)
+
+    def test_the_safe_first_try_hint_is_the_json_form(self) -> None:
+        self.assertEqual(
+            CLI._safe_first_try_command("contract-lint"),  # noqa: SLF001
+            "manage.py contract-lint --format json",
+        )
+
+    def test_the_command_runs_end_to_end_from_a_subprocess(self) -> None:
+        """Fresh-process proof: this is exactly what the gate and CI invoke."""
+        proc = subprocess.run(
+            [sys.executable, str(ENV_MANAGER_DIR / "manage.py"), "contract-lint", "--format", "json"],
+            cwd=str(ROOT_DIR),
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        payload = json.loads(proc.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["schema"], "skillbox.contract-lint.v1")
+
+
+class RuntimeDispatchLeaseTests(unittest.TestCase):
+    """Dispatch consults the canonical manifest and gates on it.
+
+    There is no second table here: the boundary comes from
+    ``state_mutation.MANIFEST``, so a surface that is classified as a mutation
+    is a surface that is gated, and the coverage ratchet refuses to let a new
+    public surface ship unclassified.
+    """
+
+    def setUp(self) -> None:
+        from runtime_manager import state_mutation as SM
+
+        self.SM = SM
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name).resolve()
+        (self.repo / ".skillbox-state").mkdir(parents=True)
+        self.addCleanup(setattr, SM, "_ACTIVE_RUNTIME_LEASE", None)
+
+    # -- boundary selection --------------------------------------------------
+
+    def test_a_read_selects_no_boundary(self) -> None:
+        for command in ("status", "graph", "explain", "capabilities"):
+            with self.subTest(command=command):
+                args = argparse.Namespace(command=command)
+                self.assertIsNone(self.SM.manage_boundary_for(args))
+
+    def test_a_real_mutation_selects_its_manifest_boundary(self) -> None:
+        args = argparse.Namespace(command="sync", dry_run=False)
+        self.assertEqual(self.SM.manage_boundary_for(args), "manage.sync")
+
+    def test_a_true_dry_run_selects_no_boundary(self) -> None:
+        """A preview that queued behind a writer would not be lock-free."""
+        args = argparse.Namespace(command="sync", dry_run=True)
+        self.assertIsNone(self.SM.manage_boundary_for(args))
+
+    def test_subactions_resolve_to_their_own_boundary(self) -> None:
+        gated = argparse.Namespace(command="state-backup", state_backup_action="restore")
+        reader = argparse.Namespace(command="state-backup", state_backup_action="verify")
+        self.assertEqual(
+            self.SM.manage_boundary_for(gated), "manage.state-backup.restore"
+        )
+        self.assertIsNone(self.SM.manage_boundary_for(reader))
+
+    def test_every_selected_boundary_is_a_declared_mutation(self) -> None:
+        """A read can never take the write lease; the lease itself refuses it."""
+        for command, leaf in (("sync", None), ("skill", "off"), ("state-backup", "restore")):
+            with self.subTest(command=command, leaf=leaf):
+                fields = {"command": command, "dry_run": False}
+                if leaf is not None:
+                    fields[f"{command.replace('-', '_')}_action"] = leaf
+                boundary_id = self.SM.manage_boundary_for(argparse.Namespace(**fields))
+                self.assertIsNotNone(boundary_id)
+                self.assertTrue(self.SM.boundary(boundary_id).is_mutation)
+
+    # -- the canonical root --------------------------------------------------
+
+    def test_the_runtime_and_operator_halves_resolve_one_root(self) -> None:
+        """Two halves canonicalizing differently would each hold a lock and each
+        believe it was the single writer."""
+        sys.path.insert(0, str(ROOT_DIR / "scripts"))
+        from lib import opslib
+
+        for override in (None, "state/here", str(self.repo / "abs-root")):
+            with self.subTest(override=override):
+                env = {} if override is None else {"SKILLBOX_STATE_ROOT": override}
+                with mock.patch.dict(os.environ, env, clear=False):
+                    if override is None:
+                        os.environ.pop("SKILLBOX_STATE_ROOT", None)
+                    self.assertEqual(
+                        self.SM.canonical_runtime_state_root(self.repo),
+                        opslib.resolve_state_root(self.repo),
+                    )
+
+    # -- nesting -------------------------------------------------------------
+
+    def test_nested_work_reuses_the_held_lease_instead_of_deadlocking(self) -> None:
+        """focus -> sync inside one dispatch: one lease, no second flock."""
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SKILLBOX_STATE_ROOT", None)
+            with self.SM.runtime_mutation_lease(
+                "manage.focus", root_dir=self.repo
+            ) as outer:
+                self.assertIs(self.SM.active_runtime_lease(), outer)
+                with self.SM.runtime_mutation_lease("manage.sync", root_dir=self.repo):
+                    self.assertIs(self.SM.active_runtime_lease(), outer)
+                self.assertTrue(outer.held)
+        self.assertIsNone(self.SM.active_runtime_lease())
+
+    def test_the_lease_is_released_when_the_body_raises(self) -> None:
+        class Boom(RuntimeError):
+            pass
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SKILLBOX_STATE_ROOT", None)
+            with self.assertRaises(Boom):
+                with self.SM.runtime_mutation_lease("manage.sync", root_dir=self.repo):
+                    raise Boom()
+        self.assertIsNone(self.SM.active_runtime_lease())
+
+    # -- contention ----------------------------------------------------------
+
+    def test_contention_is_reported_with_the_boundary_and_never_swallowed(self) -> None:
+        args = argparse.Namespace(command="sync", dry_run=False, format="json")
+        timeout = self.SM.StateMutationLeaseTimeout(
+            "busy",
+            state_root=str(self.repo / ".skillbox-state"),
+            boundary_id="manage.sync",
+            operation_id="manage.sync@1.1",
+        )
+        buffer = StringIO()
+        with redirect_stdout(buffer):
+            code = CLI._emit_lease_contention(args, "manage.sync", timeout)  # noqa: SLF001
+        self.assertNotEqual(code, CLI.EXIT_OK)
+        payload = json.loads(buffer.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["context"]["boundary_id"], "manage.sync")
+        self.assertTrue(payload["error"]["next_actions"])
+
+    def test_a_gated_command_runs_inside_the_lease(self) -> None:
+        """The handler observes a held lease; a read handler does not."""
+        seen: list[object] = []
+
+        def handler(args, root_dir):
+            seen.append(self.SM.active_runtime_lease())
+            return CLI.EXIT_OK
+
+        spec = SimpleNamespace(name="sync", handler=handler, loads_model=False)
+        with mock.patch.dict(CLI._COMMAND_REGISTRY, {"sync": spec}):  # noqa: SLF001
+            with mock.patch.dict(CLI._EARLY_DISPATCH, {}, clear=False):  # noqa: SLF001
+                with mock.patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("SKILLBOX_STATE_ROOT", None)
+                    args = argparse.Namespace(command="sync", dry_run=False, format="json")
+                    code = CLI._dispatch_registered_command(args, self.repo, "local")  # noqa: SLF001
+        self.assertEqual(code, CLI.EXIT_OK)
+        self.assertEqual(len(seen), 1)
+        self.assertIsNotNone(seen[0], "a gated command must run under the lease")
+
+    def test_a_read_command_runs_without_a_lease(self) -> None:
+        seen: list[object] = []
+
+        def handler(args, root_dir):
+            seen.append(self.SM.active_runtime_lease())
+            return CLI.EXIT_OK
+
+        spec = SimpleNamespace(name="status", handler=handler, loads_model=False)
+        with mock.patch.dict(CLI._COMMAND_REGISTRY, {"status": spec}):  # noqa: SLF001
+            args = argparse.Namespace(command="status", format="json")
+            code = CLI._dispatch_registered_command(args, self.repo, "local")  # noqa: SLF001
+        self.assertEqual(code, CLI.EXIT_OK)
+        self.assertEqual(seen, [None], "a read must not take the write lease")
 
 
 if __name__ == "__main__":

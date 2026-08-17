@@ -22,7 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
@@ -111,6 +111,23 @@ class CheckResult:
     message: str
     details: dict[str, Any] | None = None
     fix_command: str | None = None
+    #: Extra TOP-LEVEL keys for this finding's payload entry, for checks whose
+    #: consumers assert on domain fields directly rather than reaching through
+    #: ``details``. It may not carry ``status`` or ``code``: those belong to the
+    #: doctor family vocabulary and are not a check's to redefine.
+    extra: dict[str, Any] = field(default_factory=dict)
+
+def check_result_payload(result: CheckResult) -> dict[str, Any]:
+    """Serialize a :class:`CheckResult`, omitting an empty ``extra``.
+
+    Almost no check promotes payload fields, so emitting ``"extra": {}`` on
+    every one of them would change every existing consumer's payload to say
+    nothing. Absent means absent.
+    """
+    payload = asdict(result)
+    if not payload.get("extra"):
+        payload.pop("extra", None)
+    return payload
 
 def structured_error(
     message: str,

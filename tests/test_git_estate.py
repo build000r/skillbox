@@ -29,6 +29,9 @@ if str(ENV_MANAGER_DIR) not in sys.path:
     sys.path.insert(0, str(ENV_MANAGER_DIR))
 
 from runtime_manager import git_estate  # noqa: E402
+
+from tests import helpers  # noqa: E402
+from runtime_manager import git_inventory  # noqa: E402
 from runtime_manager.git_inventory import GitRepoRecord  # noqa: E402
 
 SBP = ROOT / "scripts" / "sbp"
@@ -104,6 +107,890 @@ def _record(path: str = "/repo", **overrides) -> GitRepoRecord:
     )
     defaults.update(overrides)
     return GitRepoRecord(**defaults)
+
+
+def _lane_row(path: str, **overrides) -> dict:
+    """A minimal envelope ROW (lane planning is pure over rows, not records)."""
+    row = {
+        "path": path,
+        "risk_band": "clean",
+        "classes": ["clean-current"],
+        "registration": "registered",
+        "ahead": 0,
+        "behind": 0,
+        "staged": 0,
+        "unstaged": 0,
+        "untracked": 0,
+        "stash_count": 0,
+        "ownership": git_estate.OWNERSHIP_OPERATOR,
+        "push_policy": git_estate.PUSH_POLICY_PUSH,
+    }
+    row.update(overrides)
+    return row
+
+
+class LanePlanTests(unittest.TestCase):
+    """The envelope hands over the division the coordinator used to hand-build.
+
+    The 2026-08-15 brief partitioned 55 issue rows into 5 lanes with prose
+    write scopes; every rule it applied was mechanical. These pin the rules.
+    """
+
+    # -- the assignment ladder --------------------------------------------
+
+    def test_each_band_shape_lands_in_its_lane(self) -> None:
+        cases = {
+            git_estate.LANE_DIVERGED: _lane_row(
+                "/r/d", risk_band="diverged", classes=["ahead", "behind", "diverged-clean"],
+                ahead=2, behind=3,
+            ),
+            git_estate.LANE_DIRTY_BEHIND: _lane_row(
+                "/r/db", risk_band="dirty-behind", classes=["dirty", "behind"],
+                behind=3, unstaged=1,
+            ),
+            git_estate.LANE_CONVERGE: _lane_row(
+                "/r/b", risk_band="behind-clean", classes=["behind"], behind=4
+            ),
+            git_estate.LANE_PUSH_AHEAD: _lane_row(
+                "/r/a", risk_band="ahead", classes=["ahead"], ahead=2
+            ),
+            git_estate.LANE_SMALL_DIRTY: _lane_row(
+                "/r/s", risk_band="dirty", classes=["dirty"], unstaged=2
+            ),
+            git_estate.LANE_UNREGISTERED_DIRTY: _lane_row(
+                "/r/u", risk_band="dirty", classes=["dirty"], unstaged=1,
+                registration="unregistered",
+            ),
+        }
+        for kind, row in cases.items():
+            with self.subTest(kind=kind):
+                self.assertEqual(git_estate.lane_kind_for_row(row), kind)
+
+    def test_a_clean_row_needs_no_lane(self) -> None:
+        self.assertIsNone(git_estate.lane_kind_for_row(_lane_row("/r/clean")))
+
+    def test_every_emitted_kind_is_in_the_declared_vocabulary(self) -> None:
+        self.assertEqual(
+            set(git_estate.EMITTED_LANE_KINDS) - set(git_estate.LANE_KINDS), set()
+        )
+
+    def test_doc_only_is_declared_but_never_emitted(self) -> None:
+        # It needs file-level data the read-only glance does not probe.
+        self.assertIn(git_estate.LANE_DOC_ONLY, git_estate.LANE_KINDS)
+        self.assertNotIn(git_estate.LANE_DOC_ONLY, git_estate.EMITTED_LANE_KINDS)
+
+    # -- the convergence contract (VISION CORRECTION) ----------------------
+
+    def test_no_lane_kind_ends_in_a_side_ref(self) -> None:
+        # Safety branches are the debris a reconcile eliminates, not an
+        # outcome. There must be no lane whose end state is a new side ref.
+        for kind in git_estate.LANE_KINDS:
+            self.assertNotIn("safety", kind)
+            self.assertNotIn("backup", kind)
+            self.assertNotIn("snapshot", kind)
+
+    def test_a_convergence_lane_exists_for_behind_rows(self) -> None:
+        lanes = git_estate.build_lane_plan(
+            [_lane_row("/r/b", risk_band="behind-clean", classes=["behind"], behind=4)]
+        )
+        self.assertEqual([lane["kind"] for lane in lanes], [git_estate.LANE_CONVERGE])
+        self.assertIn("parity", lanes[0]["rationale"])
+
+    # -- typed withholds ---------------------------------------------------
+
+    def test_an_external_upstream_is_withheld_not_dispatched(self) -> None:
+        row = _lane_row(
+            "/r/ext", risk_band="ahead", classes=["ahead"], ahead=2,
+            ownership=git_estate.OWNERSHIP_EXTERNAL,
+            push_policy=git_estate.PUSH_POLICY_NO_PUSH,
+            push_policy_reason="external upstream (tetsuo-ai)",
+        )
+        self.assertEqual(git_estate.lane_kind_for_row(row), git_estate.LANE_WITHHELD)
+        lane = git_estate.build_lane_plan([row])[0]
+        self.assertEqual(lane["withheld"][0]["path"], "/r/ext")
+        self.assertIn("tetsuo-ai", lane["withheld"][0]["reason"])
+
+    def test_a_declared_remoteless_repo_is_withheld_with_its_declaration(self) -> None:
+        # Live: 5 repos are registry-declared "Deliberately remoteless".
+        # Telling an agent to add a remote to one would be actively wrong.
+        row = _lane_row(
+            "/r/local", risk_band="no-remote", classes=["no-remote"],
+            ownership=git_estate.OWNERSHIP_LOCAL,
+            push_policy=git_estate.PUSH_POLICY_NO_PUSH,
+        )
+        lane = git_estate.build_lane_plan([row])[0]
+        self.assertEqual(lane["kind"], git_estate.LANE_WITHHELD)
+        self.assertIn("by declaration", lane["withheld"][0]["reason"])
+
+    def test_a_dirty_remoteless_repo_is_still_dispatchable(self) -> None:
+        # Committing secures the work; that is safe and valuable even with
+        # nowhere to push. Only the nothing-else-to-do case is withheld.
+        row = _lane_row(
+            "/r/local", risk_band="dirty", classes=["no-remote", "dirty"],
+            unstaged=2, ownership=git_estate.OWNERSHIP_LOCAL,
+            push_policy=git_estate.PUSH_POLICY_NO_PUSH,
+        )
+        self.assertEqual(git_estate.lane_kind_for_row(row), git_estate.LANE_SMALL_DIRTY)
+
+    def test_a_mid_op_row_is_a_judgment_block(self) -> None:
+        row = _lane_row("/r/m", risk_band="mid-op", classes=["mid-op"], mid_op="merge")
+        lane = git_estate.build_lane_plan([row])[0]
+        self.assertEqual(lane["kind"], git_estate.LANE_WITHHELD)
+        self.assertIn("merge in flight", lane["withheld"][0]["reason"])
+
+    def test_a_withheld_lane_is_not_dispatchable_work(self) -> None:
+        row = _lane_row("/r/m", risk_band="mid-op", classes=["mid-op"], mid_op="rebase")
+        self.assertEqual(git_estate.build_lane_plan([row])[0]["suggested_concurrency"], 0)
+
+    def test_a_blocked_probe_is_withheld_never_silently_dropped(self) -> None:
+        row = _lane_row(
+            "/r/x", risk_band="blocked", classes=["blocked"], error="permission denied"
+        )
+        lane = git_estate.build_lane_plan([row])[0]
+        self.assertEqual(lane["kind"], git_estate.LANE_WITHHELD)
+        self.assertIn("permission denied", lane["withheld"][0]["reason"])
+
+    # -- the worktree hard rule -------------------------------------------
+
+    def test_a_repo_and_its_worktrees_never_split_across_lanes(self) -> None:
+        # The live incident: lanes partitioned by directory let L2 push L4's
+        # branch through the shared git dir.
+        parent = _lane_row("/r/main", risk_band="dirty", classes=["dirty"], unstaged=1)
+        worktree = _lane_row(
+            "/r/wt", risk_band="ahead", classes=["ahead"], ahead=3, worktree_of="/r/main"
+        )
+        lanes = git_estate.build_lane_plan([parent, worktree])
+        self.assertEqual(len(lanes), 1, "family was split across lanes")
+        self.assertEqual(
+            sorted(lanes[0]["repos"]), ["/r/main", "/r/wt"]
+        )
+
+    def test_the_family_takes_its_most_urgent_members_lane(self) -> None:
+        parent = _lane_row("/r/main", risk_band="dirty", classes=["dirty"], unstaged=1)
+        worktree = _lane_row(
+            "/r/wt", risk_band="diverged", classes=["ahead", "behind", "diverged-clean"],
+            ahead=1, behind=1, worktree_of="/r/main",
+        )
+        lanes = git_estate.build_lane_plan([parent, worktree])
+        self.assertEqual(lanes[0]["kind"], git_estate.LANE_DIVERGED)
+
+    def test_write_scope_covers_clean_siblings_on_the_shared_store(self) -> None:
+        # Writing through a shared git dir touches every worktree on it, so a
+        # CLEAN sibling still belongs to the write scope even though it is not
+        # itself a row to work.
+        parent = _lane_row("/r/main", risk_band="dirty", classes=["dirty"], unstaged=1)
+        clean_wt = _lane_row("/r/wt-clean", worktree_of="/r/main")
+        lane = git_estate.build_lane_plan([parent, clean_wt])[0]
+        self.assertEqual(lane["repos"], ["/r/main"])
+        self.assertIn("/r/wt-clean", lane["write_scope"])
+        self.assertEqual(sorted(lane["write_scope"]), ["/r/main", "/r/wt-clean"])
+
+    # -- envelope contract -------------------------------------------------
+
+    def test_absent_when_nothing_needs_a_lane(self) -> None:
+        self.assertEqual(git_estate.build_lane_plan([]), [])
+        self.assertEqual(git_estate.build_lane_plan([_lane_row("/r/clean")]), [])
+
+    def test_lane_ids_are_sequential_in_emission_order(self) -> None:
+        rows = [
+            _lane_row("/r/a", risk_band="ahead", classes=["ahead"], ahead=1),
+            _lane_row("/r/s", risk_band="dirty", classes=["dirty"], unstaged=1),
+            _lane_row("/r/m", risk_band="mid-op", classes=["mid-op"], mid_op="merge"),
+        ]
+        lanes = git_estate.build_lane_plan(rows)
+        self.assertEqual([lane["id"] for lane in lanes], ["L1", "L2", "L3"])
+        # Ladder order, not input order: withheld leads.
+        self.assertEqual(lanes[0]["kind"], git_estate.LANE_WITHHELD)
+
+    def test_the_plan_is_deterministic_across_runs_and_input_order(self) -> None:
+        rows = [
+            _lane_row("/r/b", risk_band="behind-clean", classes=["behind"], behind=1),
+            _lane_row("/r/a", risk_band="ahead", classes=["ahead"], ahead=1),
+            _lane_row("/r/s", risk_band="dirty", classes=["dirty"], unstaged=1),
+        ]
+        first = git_estate.build_lane_plan(rows)
+        self.assertEqual(first, git_estate.build_lane_plan(rows))
+        self.assertEqual(first, git_estate.build_lane_plan(list(reversed(rows))))
+
+    def test_every_lane_carries_the_full_contract(self) -> None:
+        rows = [_lane_row("/r/a", risk_band="ahead", classes=["ahead"], ahead=1)]
+        for lane in git_estate.build_lane_plan(rows):
+            for key in (
+                "id", "kind", "repos", "write_scope", "rationale", "suggested_concurrency"
+            ):
+                self.assertIn(key, lane)
+            self.assertIn(lane["kind"], git_estate.EMITTED_LANE_KINDS)
+            self.assertTrue(lane["rationale"])
+
+    def test_concurrency_is_one_per_independent_family_and_capped(self) -> None:
+        many = [
+            _lane_row(f"/r/a{i}", risk_band="ahead", classes=["ahead"], ahead=1)
+            for i in range(10)
+        ]
+        lane = git_estate.build_lane_plan(many)[0]
+        self.assertEqual(lane["suggested_concurrency"], git_estate.MAX_LANE_CONCURRENCY)
+
+    def test_worktree_families_count_once_toward_concurrency(self) -> None:
+        rows = [
+            _lane_row("/r/main", risk_band="ahead", classes=["ahead"], ahead=1),
+            _lane_row("/r/wt", risk_band="ahead", classes=["ahead"], ahead=1, worktree_of="/r/main"),
+        ]
+        lane = git_estate.build_lane_plan(rows)[0]
+        self.assertEqual(lane["suggested_concurrency"], 1)
+
+    def test_every_issue_row_lands_in_exactly_one_lane(self) -> None:
+        # The 2026-08-15 shape in miniature: no row may be dropped, and none
+        # may appear twice.
+        rows = [
+            _lane_row("/r/m", risk_band="mid-op", classes=["mid-op"], mid_op="merge"),
+            _lane_row("/r/d", risk_band="diverged", classes=["ahead", "behind", "diverged-clean"], ahead=1, behind=1),
+            _lane_row("/r/db", risk_band="dirty-behind", classes=["dirty", "behind"], behind=2, unstaged=1),
+            _lane_row("/r/b", risk_band="behind-clean", classes=["behind"], behind=1),
+            _lane_row("/r/a", risk_band="ahead", classes=["ahead"], ahead=1),
+            _lane_row("/r/u", risk_band="dirty", classes=["dirty"], unstaged=1, registration="unregistered"),
+            _lane_row("/r/s", risk_band="dirty", classes=["dirty"], unstaged=1),
+            _lane_row("/r/mech", unpushed_branches=[{"name": "f", "ahead": 1}]),
+            _lane_row("/r/clean"),
+        ]
+        lanes = git_estate.build_lane_plan(rows)
+        placed = [path for lane in lanes for path in lane["repos"]]
+        self.assertEqual(len(placed), len(set(placed)), "a row landed in two lanes")
+        expected = {r["path"] for r in rows if git_estate.lane_kind_for_row(r)}
+        self.assertEqual(set(placed), expected)
+        self.assertNotIn("/r/clean", placed)
+
+
+class MisconfiguredUpstreamBandingTests(unittest.TestCase):
+    """The top of the risk table must never be a config artifact."""
+
+    def _mismatch(self, ahead_vs: int = 0, behind_vs: int = 0):
+        return git_inventory.UpstreamMismatch(
+            configured="origin/main",
+            same_name="origin/codex/qbo",
+            ahead_vs_same_name=ahead_vs,
+            behind_vs_same_name=behind_vs,
+        )
+
+    def _cfo_record(self, **overrides) -> GitRepoRecord:
+        defaults = dict(
+            classes=frozenset({"clean-current"}),
+            primary_class="clean-current",
+            branch="codex/qbo",
+            upstream="origin/main",
+            ahead=3,
+            behind=58,
+            upstream_mismatch=self._mismatch(),
+        )
+        defaults.update(overrides)
+        return _record("/r/cfo", **defaults)
+
+    def test_the_false_diverged_row_no_longer_bands_diverged(self) -> None:
+        record = self._cfo_record()
+        band = git_estate.RISK_BAND_NAMES[git_estate.risk_band(record)]
+        self.assertNotEqual(band, "diverged")
+        self.assertEqual(band, "clean")
+
+    def test_genuine_divergence_is_untouched(self) -> None:
+        record = _record(
+            "/r/real",
+            classes=frozenset({"ahead", "behind", "diverged-clean"}),
+            primary_class="diverged-clean",
+            ahead=3,
+            behind=58,
+            upstream_mismatch=None,
+        )
+        self.assertEqual(
+            git_estate.RISK_BAND_NAMES[git_estate.risk_band(record)], "diverged"
+        )
+
+    def test_the_configured_counts_survive_for_the_reader(self) -> None:
+        # The A/B column keeps saying what the CONFIGURED upstream says: that
+        # is a real fact about the config, and the marker is what tells the
+        # reader those numbers are an artifact.
+        row = git_estate._row(self._cfo_record())
+        self.assertEqual((row["ahead"], row["behind"]), (3, 58))
+        self.assertEqual(row["upstream_mismatch"]["configured"], "origin/main")
+        self.assertEqual(row["upstream_mismatch"]["same_name"], "origin/codex/qbo")
+        self.assertEqual(row["upstream_mismatch"]["ahead_vs_same_name"], 0)
+
+    def test_the_fix_repairs_the_config_instead_of_reconciling(self) -> None:
+        fixes = git_estate.fix_commands(self._cfo_record())
+        self.assertEqual(
+            fixes,
+            [
+                "git -C /r/cfo branch --set-upstream-to origin/codex/qbo"
+                "  # upstream points at origin/main"
+            ],
+        )
+        # Emphatically NOT the divergence handoff: there is no divergence.
+        self.assertNotIn("sbp doctor / reconcile skill — do not hand-merge", fixes)
+
+    def test_a_genuinely_diverged_row_still_gets_the_reconcile_handoff(self) -> None:
+        record = _record(
+            "/r/real",
+            classes=frozenset({"ahead", "behind", "diverged-clean"}),
+            primary_class="diverged-clean",
+            ahead=3,
+            behind=58,
+        )
+        self.assertIn(
+            "sbp doctor / reconcile skill — do not hand-merge",
+            git_estate.fix_commands(record),
+        )
+
+    def test_a_still_behind_row_gets_a_pull_not_a_reconcile(self) -> None:
+        # Config is wrong AND the same-name ref really has moved on: repair
+        # the upstream, then fast-forward. Still never a hand-merge.
+        record = self._cfo_record(upstream_mismatch=self._mismatch(behind_vs=4))
+        fixes = git_estate.fix_commands(record)
+        self.assertIn("git -C /r/cfo branch --set-upstream-to origin/codex/qbo"
+                      "  # upstream points at origin/main", fixes)
+        self.assertIn("git -C /r/cfo pull --ff-only  # or /reconcile", fixes)
+
+    def test_the_row_is_marked_in_the_tty(self) -> None:
+        row = git_estate._row(self._cfo_record())
+        lines = git_estate._table_lines([row], False)
+        self.assertTrue(any("[upstream-misconfigured]" in line for line in lines))
+
+    def test_no_push_badge_on_a_row_with_nothing_to_publish(self) -> None:
+        # ahead=3 against the wrong ref, 0 against the right one. Badging this
+        # with a push policy would be advice about work that does not exist.
+        row = git_estate._row(self._cfo_record())
+        row["push_policy"] = git_estate.PUSH_POLICY_ASK
+        lines = git_estate._table_lines([row], False)
+        self.assertFalse(any("[ask]" in line for line in lines))
+
+    def test_the_row_stays_visible_despite_banding_clean(self) -> None:
+        # Trading a false alarm for silence would be no improvement: the row
+        # still carries a repair, so it earns footer next_actions.
+        row = git_estate._row(self._cfo_record())
+        self.assertTrue(git_estate._is_issue_row(row))
+
+    def test_a_clean_row_without_a_mismatch_is_still_not_an_issue(self) -> None:
+        self.assertFalse(git_estate._is_issue_row(git_estate._row(_record("/r/clean"))))
+
+    def test_rows_without_a_mismatch_project_null(self) -> None:
+        self.assertIsNone(git_estate._row(_record("/r/clean"))["upstream_mismatch"])
+
+
+class SameNameRefTests(unittest.TestCase):
+    """Which ref the branch SHOULD have been measured against."""
+
+    def test_the_remote_comes_from_the_configured_upstream(self) -> None:
+        # A fork tracking upstream/main is compared against upstream/<branch>,
+        # not origin/<branch>: that is the ref that would explain its commits.
+        self.assertEqual(
+            git_inventory._same_name_ref("feature", "upstream/main"),
+            "upstream/feature",
+        )
+
+    def test_a_branch_already_on_its_own_ref_is_skipped(self) -> None:
+        self.assertIsNone(git_inventory._same_name_ref("main", "origin/main"))
+
+    def test_slashed_branch_names_round_trip(self) -> None:
+        self.assertEqual(
+            git_inventory._same_name_ref("codex/qbo", "origin/main"),
+            "origin/codex/qbo",
+        )
+
+    def test_unusable_inputs_yield_nothing(self) -> None:
+        for branch, configured in (
+            ("", "origin/main"),
+            (git_inventory.BRANCH_DETACHED, "origin/main"),
+            ("feature", "no-slash"),
+            ("feature", ""),
+        ):
+            with self.subTest(branch=branch, configured=configured):
+                self.assertIsNone(git_inventory._same_name_ref(branch, configured))
+
+
+class EffectiveAheadBehindTests(unittest.TestCase):
+    def test_without_a_mismatch_the_records_own_numbers_are_used(self) -> None:
+        record = _record("/r/x", ahead=4, behind=2)
+        self.assertEqual(git_inventory.effective_ahead_behind(record), (4, 2))
+
+    def test_with_a_mismatch_the_same_name_numbers_are_used(self) -> None:
+        record = _record(
+            "/r/x",
+            ahead=3,
+            behind=58,
+            upstream_mismatch=git_inventory.UpstreamMismatch(
+                configured="origin/main",
+                same_name="origin/f",
+                ahead_vs_same_name=0,
+                behind_vs_same_name=1,
+            ),
+        )
+        self.assertEqual(git_inventory.effective_ahead_behind(record), (0, 1))
+
+
+class WorktreeIdentityTests(unittest.TestCase):
+    """Who is the primary checkout behind a linked worktree.
+
+    Uses synthetic records: the identity rule is ``git_dir != common_dir``,
+    which is a pair of strings, so real worktree plumbing proves nothing extra
+    here. (The end-to-end proof over git's own worktree-add plumbing is the
+    blocked item recorded in WG-era21_RESULT.md.)
+    """
+
+    def _wt(self, path: str, git_dir: str, common: str) -> GitRepoRecord:
+        return _record(path, git_dir=git_dir, common_dir=common)
+
+    def test_a_main_worktree_has_no_parent(self) -> None:
+        main = self._wt("/r/main", "/r/main/.git", "/r/main/.git")
+        self.assertIsNone(git_estate.worktree_primary(main))
+
+    def test_a_linked_worktree_names_its_scanned_parent(self) -> None:
+        main = self._wt("/r/main", "/r/main/.git", "/r/main/.git")
+        linked = self._wt("/r/wt", "/r/main/.git/worktrees/wt", "/r/main/.git")
+        parents = git_estate.worktree_primaries([main, linked])
+        self.assertEqual(git_estate.worktree_primary(linked, parents), "/r/main")
+
+    def test_a_linked_worktree_derives_its_parent_when_unscanned(self) -> None:
+        # The parent lives outside the scan roots. Git puts a main worktree's
+        # store at <primary>/.git, so the row still names it instead of
+        # reporting nothing.
+        linked = self._wt("/r/wt", "/r/main/.git/worktrees/wt", "/r/main/.git")
+        self.assertEqual(git_estate.worktree_primary(linked, {}), "/r/main")
+
+    def test_a_non_dot_git_store_is_not_guessed_at(self) -> None:
+        # A bare repo serving worktrees: the store is not "<primary>/.git", so
+        # there is no parent directory to name and the field stays absent.
+        linked = self._wt("/r/wt", "/srv/bare.git/worktrees/wt", "/srv/bare.git")
+        self.assertIsNone(git_estate.worktree_primary(linked, {}))
+
+    def test_a_record_without_store_identity_is_never_grouped(self) -> None:
+        # An old git (no --git-common-dir) or a blocked probe: unknown must not
+        # read as "same store as every other unknown".
+        blank = self._wt("/r/x", None, None)
+        self.assertIsNone(git_estate.worktree_primary(blank, {}))
+
+    def test_primaries_map_indexes_only_main_worktrees(self) -> None:
+        main = self._wt("/r/main", "/r/main/.git", "/r/main/.git")
+        linked = self._wt("/r/wt", "/r/main/.git/worktrees/wt", "/r/main/.git")
+        self.assertEqual(
+            git_estate.worktree_primaries([main, linked]),
+            {"/r/main/.git": "/r/main"},
+        )
+
+    def test_rows_carry_worktree_of_only_when_linked(self) -> None:
+        main = self._wt("/r/main", "/r/main/.git", "/r/main/.git")
+        linked = self._wt("/r/wt", "/r/main/.git/worktrees/wt", "/r/main/.git")
+        parents = git_estate.worktree_primaries([main, linked])
+        main_row = git_estate._row(main, worktree_parents=parents)
+        linked_row = git_estate._row(linked, worktree_parents=parents)
+        self.assertNotIn("worktree_of", main_row)
+        self.assertEqual(linked_row["worktree_of"], "/r/main")
+
+
+class WorktreeBandingTests(unittest.TestCase):
+    """A linked worktree must never overstate loss risk.
+
+    ``no-remote`` reads as "this work exists nowhere else". For a worktree
+    whose shared store has a remote that is false -- the 2026-08-15 run pushed
+    four such "orphaned" branches trivially once they were reclassified.
+    """
+
+    def _classify(self, **kwargs):
+        base = dict(
+            mid_op=None,
+            dirty=False,
+            stash_count=0,
+            upstream=None,
+            ahead=0,
+            behind=0,
+        )
+        base.update(kwargs)
+        return git_inventory._classify(**base)
+
+    def test_a_store_backed_worktree_is_never_no_remote(self) -> None:
+        classes, primary = self._classify(linked_worktree=True, has_remote=True)
+        self.assertNotIn("no-remote", classes)
+        self.assertNotEqual(primary, "no-remote")
+        self.assertIn("unpublished-branch", classes)
+
+    def test_a_remoteless_worktree_still_bands_no_remote(self) -> None:
+        # Here the scary reading is TRUE: the store has nowhere to push.
+        classes, primary = self._classify(linked_worktree=True, has_remote=False)
+        self.assertIn("no-remote", classes)
+        self.assertEqual(primary, "no-remote")
+
+    def test_a_main_worktree_banding_is_unchanged(self) -> None:
+        # Scope: this bead reclassifies linked worktrees only. A main checkout
+        # with remotes but no upstream keeps its existing band.
+        classes, primary = self._classify(linked_worktree=False, has_remote=True)
+        self.assertIn("no-remote", classes)
+        self.assertEqual(primary, "no-remote")
+
+    def test_a_store_backed_worktree_bands_from_its_own_checkout_state(self) -> None:
+        classes, primary = self._classify(
+            linked_worktree=True, has_remote=True, dirty=True
+        )
+        self.assertEqual(primary, "dirty")
+        self.assertNotIn("no-remote", classes)
+
+    def test_the_demoted_row_drops_out_of_the_no_remote_band(self) -> None:
+        record = _record(
+            "/r/wt",
+            classes=frozenset({"unpublished-branch"}),
+            primary_class="unpublished-branch",
+            upstream=None,
+            git_dir="/r/main/.git/worktrees/wt",
+            common_dir="/r/main/.git",
+        )
+        band = git_estate.RISK_BAND_NAMES[git_estate.risk_band(record)]
+        self.assertNotEqual(band, "no-remote")
+        self.assertEqual(band, "clean")
+
+    def test_an_upstream_backed_worktree_is_unaffected(self) -> None:
+        classes, primary = self._classify(
+            linked_worktree=True, has_remote=True, upstream="origin/feature", ahead=2
+        )
+        self.assertIn("ahead", classes)
+        self.assertNotIn("unpublished-branch", classes)
+        self.assertEqual(primary, "ahead-clean")
+
+    def test_unpublished_branch_is_a_declared_class(self) -> None:
+        # It has to be in every vocabulary, or consumers filtering on
+        # ALL_CLASSES silently drop the rows this bead created.
+        self.assertIn("unpublished-branch", git_inventory.ALL_CLASSES)
+        self.assertIn("unpublished-branch", git_inventory.PRIMARY_CLASSES)
+        self.assertIn("unpublished-branch", git_estate.FILTER_CLASSES)
+
+    def test_the_reclassified_rows_are_askable_for_by_name(self) -> None:
+        self.assertEqual(
+            git_estate.parse_only(["unpublished-branch"]),
+            (("unpublished-branch",), ()),
+        )
+        record = _record(
+            "/r/wt",
+            classes=frozenset({"unpublished-branch"}),
+            primary_class="unpublished-branch",
+            upstream=None,
+        )
+        self.assertTrue(git_estate._matches_only(record, "unpublished-branch"))
+        self.assertFalse(git_estate._matches_only(record, "no-remote"))
+
+
+class WorktreeStashDedupTests(unittest.TestCase):
+    """One physical stash store is counted once, whatever the row count.
+
+    The live run listed 26 stashes where 12 existed: linked worktrees share
+    ONE stash store, and every row reported the same entries.
+    """
+
+    def _store(self, count: int) -> list[GitRepoRecord]:
+        return [
+            _record("/r/main", git_dir="/r/main/.git", common_dir="/r/main/.git", stash_count=count),
+            _record("/r/wt-a", git_dir="/r/main/.git/worktrees/a", common_dir="/r/main/.git", stash_count=count),
+            _record("/r/wt-b", git_dir="/r/main/.git/worktrees/b", common_dir="/r/main/.git", stash_count=count),
+        ]
+
+    def test_estate_total_counts_the_store_once(self) -> None:
+        records = self._store(4)
+        summary = git_estate.stash_summary(records)
+        # Row math would say 12; the store holds 4.
+        self.assertEqual(summary["row_total"], 12)
+        self.assertEqual(summary["total"], 4)
+        self.assertEqual(summary["shared_rows"], 2)
+        self.assertEqual(summary["shared_stores"], 1)
+
+    def test_the_main_worktree_owns_the_count(self) -> None:
+        owners = git_estate.stash_store_owners(self._store(4))
+        self.assertEqual(set(owners.values()), {"/r/main"})
+
+    def test_sharer_rows_defer_instead_of_repeating_the_number(self) -> None:
+        records = self._store(4)
+        owners = git_estate.stash_store_owners(records)
+        rows = [
+            git_estate._row(r, stash_owner=owners.get(r.path)) for r in records
+        ]
+        by_path = {row["path"]: row for row in rows}
+        # Every row names the store's primary...
+        for path in ("/r/main", "/r/wt-a", "/r/wt-b"):
+            self.assertEqual(by_path[path]["stash_store_primary"], "/r/main")
+        # ...but only the primary is CREDITED with the entries, so the
+        # attributed column sums to the store's real total instead of 3x it.
+        self.assertEqual(by_path["/r/main"]["stash_attributed"], 4)
+        self.assertEqual(by_path["/r/wt-a"]["stash_attributed"], 0)
+        self.assertEqual(by_path["/r/wt-b"]["stash_attributed"], 0)
+        self.assertEqual(sum(r["stash_attributed"] for r in rows), 4)
+        # The honest per-checkout observation is never rewritten: a worktree
+        # parked on a shared stash stays as visible as before.
+        self.assertEqual(by_path["/r/wt-a"]["stash_count"], 4)
+
+    def test_worktree_rows_carry_both_the_parent_and_the_store_primary(self) -> None:
+        records = self._store(2)
+        owners = git_estate.stash_store_owners(records)
+        parents = git_estate.worktree_primaries(records)
+        row = git_estate._row(
+            records[1], stash_owner=owners.get(records[1].path), worktree_parents=parents
+        )
+        self.assertEqual(row["worktree_of"], "/r/main")
+        self.assertEqual(row["stash_store_primary"], "/r/main")
+
+    def test_an_unshared_store_is_untouched(self) -> None:
+        solo = [_record("/r/solo", git_dir="/r/solo/.git", common_dir="/r/solo/.git", stash_count=3)]
+        self.assertEqual(git_estate.stash_store_owners(solo), {})
+        self.assertEqual(git_estate.stash_summary(solo)["total"], 3)
+
+
+class RemoteOwnerParseTests(unittest.TestCase):
+    """``parse_remote_owner`` over every URL spelling git actually returns."""
+
+    def test_scp_style_ssh_url(self) -> None:
+        self.assertEqual(
+            git_estate.parse_remote_owner("git@github.com:choffmanebpm/pdsmvp.git"),
+            ("github.com", "choffmanebpm"),
+        )
+
+    def test_https_url(self) -> None:
+        self.assertEqual(
+            git_estate.parse_remote_owner("https://github.com/tetsuo-ai/agenc-core.git"),
+            ("github.com", "tetsuo-ai"),
+        )
+
+    def test_ssh_scheme_url_with_port(self) -> None:
+        self.assertEqual(
+            git_estate.parse_remote_owner("ssh://git@github.com:22/build000r/skillbox.git"),
+            ("github.com", "build000r"),
+        )
+
+    def test_local_paths_have_no_owner(self) -> None:
+        # The live run's third ownership class: a remote that is just a path.
+        for url in ("/srv/mirrors/thing.git", "../sibling.git", "~/repos/x.git", "file:///tmp/x.git"):
+            with self.subTest(url=url):
+                self.assertEqual(git_estate.parse_remote_owner(url), (None, None))
+
+    def test_empty_and_garbage_degrade_to_none(self) -> None:
+        for url in ("", "   ", "not-a-url"):
+            with self.subTest(url=url):
+                self.assertEqual(git_estate.parse_remote_owner(url), (None, None))
+
+
+class OwnershipDerivationTests(unittest.TestCase):
+    """Who owns a row, and may a coordinator push to it.
+
+    The bar from the bead: zero prose about who may push in a coordinator
+    brief. Every case below therefore resolves to a value, a source, and a
+    reason -- never to "it depends".
+    """
+
+    def _derive(self, remotes=(), entry=None, owner="build000r"):
+        record = _record("/r/x", remotes=tuple(remotes))
+        return git_estate.derive_ownership(
+            record, registry_entry=entry, operator_owner=owner
+        )
+
+    # -- registry is the declared source ----------------------------------
+
+    def test_registry_owned_is_operator_owned_and_pushable(self) -> None:
+        result = self._derive(
+            [("origin", "https://github.com/build000r/x.git")], {"ownership": "owned"}
+        )
+        self.assertEqual(result["ownership"], git_estate.OWNERSHIP_OPERATOR)
+        self.assertEqual(result["ownership_source"], git_estate.OWNERSHIP_SOURCE_REGISTRY)
+        self.assertEqual(result["push_policy"], git_estate.PUSH_POLICY_PUSH)
+
+    def test_registry_owned_local_has_nowhere_to_push(self) -> None:
+        result = self._derive([], {"ownership": "owned-local"})
+        self.assertEqual(result["ownership"], git_estate.OWNERSHIP_LOCAL)
+        self.assertEqual(result["push_policy"], git_estate.PUSH_POLICY_NO_PUSH)
+
+    def test_registry_external_spellings_all_mean_no_push(self) -> None:
+        # v6ac.6.4 will start writing these; accept them now so that bead is a
+        # registry edit, not another change here.
+        for spelling in ("external", "external-upstream", "upstream", "fork", "vendor"):
+            with self.subTest(spelling=spelling):
+                result = self._derive(
+                    [("origin", "https://github.com/someone/x.git")],
+                    {"ownership": spelling},
+                )
+                self.assertEqual(result["ownership"], git_estate.OWNERSHIP_EXTERNAL)
+                self.assertEqual(result["push_policy"], git_estate.PUSH_POLICY_NO_PUSH)
+
+    def test_an_unrecognized_registry_spelling_asks_rather_than_assumes(self) -> None:
+        result = self._derive(
+            [("origin", "https://github.com/build000r/x.git")],
+            {"ownership": "something-new"},
+        )
+        self.assertEqual(result["ownership"], git_estate.OWNERSHIP_UNKNOWN)
+        self.assertEqual(result["push_policy"], git_estate.PUSH_POLICY_ASK)
+
+    def test_registered_without_a_remote_is_owned_local(self) -> None:
+        result = self._derive([], {"id": "x"})
+        self.assertEqual(result["ownership"], git_estate.OWNERSHIP_LOCAL)
+        self.assertEqual(result["ownership_source"], git_estate.OWNERSHIP_SOURCE_REGISTRY)
+
+    # -- the remote heuristic ---------------------------------------------
+
+    def test_operator_account_remote_is_operator_owned(self) -> None:
+        result = self._derive([("origin", "https://github.com/build000r/skillbox.git")])
+        self.assertEqual(result["ownership"], git_estate.OWNERSHIP_OPERATOR)
+        self.assertEqual(result["ownership_source"], git_estate.OWNERSHIP_SOURCE_HEURISTIC)
+        self.assertEqual(result["push_policy"], git_estate.PUSH_POLICY_PUSH)
+
+    def test_the_two_live_run_external_upstreams_are_no_push(self) -> None:
+        # The exact repos the 2026-08-15 coordinator classified by hand, and
+        # the exact URLs on disk.
+        cases = {
+            "https://github.com/tetsuo-ai/agenc-core.git": "tetsuo-ai",
+            "git@github.com:choffmanebpm/pdsmvp.git": "choffmanebpm",
+        }
+        for url, owner in cases.items():
+            with self.subTest(url=url):
+                result = self._derive([("origin", url)])
+                self.assertEqual(result["ownership"], git_estate.OWNERSHIP_EXTERNAL)
+                self.assertEqual(result["push_policy"], git_estate.PUSH_POLICY_NO_PUSH)
+                self.assertEqual(result["remote_owner"], owner)
+                self.assertIn(owner, result["push_policy_reason"])
+
+    def test_a_local_path_remote_is_ownership_unknown(self) -> None:
+        result = self._derive([("origin", "/srv/mirrors/x.git")])
+        self.assertEqual(result["ownership"], git_estate.OWNERSHIP_UNKNOWN)
+        self.assertEqual(result["push_policy"], git_estate.PUSH_POLICY_ASK)
+
+    def test_an_unrecognized_forge_host_asks(self) -> None:
+        result = self._derive([("origin", "https://git.example.invalid/build000r/x.git")])
+        self.assertEqual(result["ownership"], git_estate.OWNERSHIP_UNKNOWN)
+        self.assertEqual(result["push_policy"], git_estate.PUSH_POLICY_ASK)
+
+    def test_no_remote_and_no_registry_entry_is_unknown_with_no_source(self) -> None:
+        result = self._derive([])
+        self.assertEqual(result["ownership"], git_estate.OWNERSHIP_UNKNOWN)
+        self.assertEqual(result["ownership_source"], git_estate.OWNERSHIP_SOURCE_NONE)
+        self.assertEqual(result["push_policy"], git_estate.PUSH_POLICY_ASK)
+
+    def test_origin_wins_over_other_remotes(self) -> None:
+        result = self._derive(
+            [
+                ("origin", "https://github.com/build000r/x.git"),
+                ("upstream", "https://github.com/tetsuo-ai/x.git"),
+            ]
+        )
+        self.assertEqual(result["ownership"], git_estate.OWNERSHIP_OPERATOR)
+
+    def test_the_operator_account_comes_from_the_registry_not_a_constant(self) -> None:
+        # A different estate declares a different metadata.owner; the same URL
+        # must then read as external.
+        result = self._derive(
+            [("origin", "https://github.com/build000r/x.git")], owner="someone-else"
+        )
+        self.assertEqual(result["ownership"], git_estate.OWNERSHIP_EXTERNAL)
+
+    # -- conflict and forward compatibility --------------------------------
+
+    def test_a_registry_owned_claim_over_an_external_remote_asks(self) -> None:
+        # Never let a stale registry line authorize a push at somebody else's
+        # upstream: the observable remote disagrees, so a human decides.
+        result = self._derive(
+            [("origin", "https://github.com/tetsuo-ai/x.git")], {"ownership": "owned"}
+        )
+        self.assertEqual(result["ownership"], git_estate.OWNERSHIP_OPERATOR)
+        self.assertEqual(result["push_policy"], git_estate.PUSH_POLICY_ASK)
+        self.assertIn("confirm", result["push_policy_reason"])
+
+    def test_an_explicit_registry_push_policy_is_honoured(self) -> None:
+        result = self._derive(
+            [("origin", "https://github.com/build000r/x.git")],
+            {"ownership": "owned", "push_policy": "scrub-gate"},
+        )
+        self.assertEqual(result["push_policy"], git_estate.PUSH_POLICY_SCRUB_GATE)
+
+    def test_a_registry_scrub_gate_flag_is_honoured(self) -> None:
+        result = self._derive(
+            [("origin", "https://github.com/build000r/x.git")],
+            {"ownership": "owned", "scrub_gate": True},
+        )
+        self.assertEqual(result["push_policy"], git_estate.PUSH_POLICY_SCRUB_GATE)
+
+
+class PushPolicyFixGatingTests(unittest.TestCase):
+    """`git push` advice is emitted for exactly one policy."""
+
+    def _fixes(self, policy):
+        record = _record(
+            "/r/ahead",
+            classes=frozenset({"ahead"}),
+            primary_class="ahead-clean",
+            ahead=3,
+        )
+        return git_estate.fix_commands(record, push_policy=policy)
+
+    def test_only_the_push_policy_yields_a_push_command(self) -> None:
+        self.assertEqual(self._fixes(git_estate.PUSH_POLICY_PUSH), ["git -C /r/ahead push"])
+
+    def test_no_other_policy_ever_emits_a_push_command(self) -> None:
+        for policy in (
+            git_estate.PUSH_POLICY_NO_PUSH,
+            git_estate.PUSH_POLICY_SCRUB_GATE,
+            git_estate.PUSH_POLICY_ASK,
+            None,
+        ):
+            with self.subTest(policy=policy):
+                fixes = self._fixes(policy)
+                joined = " ".join(fixes)
+                self.assertNotIn("git -C /r/ahead push", joined)
+                self.assertNotIn("git push", joined)
+                # It still tells the coordinator how to SEE the commits.
+                self.assertIn("log --oneline", joined)
+                self.assertIn("3 unpublished commits", joined)
+
+    def test_a_diverged_row_still_routes_to_reconcile_regardless_of_policy(self) -> None:
+        record = _record(
+            "/r/div",
+            classes=frozenset({"ahead", "behind", "diverged-clean"}),
+            primary_class="diverged-clean",
+            ahead=1,
+            behind=1,
+        )
+        fixes = git_estate.fix_commands(record, push_policy=git_estate.PUSH_POLICY_PUSH)
+        self.assertIn("sbp doctor / reconcile skill — do not hand-merge", fixes)
+        self.assertNotIn("git -C /r/div push", fixes)
+
+    def test_singular_commit_wording(self) -> None:
+        record = _record(
+            "/r/one", classes=frozenset({"ahead"}), primary_class="ahead-clean", ahead=1
+        )
+        fixes = git_estate.fix_commands(record, push_policy=git_estate.PUSH_POLICY_NO_PUSH)
+        self.assertIn("1 unpublished commit;", fixes[0])
+
+
+class PushPolicyMarkerTests(unittest.TestCase):
+    """The tty gains a marker, never a column, and only where advice changed."""
+
+    def _row(self, *, ahead: int, policy: str) -> dict:
+        return {
+            "path": "/r/x",
+            "risk_band": "ahead" if ahead else "clean",
+            "branch": "main",
+            "staged": 0,
+            "unstaged": 0,
+            "untracked": 0,
+            "stash_count": 0,
+            "ahead": ahead,
+            "behind": 0,
+            "push_policy": policy,
+        }
+
+    def test_an_ahead_no_push_row_is_marked(self) -> None:
+        lines = git_estate._table_lines([self._row(ahead=2, policy="no-push")], False)
+        self.assertTrue(any("[no-push]" in line for line in lines))
+
+    def test_a_pushable_row_is_not_marked(self) -> None:
+        lines = git_estate._table_lines([self._row(ahead=2, policy="push")], False)
+        self.assertFalse(any("[no-push]" in line or "[push]" in line for line in lines))
+
+    def test_a_row_with_nothing_to_push_is_not_marked(self) -> None:
+        # No advice would have said "push", so no badge: the table must not
+        # sprout markers on repos nobody was about to publish.
+        lines = git_estate._table_lines([self._row(ahead=0, policy="no-push")], False)
+        self.assertFalse(any("[no-push]" in line for line in lines))
+
+    def test_the_table_header_gains_no_column(self) -> None:
+        header = git_estate._table_lines([self._row(ahead=2, policy="no-push")], False)[0]
+        self.assertNotIn("OWNER", header.upper().replace("OWNERSHIP", ""))
+        self.assertNotIn("POLICY", header.upper())
 
 
 class RiskSortTests(unittest.TestCase):
@@ -192,9 +1079,20 @@ class RiskSortTests(unittest.TestCase):
 
 
 class FixCommandTests(unittest.TestCase):
-    def test_ahead_gets_push(self) -> None:
+    def test_ahead_gets_push_when_the_remote_is_operator_owned(self) -> None:
         record = _record("/r/ahead", classes=frozenset({"ahead"}), primary_class="ahead-clean", ahead=2)
-        self.assertEqual(git_estate.fix_commands(record), ["git -C /r/ahead push"])
+        self.assertEqual(
+            git_estate.fix_commands(record, push_policy=git_estate.PUSH_POLICY_PUSH),
+            ["git -C /r/ahead push"],
+        )
+
+    def test_an_omitted_push_policy_is_not_permission_to_push(self) -> None:
+        # Fail-safe default: a caller that never derived a policy has not
+        # established that pushing is allowed, so it does not get told to.
+        record = _record("/r/ahead", classes=frozenset({"ahead"}), primary_class="ahead-clean", ahead=2)
+        fixes = git_estate.fix_commands(record)
+        self.assertNotIn("git -C /r/ahead push", fixes)
+        self.assertIn("ownership unconfirmed", fixes[0])
 
     def test_behind_gets_ff_only_pull(self) -> None:
         record = _record("/r/behind", classes=frozenset({"behind"}), primary_class="behind-clean", behind=2)
@@ -307,7 +1205,9 @@ class FixCommandTests(unittest.TestCase):
         record = _record(
             "/r/da", classes=frozenset({"dirty", "ahead"}), primary_class="dirty", ahead=1, staged=1
         )
-        fixes = git_estate.fix_commands(record)
+        fixes = git_estate.fix_commands(
+            record, push_policy=git_estate.PUSH_POLICY_PUSH
+        )
         self.assertIn("git -C /r/da push", fixes)
         self.assertIn("git -C /r/da add -p && git -C /r/da commit", fixes)
 
@@ -489,9 +1389,7 @@ class GitEstateFixtureCase(unittest.TestCase):
                 # every external-state join at nonexistent paths -- otherwise
                 # a real receipts store or reconcile-skill checkout on the
                 # host leaks into fixture envelopes.
-                "SKILLBOX_RECONCILE_RECEIPTS_DIR": str(self.tmp / "no-receipts"),
-                "SKILLBOX_AMP_CAPSULE_GUARD": str(self.tmp / "no-capsule-guard"),
-                "SKILLBOX_AMP_CAMPAIGN_GUARD": str(self.tmp / "no-campaign-guard"),
+                **helpers.hermetic_join_env(self.tmp),
             },
         )
         patcher.start()
@@ -691,8 +1589,35 @@ class BuildReportTests(GitEstateFixtureCase):
                 f"register in {self.registry_yaml} or add an ignore rule there",
             ],
         )
-        self.assertEqual(rows[str(ahead)]["fix"], [f"git -C {ahead} push"])
+        # The fixture's remote is a local bare path, which is exactly the
+        # "ownership-unknown" case the live run hit: no forge, no account to
+        # compare, so the row asks instead of advising a push.
+        self.assertEqual(rows[str(ahead)]["ownership"], git_estate.OWNERSHIP_UNKNOWN)
+        self.assertEqual(rows[str(ahead)]["push_policy"], git_estate.PUSH_POLICY_ASK)
+        self.assertEqual(
+            rows[str(ahead)]["fix"],
+            [
+                f"git -C {ahead} log --oneline @{{u}}..HEAD  # 1 unpublished commit; "
+                "ownership unconfirmed — establish intent before publishing"
+            ],
+        )
+        self.assertNotIn(f"git -C {ahead} push", rows[str(ahead)]["fix"])
         self.assertEqual(rows[str(clean)]["fix"], [])
+
+        # Every row carries the ownership join, on both the scanned rows and
+        # cwd_repo, so a coordinator never has to re-derive it.
+        for row in report["repos"]:
+            self.assertIn(row["ownership"], git_estate.OWNERSHIP_VALUES)
+            self.assertIn(row["push_policy"], git_estate.PUSH_POLICY_VALUES)
+            self.assertIn(
+                row["ownership_source"],
+                (
+                    git_estate.OWNERSHIP_SOURCE_REGISTRY,
+                    git_estate.OWNERSHIP_SOURCE_HEURISTIC,
+                    git_estate.OWNERSHIP_SOURCE_NONE,
+                ),
+            )
+            self.assertTrue(row["push_policy_reason"])
 
         # Estate-level registration summary + the stale-registered section.
         self.assertEqual(

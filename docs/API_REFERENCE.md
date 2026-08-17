@@ -7,7 +7,7 @@
 Generated from command registry ABI `2026-06-11+agent_ops_brain`.
 Do not edit by hand; run `python3 .env-manager/manage.py registry-docs --write`.
 
-Registry entries: 47.
+Registry entries: 53.
 
 > **The in-box MCP surface is deprecated and frozen.**
 > The in-box MCP surface is DEPRECATED and FROZEN — no new tools. Canonical agent path: python3 .env-manager/manage.py <command> --format json, with `robot-docs guide` for the workflow and `capabilities --json` for the machine-readable contract. The `sbp` wrapper covers only a curated subset of commands — run `sbp capabilities --json` to see it, and use manage.py for the rest.
@@ -359,6 +359,108 @@ cd skillbox-config && python3 -m pytest tests/ -k evidence
 
 **Graph Nodes**: `evidence`, `skill`, `repo`
 
+#### runtime.contract_lint
+
+Report NEW cross-surface command and destructive-safety drift against the accepted baselines.
+
+- Surfaces: `cli`
+- Scopes: None
+- Side effect: `none`
+- Risk: `low`
+- Entrypoint: `manage.py`
+- Owner binary: None
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `format` | `enum[json\|text]?` | no |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `counts` | `object` | yes |
+| `new_gaps` | `object[]` | yes |
+| `new_policy_findings` | `object[]` | yes |
+| `next_actions` | `string[]` | yes |
+| `ok` | `boolean` | yes |
+| `resolved_baseline_entries` | `object[]` | yes |
+| `schema` | `string` | yes |
+
+**Examples**
+
+```bash
+python3 .env-manager/manage.py contract-lint --format json
+```
+
+```bash
+python3 .env-manager/manage.py contract-lint --format text
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_command_contract
+```
+
+**Graph Nodes**: `command`, `check`
+
+#### runtime.dcg-reconcile
+
+Converge, verify, or relinquish DCG hooks through the one shared lifecycle contract.
+
+- Surfaces: `cli`, `make`
+- Scopes: `client`, `profile`
+- Side effect: `local_write`
+- Risk: `medium`
+- Entrypoint: `manage.py`
+- Owner binary: `sbp`
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `action` | `enum[apply\|verify\|relinquish]?` | no |
+| `dry_run` | `boolean?` | no |
+| `entrypoint` | `string?` | no |
+| `format` | `enum[json\|text]?` | no |
+| `purge` | `boolean?` | no |
+| `remove` | `boolean?` | no |
+| `scope` | `enum[host\|container]?` | no |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `entrypoint` | `string` | yes |
+| `home` | `string` | yes |
+| `marker` | `string` | yes |
+| `ok` | `boolean` | yes |
+| `operator_actions` | `string[]` | yes |
+| `scope` | `string` | yes |
+| `status` | `string` | yes |
+
+**Examples**
+
+```bash
+python3 .env-manager/manage.py dcg-reconcile --action verify --format json
+```
+
+```bash
+python3 .env-manager/manage.py dcg-reconcile --remove --format json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_agent_ops_command_registry
+```
+
+**Graph Nodes**: `command`, `check`
+
 #### runtime.doctor
 
 Validate the internal repos/skills/logs/check graph for the selected scope.
@@ -375,6 +477,7 @@ Validate the internal repos/skills/logs/check graph for the selected scope.
 
 | Name | Type | Required |
 |---|---|---|
+| `all` | `boolean?` | no |
 | `client` | `string?` | no |
 | `format` | `enum[json\|text]?` | no |
 | `profile` | `string[]?` | no |
@@ -440,6 +543,110 @@ python3 .env-manager/manage.py down --profile surfaces --service api-stub
 None
 
 **Graph Nodes**: `service`
+
+#### runtime.env_inventory_refresh
+
+Rebuild the environment-inventory cache off the hot path, under the state-root lease.
+
+- Surfaces: `cli`
+- Scopes: None
+- Side effect: `local_write`
+- Risk: `low`
+- Entrypoint: `manage.py`
+- Owner binary: None
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `action` | `enum[refresh]` | yes |
+| `format` | `enum[json\|text]?` | no |
+| `no_observe` | `boolean?` | no |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `action` | `string` | yes |
+| `cache` | `object` | yes |
+| `next_actions` | `string[]` | yes |
+| `ok` | `boolean` | yes |
+
+**Examples**
+
+```bash
+python3 .env-manager/manage.py env-inventory refresh --format json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_env_inventory_cli
+```
+
+```bash
+python3 -m unittest tests.test_state_mutation_inventory
+```
+
+**Graph Nodes**: `client`, `repo`, `artifact`
+
+#### runtime.env_inventory_show
+
+Read the versioned, sanitized environment-inventory contract (machine, clients, repos).
+
+- Surfaces: `cli`
+- Scopes: None
+- Side effect: `none`
+- Risk: `low`
+- Entrypoint: `manage.py`
+- Owner binary: None
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `action` | `enum[show]` | yes |
+| `cached` | `boolean?` | no |
+| `format` | `enum[json\|text]?` | no |
+| `no_clients` | `boolean?` | no |
+| `observe` | `boolean?` | no |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `action` | `string` | yes |
+| `cache_path` | `string?` | no |
+| `inventory` | `object` | yes |
+| `next_actions` | `string[]` | yes |
+| `ok` | `boolean` | yes |
+| `reason` | `string?` | no |
+| `source` | `enum[build\|cache]` | yes |
+| `stale` | `boolean` | yes |
+
+**Examples**
+
+```bash
+python3 .env-manager/manage.py env-inventory show --format json
+```
+
+```bash
+python3 .env-manager/manage.py env-inventory show --cached --format json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_env_inventory_cli
+```
+
+```bash
+python3 -m unittest tests.test_environment_inventory
+```
+
+**Graph Nodes**: `client`, `repo`, `profile`, `evidence`
 
 #### runtime.evidence
 
@@ -804,6 +1011,53 @@ python3 -m unittest tests.test_mcp_render
 ```
 
 **Graph Nodes**: `mcp_tool`, `service`
+
+#### runtime.oracle_lane
+
+Report the Oracle lane every native surface routes through, with the identity that proved it.
+
+- Surfaces: `cli`
+- Scopes: None
+- Side effect: `none`
+- Risk: `low`
+- Entrypoint: `manage.py`
+- Owner binary: `sbp`
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `format` | `enum[json\|text]?` | no |
+| `state-root` | `string?` | no |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `auth_method` | `string` | yes |
+| `caller_id` | `string` | yes |
+| `endpoint` | `string?` | no |
+| `identity_path` | `string` | yes |
+| `lane` | `string` | yes |
+| `ok` | `boolean` | yes |
+| `reason` | `string` | yes |
+| `schema_version` | `string` | yes |
+| `scope` | `string?` | no |
+
+**Examples**
+
+```bash
+python3 .env-manager/manage.py oracle-lane --format json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_oracle_lane_parity
+```
+
+**Graph Nodes**: `command`
 
 #### runtime.ports
 
@@ -1723,6 +1977,66 @@ python3 .env-manager/manage.py sync --client personal --dry-run
 None
 
 **Graph Nodes**: `repo`, `artifact`, `skill`, `log`
+
+#### runtime.test
+
+Read .skillbox/test.yaml. plan/lint read-only; capsule stores a source capsule; run/dispatch gated, unimplemented.
+
+- Surfaces: `cli`
+- Scopes: `cwd`
+- Side effect: `local_write`
+- Risk: `low`
+- Entrypoint: `manage.py`
+- Owner binary: `sbp`
+- MCP mirror: None
+
+**Inputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `cwd` | `string?` | no |
+| `format` | `enum[json\|text]?` | no |
+| `group` | `string?` | no |
+| `test_verb` | `enum[plan\|lint\|capsule\|run\|dispatch]?` | no |
+
+**Outputs**
+
+| Name | Type | Required |
+|---|---|---|
+| `command` | `string` | yes |
+| `cwd` | `string` | yes |
+| `issues` | `string[]` | yes |
+| `manifest_path` | `string` | yes |
+| `next_actions` | `string[]` | yes |
+| `ok` | `boolean` | yes |
+| `schema_version` | `string` | yes |
+| `verb` | `string` | yes |
+
+**Examples**
+
+```bash
+python3 .env-manager/manage.py test --format json
+```
+
+```bash
+python3 .env-manager/manage.py test plan --format json
+```
+
+```bash
+python3 .env-manager/manage.py test lint --format json
+```
+
+**Validation**
+
+```bash
+python3 -m unittest tests.test_sbp_test_front_door
+```
+
+```bash
+python3 -m unittest tests.test_sbp_test_manifest
+```
+
+**Graph Nodes**: `command`
 
 #### runtime.up
 

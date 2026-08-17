@@ -13,7 +13,7 @@ estate: 8 repos under /GOLDEN_TMP/estate
   -----------------------------------------------
   [31mmid-op    [0m    0/0    1/1/0      0  main    /GOLDEN_TMP/estate/e-midop  [+1 unpushed branch]
   [33mdirty     [0m    0/0    1/1/1      0  main    /GOLDEN_TMP/estate/b-dirty
-  [36mahead     [0m    1/0    0/0/0      0  main    /GOLDEN_TMP/estate/c-ahead
+  [36mahead     [0m    1/0    0/0/0      0  main    /GOLDEN_TMP/estate/c-ahead  [ask]
   [35mno-remote [0m    0/0    0/0/0      0  main    /GOLDEN_TMP/estate/g-unregistered  [unregistered]
   [35mno-remote [0m    0/0    0/0/0      0  main    /GOLDEN_TMP/estate/f-noremote
   [36mstash-only[0m    0/0    0/0/0      2  main    /GOLDEN_TMP/estate/d-stash  [stash newest 3d, oldest 40d]
@@ -35,8 +35,9 @@ next_actions:
   - git -C /GOLDEN_TMP/estate/e-midop branch -vv  # 1 unpushed branch: feature(+2)
   - add a remote or register intent
   - git -C /GOLDEN_TMP/estate/b-dirty add -p && git -C /GOLDEN_TMP/estate/b-dirty commit
-  - git -C /GOLDEN_TMP/estate/c-ahead push
+  - git -C /GOLDEN_TMP/estate/c-ahead log --oneline @{u}..HEAD  # 1 unpublished commit; ownership unconfirmed — establish intent before publishing
   - add a remote or register intent
   - register in /GOLDEN_TMP/config/registry/repos.yaml or add an ignore rule there
   - add a remote or register intent
   (… 2 more issue rows — sbp git --json for the full set)
+lanes: 3 (L1 withheld, L2 small-dirty, L3 mechanical-cluster) — use --json for write scopes

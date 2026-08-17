@@ -1,0 +1,7 @@
+# A shell string makes quoting/word-splitting the compiler's problem.
+schema_version: 1
+units:
+  shelly:
+    command: "pytest -q && echo done"
+groups:
+  default: [shelly]

@@ -1,0 +1,295 @@
+{
+  "axes": {
+    "concurrency_safety": {
+      "codes": [
+        "EXTERNAL_SCHEDULER_LOCK_SEAM_MISSING",
+        "SERVICE_ENDPOINT_STATIC"
+      ],
+      "ordinal": 5,
+      "state": "ready",
+      "title": "Concurrency safety"
+    },
+    "determinism": {
+      "codes": [
+        "SERVICE_IMAGES_UNPINNED"
+      ],
+      "ordinal": 6,
+      "state": "ready",
+      "title": "Determinism"
+    },
+    "entrypoint_clarity": {
+      "codes": [
+        "TARGET_MONOLITHIC"
+      ],
+      "ordinal": 1,
+      "state": "bounded",
+      "title": "Entrypoint clarity"
+    },
+    "failure_cleanup": {
+      "codes": [],
+      "ordinal": 10,
+      "state": "not_covered_in_v1",
+      "title": "Failure cleanup"
+    },
+    "observability": {
+      "codes": [
+        "RECEIPT_NOT_COMPOSABLE"
+      ],
+      "ordinal": 8,
+      "state": "bounded",
+      "title": "Observability"
+    },
+    "resource_declaration": {
+      "codes": [],
+      "ordinal": 7,
+      "state": "not_covered_in_v1",
+      "title": "Resource declaration"
+    },
+    "selection_completeness": {
+      "codes": [
+        "CROSS_MACHINE_PARTITION_MISSING",
+        "PACKAGE_LANES_UNENUMERATED",
+        "SERVICE_REQUIREMENT_UNDERIVED"
+      ],
+      "ordinal": 2,
+      "state": "bounded",
+      "title": "Selection completeness"
+    },
+    "service_isolation": {
+      "codes": [
+        "SERVICE_FREE_LANE_MISSING"
+      ],
+      "ordinal": 4,
+      "state": "ready",
+      "title": "Service isolation"
+    },
+    "source_fidelity": {
+      "codes": [],
+      "ordinal": 9,
+      "state": "not_covered_in_v1",
+      "title": "Source fidelity"
+    },
+    "workspace_isolation": {
+      "codes": [
+        "PATH_FRAGILE"
+      ],
+      "ordinal": 3,
+      "state": "blocked",
+      "title": "Workspace isolation"
+    }
+  },
+  "cleared": [
+    {
+      "axis": "service_isolation",
+      "evidence": [
+        {
+          "detail": "no service dependency",
+          "kind": "parsed_target",
+          "locator": "make -qp:pytest-unit"
+        }
+      ],
+      "finding_code": "SERVICE_FREE_LANE_MISSING"
+    },
+    {
+      "axis": "concurrency_safety",
+      "evidence": [
+        {
+          "detail": "lock-free lane exists alongside the locking one",
+          "kind": "file",
+          "locator": "Makefile:203"
+        }
+      ],
+      "finding_code": "EXTERNAL_SCHEDULER_LOCK_SEAM_MISSING"
+    },
+    {
+      "axis": "concurrency_safety",
+      "evidence": [
+        {
+          "detail": "compose port -> env injection",
+          "kind": "file",
+          "locator": "scripts/orb_test_dependencies.sh:64"
+        }
+      ],
+      "finding_code": "SERVICE_ENDPOINT_STATIC"
+    },
+    {
+      "axis": "determinism",
+      "evidence": [
+        {
+          "detail": "pgvector + redis pinned by digest",
+          "kind": "file",
+          "locator": "scripts/orb_test_dependencies.sh:12"
+        }
+      ],
+      "finding_code": "SERVICE_IMAGES_UNPINNED"
+    }
+  ],
+  "counts": {
+    "blocked": 1,
+    "cleared": 4,
+    "likely": 1,
+    "not_applicable": 1,
+    "proven": 2,
+    "unknown": 1
+  },
+  "coverage": {
+    "axes_total": 10,
+    "not_covered_in_v1": [
+      "failure_cleanup",
+      "resource_declaration",
+      "source_fidelity"
+    ],
+    "note": "a v1 report is a claim about the covered axes only",
+    "v1_covered": [
+      "concurrency_safety",
+      "determinism",
+      "entrypoint_clarity",
+      "observability",
+      "selection_completeness",
+      "service_isolation",
+      "workspace_isolation"
+    ]
+  },
+  "findings": [
+    {
+      "affected_units": [],
+      "axis": "entrypoint_clarity",
+      "blocks": "optimization-only",
+      "evidence": [],
+      "finding_code": "TARGET_MONOLITHIC",
+      "reason": "the gate target is assembled by an included makefile this adapter does not parse",
+      "recipe_id": "suite-refactor/split-monolithic-target",
+      "severity": "medium",
+      "status": "unknown"
+    },
+    {
+      "affected_units": [
+        "pytest-full"
+      ],
+      "axis": "selection_completeness",
+      "blocks": "optimization-only",
+      "evidence": [
+        {
+          "detail": "one pytest invocation, no selection",
+          "kind": "parsed_target",
+          "locator": "make -qp:test"
+        }
+      ],
+      "finding_code": "CROSS_MACHINE_PARTITION_MISSING",
+      "recipe_id": "suite-refactor/cross-machine-partition",
+      "severity": "high",
+      "status": "proven"
+    },
+    {
+      "affected_units": [],
+      "axis": "selection_completeness",
+      "blocks": "parallel",
+      "evidence": [],
+      "finding_code": "PACKAGE_LANES_UNENUMERATED",
+      "reason": "the repo declares no package-manager test scripts",
+      "recipe_id": "suite-refactor/enumerate-package-lanes",
+      "severity": "medium",
+      "status": "not_applicable"
+    },
+    {
+      "affected_units": [],
+      "axis": "selection_completeness",
+      "blocks": "parallel",
+      "evidence": [],
+      "finding_code": "SERVICE_REQUIREMENT_UNDERIVED",
+      "reason": "deciding this needs a bounded probe, and --probe was not granted",
+      "recipe_id": "suite-refactor/derive-service-requirements",
+      "severity": "medium",
+      "status": "blocked"
+    },
+    {
+      "affected_units": [
+        "pytest-full",
+        "browser-e2e"
+      ],
+      "axis": "workspace_isolation",
+      "blocks": "remote",
+      "evidence": [
+        {
+          "detail": "cd ../../ && pytest",
+          "kind": "file",
+          "locator": "Makefile:118"
+        }
+      ],
+      "finding_code": "PATH_FRAGILE",
+      "proposed_fragment": {
+        "units": {
+          "pytest-full": {
+            "cwd": "packages/server"
+          }
+        }
+      },
+      "recipe_id": "suite-refactor/repo-relative-paths",
+      "severity": "high",
+      "status": "proven"
+    },
+    {
+      "affected_units": [],
+      "axis": "observability",
+      "blocks": "parallel",
+      "evidence": [
+        {
+          "detail": "whole-tree receipt only",
+          "kind": "file",
+          "locator": "scripts/exact_tree_test_state.py:41"
+        }
+      ],
+      "finding_code": "RECEIPT_NOT_COMPOSABLE",
+      "recipe_id": "suite-refactor/composable-receipts",
+      "severity": "high",
+      "status": "likely"
+    }
+  ],
+  "gates": {
+    "caching": {
+      "admitted": true,
+      "blocked_by": [],
+      "unproven_for_intent": []
+    },
+    "local": {
+      "admitted": true,
+      "blocked_by": [],
+      "unproven_for_intent": []
+    },
+    "parallel": {
+      "admitted": true,
+      "blocked_by": [],
+      "unproven_for_intent": [
+        "SERVICE_REQUIREMENT_UNDERIVED"
+      ]
+    },
+    "remote": {
+      "admitted": false,
+      "blocked_by": [
+        "PATH_FRAGILE"
+      ],
+      "unproven_for_intent": []
+    }
+  },
+  "next_actions": [
+    "apply suite-refactor/repo-relative-paths to clear PATH_FRAGILE (blocks remote)",
+    "resolve TARGET_MONOLITHIC (unknown): the gate target is assembled by an included makefile this adapter does not parse",
+    "resolve SERVICE_REQUIREMENT_UNDERIVED (blocked): deciding this needs a bounded probe, and --probe was not granted",
+    "confirm RECEIPT_NOT_COMPOSABLE with deterministic evidence, then apply suite-refactor/composable-receipts",
+    "optional: apply suite-refactor/cross-machine-partition to clear CROSS_MACHINE_PARTITION_MISSING (optimization only)"
+  ],
+  "rollup": {
+    "advisory": true,
+    "applicable_codes": 9,
+    "authority": "named_evidenced_blockers",
+    "max": 1000,
+    "score": 488
+  },
+  "schema": "suite-readiness/v1",
+  "schema_version": 1,
+  "subject": {
+    "capsule_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "label": "exemplar-repo"
+  },
+  "v1_readiness_class": "blocked"
+}

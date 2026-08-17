@@ -1081,12 +1081,19 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertTrue((repo / ".skillbox-state" / "home" / ".local" / "bin" / "dcg").is_file())
 
             doctor = self._run(repo, "doctor", "--profile", "connectors", "--format", "json")
-            self.assertEqual(doctor.returncode, 0, doctor.stderr)
+            # EXIT_DRIFT, not 0: this fixture syncs the dcg BINARY but never
+            # converges the hooks, policy, or Codex trust, so the fail-closed
+            # `dcg` check (dcg_doctor.py) correctly reports an unguarded box.
+            # Presence of the binary is deliberately not health any more.
+            self.assertEqual(doctor.returncode, MANAGE_MODULE.EXIT_DRIFT, doctor.stderr)
             doctor_payload = json.loads(doctor.stdout)
             manifest_check = next(item for item in doctor_payload["checks"] if item["code"] == "runtime-manifest")
             connector_check = next(item for item in doctor_payload["checks"] if item["code"] == "connector-contract")
             self.assertEqual(manifest_check["status"], "pass")
             self.assertEqual(connector_check["status"], "pass")
+            # The drift is the DCG check and nothing else.
+            failed = [item["code"] for item in doctor_payload["checks"] if item["status"] == "fail"]
+            self.assertEqual(failed, ["dcg"], doctor_payload["checks"])
 
     def test_profile_selection_activates_connectors_dev_overlay(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

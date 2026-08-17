@@ -554,6 +554,11 @@ class ReadOnlyContractTests(GitFixtureCase):
         for args in calls:
             self.assertNotIn("fetch", args)
             self.assertNotIn("push", args)
+            # The remote probe reads config; it must never reach the network.
+            self.assertNotIn("ls-remote", args)
+        # And it really is probing remotes -- otherwise the assertions above
+        # would pass for a probe that simply stopped looking.
+        self.assertIn(["remote", "-v"], calls)
 
         env = git_inventory._git_env()
         self.assertEqual(env["GIT_OPTIONAL_LOCKS"], "0")
@@ -563,6 +568,185 @@ class ReadOnlyContractTests(GitFixtureCase):
         with mock.patch.dict(os.environ, {"GIT_DIR": "/somewhere/.git"}):
             env = git_inventory._git_env()
         self.assertNotIn("GIT_DIR", env)
+
+
+class MisconfiguredUpstreamTests(GitFixtureCase):
+    """Kill the false-diverged class, on real git.
+
+    Reproduces the 2026-08-15 shape: ``cfo-qbo-control-plane`` sat at the top
+    of the risk table as diverged 3/58 for months. Its commits were already on
+    ``origin/<branch>`` at identical SHA; the branch's configured upstream was
+    ``origin/main``, so ahead/behind measured against a ref that was never
+    going to contain them.
+    """
+
+    def _cfo_shape(self) -> Path:
+        """A branch tracking origin/main whose commits live on origin/<branch>."""
+        origin = self.tmp / "cfo-origin.git"
+        self.git(self.tmp, "init", "-q", "--bare", str(origin))
+        work = self.make_repo("cfo-work")
+        self.git(work, "remote", "add", "origin", str(origin))
+        self.git(work, "push", "-q", "origin", "main")
+
+        self.git(work, "checkout", "-q", "-b", "codex/qbo")
+        for name in ("w1", "w2"):
+            (work / f"{name}.txt").write_text(f"{name}\n", encoding="utf-8")
+            self.git(work, "add", f"{name}.txt")
+            self.git(work, "commit", "-q", "-m", name)
+        # Published at identical SHA...
+        self.git(work, "push", "-q", "origin", "codex/qbo")
+        # ...but the branch is pointed at the WRONG ref.
+        self.git(work, "branch", "--set-upstream-to=origin/main", "codex/qbo", "-q")
+
+        # Advance main so the row also looks "behind", completing the shape.
+        advance = self.tmp / "cfo-advance"
+        self.git(self.tmp, "clone", "-q", str(origin), str(advance))
+        for i in range(5):
+            (advance / f"m{i}.txt").write_text(f"m{i}\n", encoding="utf-8")
+            self.git(advance, "add", f"m{i}.txt")
+            self.git(advance, "commit", "-q", "-m", f"m{i}")
+        self.git(advance, "push", "-q", "origin", "main")
+        self.git(work, "fetch", "-q", "origin")
+        return work
+
+    def test_git_itself_reports_the_false_divergence(self) -> None:
+        # The premise: without this detection the row IS diverged.
+        work = self._cfo_shape()
+        status = self.git(work, "status", "-sb").stdout.splitlines()[0]
+        self.assertIn("ahead 2", status)
+        self.assertIn("behind 5", status)
+
+    def test_the_mismatch_is_detected_with_the_same_name_ref(self) -> None:
+        record = git_inventory.probe_repo(self._cfo_shape())
+        mismatch = record.upstream_mismatch
+        self.assertIsNotNone(mismatch)
+        assert mismatch is not None
+        self.assertEqual(mismatch.configured, "origin/main")
+        self.assertEqual(mismatch.same_name, "origin/codex/qbo")
+        self.assertEqual(mismatch.ahead_vs_same_name, 0)
+
+    def test_the_configured_counts_are_preserved_verbatim(self) -> None:
+        # The misconfiguration is a real fact about the repo; rewriting
+        # ahead/behind would hide it instead of reporting it.
+        record = git_inventory.probe_repo(self._cfo_shape())
+        self.assertEqual((record.ahead, record.behind), (2, 5))
+
+    def test_the_row_no_longer_classifies_as_diverged(self) -> None:
+        record = git_inventory.probe_repo(self._cfo_shape())
+        self.assertEqual(git_inventory.effective_ahead_behind(record), (0, 0))
+        self.assertNotIn("diverged-clean", record.classes)
+        self.assertNotIn("ahead", record.classes)
+        self.assertNotIn("behind", record.classes)
+        self.assertEqual(record.primary_class, "clean-current")
+
+    def test_a_branch_tracking_its_own_ref_is_never_flagged(self) -> None:
+        _origin, clone = self.make_clone_pair("own-ref")
+        (clone / "local.txt").write_text("local\n", encoding="utf-8")
+        self.git(clone, "add", "local.txt")
+        self.git(clone, "commit", "-q", "-m", "local work")
+        record = git_inventory.probe_repo(clone)
+        self.assertIsNone(record.upstream_mismatch)
+        self.assertEqual(record.primary_class, "ahead-clean")
+
+    def test_a_branch_ahead_of_BOTH_refs_stays_genuinely_ahead(self) -> None:
+        # The critical negative: the same-name ref does NOT explain the local
+        # commits, so this is a real divergence and must be left alone.
+        work = self._cfo_shape()
+        (work / "extra.txt").write_text("extra\n", encoding="utf-8")
+        self.git(work, "add", "extra.txt")
+        self.git(work, "commit", "-q", "-m", "genuinely unpublished")
+        record = git_inventory.probe_repo(work)
+        self.assertIsNone(record.upstream_mismatch)
+        self.assertIn("diverged-clean", record.classes)
+
+    def test_detection_adds_no_network_call(self) -> None:
+        work = self._cfo_shape()
+        calls: list[list[str]] = []
+        real_run_git = git_inventory._run_git
+
+        def spy(path: str, args, timeout_s: float):
+            calls.append(list(args))
+            return real_run_git(path, args, timeout_s)
+
+        with mock.patch.object(git_inventory, "_run_git", side_effect=spy):
+            git_inventory.probe_repo(work)
+        for args in calls:
+            self.assertNotIn("fetch", args)
+            self.assertNotIn("ls-remote", args)
+            self.assertNotIn("push", args)
+        # The comparison happened, and it is exactly ONE extra subprocess.
+        comparisons = [
+            args for args in calls
+            if args[:1] == ["rev-list"] and any("origin/codex/qbo" in a for a in args)
+        ]
+        self.assertEqual(len(comparisons), 1, calls)
+
+    def test_a_clean_branch_pays_nothing_for_the_probe(self) -> None:
+        # Gated on ahead > 0: with no local commits there is no false
+        # divergence to kill, so normal repos never run the comparison.
+        _origin, clone = self.make_clone_pair("cheap")
+        calls: list[list[str]] = []
+        real_run_git = git_inventory._run_git
+
+        def spy(path: str, args, timeout_s: float):
+            calls.append(list(args))
+            return real_run_git(path, args, timeout_s)
+
+        with mock.patch.object(git_inventory, "_run_git", side_effect=spy):
+            git_inventory.probe_repo(clone)
+        self.assertEqual(
+            [a for a in calls if a[:1] == ["rev-list"] and "HEAD...origin/main" in a],
+            [],
+        )
+
+
+class UnpushedHeadBranchTests(GitFixtureCase):
+    """``include_head`` closes the gap left by demoting a worktree's band.
+
+    The HEAD branch is normally excluded from the unpushed scan because its
+    ahead/behind ride the record. When a store-backed linked worktree stops
+    banding ``no-remote``, an upstream-less HEAD would have no surface at all
+    -- an overstatement traded for a silent omission. These exercise the flag
+    directly on an ordinary repo, so no worktree plumbing is involved.
+    """
+
+    def _repo_with_unpublished_head(self) -> Path:
+        origin, clone = self.make_clone_pair("headscan")
+        self.git(clone, "checkout", "-q", "-b", "solo")
+        (clone / "solo.txt").write_text("solo\n", encoding="utf-8")
+        self.git(clone, "add", "solo.txt")
+        self.git(clone, "commit", "-q", "-m", "unpublished work")
+        return clone
+
+    def _scan(self, repo: Path, *, include_head: bool):
+        clock = git_inventory._ProbeClock(git_inventory.DEFAULT_TIMEOUT_S, 30.0)
+        return git_inventory._probe_unpushed_branches(
+            str(repo), "solo", clock, include_head=include_head
+        )
+
+    def test_the_head_branch_is_excluded_by_default(self) -> None:
+        repo = self._repo_with_unpublished_head()
+        found, note = self._scan(repo, include_head=False)
+        self.assertIsNone(note)
+        self.assertNotIn("solo", [name for name, _ahead in found])
+
+    def test_include_head_reports_the_upstream_less_head_branch(self) -> None:
+        repo = self._repo_with_unpublished_head()
+        found, _note = self._scan(repo, include_head=True)
+        self.assertEqual(dict(found).get("solo"), 1)
+
+    def test_include_head_never_double_reports_a_tracked_head(self) -> None:
+        # HEAD has an upstream: its ahead/behind already ride the record, so
+        # including it here would report the same commits twice.
+        _origin, clone = self.make_clone_pair("tracked-head")
+        (clone / "more.txt").write_text("more\n", encoding="utf-8")
+        self.git(clone, "add", "more.txt")
+        self.git(clone, "commit", "-q", "-m", "ahead of upstream")
+        clock = git_inventory._ProbeClock(git_inventory.DEFAULT_TIMEOUT_S, 30.0)
+        found, _note = git_inventory._probe_unpushed_branches(
+            str(clone), "main", clock, include_head=True
+        )
+        self.assertNotIn("main", [name for name, _ahead in found])
 
 
 class RecordSerializationTests(GitFixtureCase):
@@ -579,7 +763,8 @@ class RecordSerializationTests(GitFixtureCase):
                 "path", "classes", "primary_class", "branch", "upstream",
                 "ahead", "behind", "stash_count", "stash_newest",
                 "stash_oldest", "staged", "unstaged", "untracked", "mid_op",
-                "unpushed_branches", "branch_scan_note", "bare", "git_dir",
+                "unpushed_branches", "branch_scan_note", "remotes", "upstream_mismatch",
+                "bare", "git_dir",
                 "common_dir", "error",
             ],
         )

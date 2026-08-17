@@ -1,0 +1,8 @@
+# env is an allowlist of NAMES; values would make this file a secret store.
+schema_version: 1
+units:
+  leaky:
+    command: ["true"]
+    env: [TOKEN=hunter2, lowercase, OK_NAME]
+groups:
+  default: [leaky]

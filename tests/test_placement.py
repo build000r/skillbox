@@ -57,8 +57,8 @@ FIXTURE_YAML = textwrap.dedent(
         caps: [os:wsl, arch:amd64, docker, durable]
         trust: allowlisted
 
-      sweet-potato-prod:
-        hostnames: [sweet-potato-prod]
+      prod-linux-box:
+        hostnames: [prod-linux-box]
         caps: [os:linux, durable]
         trust: allowlisted
     """
@@ -170,7 +170,7 @@ class PlacementDecideTests(unittest.TestCase):
         accounted = self._rejected_ids(result) | {result["machine_id"]}
         self.assertEqual(
             accounted,
-            {"mac-laptop", "portfolio-devbox", "conference1-wsl", "sweet-potato-prod", "jeremy"},
+            {"mac-laptop", "portfolio-devbox", "conference1-wsl", "prod-linux-box", "jeremy"},
         )
 
     def test_linux_docker_selects_declared_over_box_only(self) -> None:
@@ -182,12 +182,12 @@ class PlacementDecideTests(unittest.TestCase):
         self.assertEqual(result["machine_id"], "portfolio-devbox")
         self.assertEqual(result["box_id"], "portfolio-devbox")
         self.assertIn("missing_caps:os:linux", self._reasons_for(result, "mac-laptop"))
-        self.assertIn("missing_caps:docker", self._reasons_for(result, "sweet-potato-prod"))
+        self.assertIn("missing_caps:docker", self._reasons_for(result, "prod-linux-box"))
 
     def test_prefer_current_over_other_declared(self) -> None:
-        result = self._decide({"caps": []}, current_id="sweet-potato-prod")
+        result = self._decide({"caps": []}, current_id="prod-linux-box")
         self.assertEqual(result["decision"], "selected")
-        self.assertEqual(result["machine_id"], "sweet-potato-prod")
+        self.assertEqual(result["machine_id"], "prod-linux-box")
 
     def test_size_order_prefers_smaller_box_only(self) -> None:
         boxes = [
@@ -363,7 +363,7 @@ class PlacementDecideTests(unittest.TestCase):
         accounted = self._rejected_ids(result)
         self.assertEqual(
             accounted,
-            {"mac-laptop", "portfolio-devbox", "conference1-wsl", "sweet-potato-prod"},
+            {"mac-laptop", "portfolio-devbox", "conference1-wsl", "prod-linux-box"},
         )
 
     def test_allow_provision_false_does_not_propose(self) -> None:
@@ -450,7 +450,7 @@ class MachineViewAndObservationsTests(unittest.TestCase):
 
         self.assertEqual(rows["retired"]["box_state"], "destroyed")
         self.assertEqual(rows["conference1-wsl"]["kind"], "persistent")
-        self.assertEqual(rows["sweet-potato-prod"]["kind"], "persistent")
+        self.assertEqual(rows["prod-linux-box"]["kind"], "persistent")
 
     def test_external_box_is_persistent(self) -> None:
         boxes = [_box(id="shared", profile="dev-small", management_mode="external")]

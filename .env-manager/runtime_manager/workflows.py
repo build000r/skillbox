@@ -39,6 +39,48 @@ def _workflow_step(
     return entry
 
 
+def _dcg_lifecycle_module() -> Any:
+    """Import the DCG lifecycle module at call time.
+
+    A module-level import would pull ``dcg_reconcile`` -> ``dcg_distribution``
+    -> ``cryptography`` into the CLI import graph, which
+    ``tests/test_cli_units`` explicitly forbids: importing the CLI must not
+    require the distribution crypto stack.
+    """
+    from . import dcg_lifecycle
+
+    return dcg_lifecycle
+
+
+def converge_dcg_for_model(
+    model: dict[str, Any],
+    *,
+    entrypoint: str,
+    dry_run: bool,
+    scope: str | None = None,
+) -> dict[str, Any] | None:
+    """Run the shared DCG lifecycle contract for a runtime model.
+
+    Returns ``None`` only when the model declares no ``dcg-bin`` artifact, i.e.
+    a runtime that genuinely does not ship DCG. Every other outcome -- including
+    an unsupported platform and a reconciler failure -- comes back as a payload
+    so the caller records a step instead of silently skipping.
+    """
+    target = dcg_lifecycle_target(model)
+    if target is None:
+        return None
+    home, binary = target
+    lifecycle = _dcg_lifecycle_module()
+    return lifecycle.converge(
+        entrypoint=entrypoint,
+        scope=scope or lifecycle.SCOPE_HOST,
+        home=home,
+        binary=binary,
+        action=lifecycle.ACTION_APPLY,
+        dry_run=dry_run,
+    )
+
+
 def _emit_onboard_error(
     *,
     client_id: str,
@@ -148,7 +190,7 @@ def _onboard_verify_detail(
     has_fail = any(result.status == "fail" for result in doctor)
     has_warn = any(result.status == "warn" for result in doctor)
     status = "fail" if has_fail else ("warn" if has_warn else "ok")
-    return status, {"checks": [asdict(result) for result in doctor]}, has_fail
+    return status, {"checks": [check_result_payload(result) for result in doctor]}, has_fail
 
 
 def _onboard_next_actions(cid: str, has_fail: bool) -> list[str]:
@@ -421,6 +463,37 @@ def run_onboard(
             is_json=is_json,
         )
 
+    # -- 2b. DCG ---------------------------------------------------------------
+    # Same contract install, first-box, runtime-sync, and box deploy call. A
+    # reconciler failure aborts onboard; a Codex-trust gate is recorded as a
+    # failed step and degrades the exit code, so a fresh onboard awaiting trust
+    # never reports healthy.
+    dcg_gate = False
+    _dcg = _dcg_lifecycle_module()
+    dcg_payload = converge_dcg_for_model(
+        model, entrypoint=_dcg.ENTRYPOINT_ONBOARD, dry_run=False
+    )
+    if dcg_payload is not None:
+        _workflow_step(
+            steps,
+            is_json,
+            "dcg",
+            _dcg.workflow_status(dcg_payload),
+            _dcg.step_detail(dcg_payload),
+        )
+        if dcg_payload.get("status") == _dcg.STATE_FAILED:
+            return _emit_onboard_error(
+                client_id=cid,
+                dry_run=False,
+                steps=steps,
+                exc=RuntimeError(
+                    f"DCG reconcile failed for {dcg_payload.get('home')}: "
+                    f"{dcg_payload.get('message') or dcg_payload.get('code')}"
+                ),
+                is_json=is_json,
+            )
+        dcg_gate = not dcg_payload.get("ok")
+
     # -- 3. Bootstrap ----------------------------------------------------------
     try:
         status, detail = _onboard_bootstrap_detail(model)
@@ -459,6 +532,9 @@ def run_onboard(
     # -- 6. Doctor (verify) ----------------------------------------------------
     verify_status, verify_detail, has_fail = _onboard_verify_detail(model, root_dir)
     _workflow_step(steps, is_json, "verify", verify_status, verify_detail)
+    # An unmet DCG operator gate is drift, not success: onboard must not exit 0
+    # while the Codex hook is still untrusted.
+    has_fail = has_fail or dcg_gate
 
     payload = {
         "client_id": cid,
@@ -736,6 +812,40 @@ def _first_box_open_step(
     return open_payload, open_code, None
 
 
+def _first_box_dcg_step(
+    *,
+    root_dir: Path,
+    cid: str,
+    steps: list[dict[str, Any]],
+    is_json: bool,
+) -> tuple[bool, int | None]:
+    """Converge DCG for first-box. Returns ``(gate_unmet, early_exit_code)``.
+
+    A reconciler failure ends first-box immediately with ``EXIT_ERROR``; an
+    unmet Codex-trust gate is reported and carried forward as drift so the run
+    cannot finish green.
+    """
+    try:
+        model = _onboard_filtered_model(root_dir, cid)
+    except RuntimeError as exc:
+        _first_box_step(steps, is_json, "dcg", "fail", {"error": str(exc)})
+        return True, EXIT_ERROR
+
+    _dcg = _dcg_lifecycle_module()
+    payload = converge_dcg_for_model(
+        model, entrypoint=_dcg.ENTRYPOINT_FIRST_BOX, dry_run=False
+    )
+    if payload is None:
+        return False, None
+
+    _first_box_step(
+        steps, is_json, "dcg", _dcg.workflow_status(payload), _dcg.step_detail(payload)
+    )
+    if payload.get("status") == _dcg.STATE_FAILED:
+        return True, EXIT_ERROR
+    return (not payload.get("ok")), None
+
+
 def run_first_box(
     *,
     root_dir: Path,
@@ -801,6 +911,16 @@ def run_first_box(
     if exit_code is not None:
         return exit_code
 
+    # DCG convergence, in first-box's own name. Onboard converges too, but
+    # first-box skips onboard whenever the overlay already exists, and that
+    # rerun path must still land on the same contract. The reconciler is
+    # idempotent, so running it after an onboard that just ran is a no-op.
+    dcg_gate, exit_code = _first_box_dcg_step(
+        root_dir=root_dir, cid=cid, steps=steps, is_json=is_json,
+    )
+    if exit_code is not None:
+        return exit_code
+
     profile_args = _first_box_profile_args(profiles)
     acceptance_payload, exit_code = _first_box_acceptance_step(
         root_dir=root_dir,
@@ -839,7 +959,9 @@ def run_first_box(
         "mcp_servers": open_payload.get("mcp_servers") or [],
         "steps": steps,
         "next_actions": next_actions_for_first_box(cid, profiles),
-        "exit_code": open_code,
+        # An unmet DCG operator gate degrades an otherwise clean run to drift:
+        # first-box must never report success while the Codex hook is untrusted.
+        "exit_code": EXIT_DRIFT if (dcg_gate and open_code == EXIT_OK) else open_code,
     }
     return _emit_first_box_payload(payload, steps, is_json)
 
@@ -3301,14 +3423,14 @@ def _focus_emit_bootstrap_doctor_failure(
     is_json: bool,
 ) -> int | None:
     doctor = doctor_results(model, root_dir)
-    doctor_failures = [asdict(result) for result in doctor if result.status == "fail"]
+    doctor_failures = [check_result_payload(result) for result in doctor if result.status == "fail"]
     if not doctor_failures:
         return None
     _focus_step(
         steps, is_json, "bootstrap", "fail",
         {
             "error": "post-sync doctor checks failed",
-            "checks": [asdict(result) for result in doctor],
+            "checks": [check_result_payload(result) for result in doctor],
         },
     )
     payload = {"client_id": cid, "steps": steps}

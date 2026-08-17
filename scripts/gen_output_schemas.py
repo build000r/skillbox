@@ -80,6 +80,15 @@ RUNTIME_ROOT_PLACEHOLDER = "<RUNTIME_ROOT>"
 BR_BIN_PLACEHOLDER = "<BR_BIN>"
 REMOTE_ROOT_PLACEHOLDER = "<REMOTE_ROOT>"
 
+# Measured wall-clock values are volatile in exactly the way absolute paths are:
+# they differ on every run, so a doc that embedded them could never match a
+# regeneration and the drift gate would fail at random. Pin them to a fixed
+# value -- the example is there to show the SHAPE of the field, not a timing.
+VOLATILE_NUMERIC_KEYS = frozenset(
+    {"duration_s", "structure_duration_s", "runtime_duration_s"}
+)
+VOLATILE_NUMERIC_VALUE = 0.0
+
 
 # --------------------------------------------------------------------------- #
 # Per-field stability notes (the curated half of the contract).
@@ -404,7 +413,15 @@ FIELD_NOTES["skill_togglable.item"] = {
 def _norm(obj: Any, replacements: list[tuple[str, str]]) -> Any:
     """Replace volatile absolute-path tokens with stable placeholders, recursively."""
     if isinstance(obj, dict):
-        return {key: _norm(value, replacements) for key, value in obj.items()}
+        return {
+            key: (
+                VOLATILE_NUMERIC_VALUE
+                if key in VOLATILE_NUMERIC_KEYS and isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                else _norm(value, replacements)
+            )
+            for key, value in obj.items()
+        }
     if isinstance(obj, list):
         return [_norm(item, replacements) for item in obj]
     if isinstance(obj, str):
@@ -884,14 +901,13 @@ def example_doctor() -> dict[str, Any]:
         sd, "build_context", lambda **_kw: ctx
     ):
         payload = sd.run_structure_doctor()
-    # Normalize the volatile bits: durations (wall-clock) and roots.
-    for gate in payload["gates"]:
-        gate["duration_s"] = 0.0
-    payload["summary"]["structure_duration_s"] = 0.0
-    payload["summary"]["runtime_duration_s"] = 0.0
     payload["runtime_root"] = RUNTIME_ROOT_PLACEHOLDER
     payload["cwd"] = f"{RUNTIME_ROOT_PLACEHOLDER}/sample-repo"
-    return payload
+    # Normalize the volatile bits: durations (wall-clock) and roots. This goes
+    # through _norm rather than assigning each duration by hand -- hand-listing
+    # the sites is exactly how checks[].details.duration_s was missed, which let
+    # a wall-clock float into the committed doc and made the drift gate flap.
+    return _norm(payload, [(str(ROOT_DIR), RUNTIME_ROOT_PLACEHOLDER)])
 
 
 def example_fleet_converge() -> dict[str, Any]:

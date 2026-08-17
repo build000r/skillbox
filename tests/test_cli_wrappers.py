@@ -21,8 +21,8 @@ class CliWrapperTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("sbp capabilities --json", result.stdout)
-        self.assertIn("sbp mmdx QUERY", result.stdout)
-        self.assertIn("Fuzzy-find and open .mmdx/.mmd", result.stdout)
+        self.assertIn("sbp mmdx [QUERY]", result.stdout)
+        self.assertIn("fuzzy-find and open .mmdx/.mmd", result.stdout)
         self.assertIn("sbp hire times", result.stdout)
         self.assertIn("sbp skills audit", result.stdout)
         self.assertIn("sbp candidates", result.stdout)
@@ -32,12 +32,12 @@ class CliWrapperTests(unittest.TestCase):
         self.assertIn("sbp family dashboard", result.stdout)
         self.assertIn("sbp beads", result.stdout)
         self.assertIn("sbp launch", result.stdout)
-        self.assertIn("Alias for launch", result.stdout)
+        self.assertIn("(alias: bulk)", result.stdout)
         self.assertIn("sbp skill resolve", result.stdout)
         self.assertIn("sbp skill pull NAME", result.stdout)
-        self.assertIn("without linking or activation", result.stdout)
+        self.assertIn("no links, no activation", result.stdout)
         self.assertIn("sbp skill activate NAME", result.stdout)
-        self.assertIn("mutates links", result.stdout)
+        self.assertIn("link NAME and return a session packet", result.stdout)
 
     def test_sbo_help_uses_sbo_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

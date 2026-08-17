@@ -77,7 +77,7 @@ Options:
                      Marks the receipt non-canonical; never used by pre-push.
   --lane <id>        Run only this lane (repeatable). Recovery/debug only; marks
                      the receipt non-canonical. Lane ids: lint shellcheck render
-                     test-3.11 test-3.12-coverage test-3.13 compose
+                     contract test-3.11 test-3.12-coverage test-3.13 compose
   --refresh          Re-provision the pinned toolchain even on a cache hit.
   --trigger <name>   Record the invoking trigger in the receipt (default: manual).
   --json             Print the receipt JSON on stdout.
@@ -180,6 +180,16 @@ done
 command -v git >/dev/null 2>&1 || die "git is required"
 command -v docker >/dev/null 2>&1 || die "docker is required for the compose lane"
 
+# Git hooks export repository-local variables such as GIT_DIR. If those leak
+# into the isolated clone below, `git -C "${SRC}" checkout` still targets the
+# caller's worktree: it detaches the real checkout and leaves SRC empty. Resolve
+# the script-owned root first, then clear exactly Git's documented local vars.
+GIT_LOCAL_ENV_VARS="$(git -C "${REPO_ROOT}" rev-parse --local-env-vars 2>/dev/null || true)"
+for git_local_env in ${GIT_LOCAL_ENV_VARS}; do
+  unset "${git_local_env}"
+done
+unset GIT_LOCAL_ENV_VARS git_local_env
+
 STATE_ROOT="${SKILLBOX_STATE_ROOT:-${REPO_ROOT}/.skillbox-state}"
 TOOLCHAIN_DIR="${SKILLBOX_SELF_TEST_TOOLCHAIN_DIR:-${STATE_ROOT}/self-test/toolchain}"
 RECEIPT_DIR="${SKILLBOX_SELF_TEST_RECEIPT_DIR:-${STATE_ROOT}/self-test/receipts}"
@@ -223,7 +233,48 @@ if [[ ${#SELECTED_LANES[@]} -gt 0 ]]; then
 fi
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/skillbox-self-test.XXXXXXXX")"
+
+# Grace period between TERM and KILL when sweeping a lane's leftovers.
+LANE_REAP_GRACE_SECONDS="${SKILLBOX_SELF_TEST_REAP_GRACE:-5}"
+# Process group of the lane currently running, so the EXIT trap can sweep it if
+# the gate is interrupted mid-lane. Empty when no lane is in flight.
+CURRENT_LANE_PGID=""
+
+# Kill everything still alive in a lane's process group.
+#
+# By the time this runs the lane's own command has already exited, so any
+# surviving member of its group is something the lane spawned and failed to stop
+# -- in practice a service a test booted from builds/clients/*/workspace/
+# runtime.yaml (fwc serve-mcp, dcg mcp) inside a TemporaryDirectory sandbox.
+# Deleting the sandbox removed the files but never signalled those processes:
+# they reparented to PID 1 and accumulated as `sh -c` retry loops (~950 leaked
+# pairs drove load to ~1267 on 8 vCPUs on 2026-08-07, after a first storm on
+# 2026-07-23). A gate run must not outlive itself.
+reap_lane_group() {
+  local pgid="$1" lane="$2" waited=0
+  # Nothing left in the group is the normal, quiet case.
+  kill -0 -- "-${pgid}" 2>/dev/null || return 1
+  log "self-test: reaping stray processes left behind by lane ${lane}"
+  kill -TERM -- "-${pgid}" 2>/dev/null || true
+  while kill -0 -- "-${pgid}" 2>/dev/null; do
+    if [[ "${waited}" -ge "${LANE_REAP_GRACE_SECONDS}" ]]; then
+      kill -KILL -- "-${pgid}" 2>/dev/null || true
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 0
+}
+
 cleanup() {
+  # Interrupted mid-lane (the gate is killable, and was killed in practice):
+  # sweep the in-flight lane before dropping the sandbox, or the same leak
+  # happens on every aborted run.
+  if [[ -n "${CURRENT_LANE_PGID}" ]]; then
+    reap_lane_group "${CURRENT_LANE_PGID}" "interrupted" || true
+    CURRENT_LANE_PGID=""
+  fi
   rm -rf "${WORK_DIR}"
 }
 trap cleanup EXIT
@@ -345,12 +396,26 @@ run_lane() {
   shift
   lane_selected "${id}" || return 0
 
-  local started ended elapsed status code
+  local started ended elapsed status code reaped lane_pid
   local log_file="${LOG_DIR}/${id}.log"
   started="$(date +%s)"
   set +e
-  ( cd "${SRC}" && "$@" ) >"${log_file}" 2>&1
+  # `set -m` makes each background job a process-group leader, so the lane and
+  # everything it spawns share a group we can signal as a unit afterwards.
+  # setsid(1) would be the obvious tool but it does not ship on macOS, and this
+  # gate runs on both macOS and Linux; job control is the portable equivalent.
+  set -m
+  ( cd "${SRC}" && "$@" ) >"${log_file}" 2>&1 &
+  lane_pid=$!
+  CURRENT_LANE_PGID="${lane_pid}"
+  wait "${lane_pid}"
   code="$?"
+  set +m
+  reaped="false"
+  if reap_lane_group "${lane_pid}" "${id}"; then
+    reaped="true"
+  fi
+  CURRENT_LANE_PGID=""
   set -e
   ended="$(date +%s)"
   elapsed="$((ended - started))"
@@ -374,7 +439,8 @@ run_lane() {
   fi
 
   RAN_LANES+=("${id}")
-  printf '%s\t%s\t%s\t%s\t%s\n' "${id}" "${status}" "${code}" "${elapsed}" "$*" >>"${LANE_TSV}"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "${id}" "${status}" "${code}" "${elapsed}" "${reaped}" "$*" >>"${LANE_TSV}"
 }
 
 RUN_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -391,6 +457,14 @@ run_lane "shellcheck" bash -c \
 run_lane "render" bash -c \
   "\"\$1\" scripts/04-reconcile.py render >\"\$2\"" _ \
   "${PY_ROOT}/${COVERAGE_PYTHON}/bin/python" "${WORK_DIR}/render.json"
+
+# The cross-surface command contract. Read-only: it imports and introspects the
+# parsers, the registry, the Makefile and the checked-in baselines, and runs
+# nothing -- so it is safe in the isolated checkout and needs no Docker, no
+# network, and no operator state. Output is NOT redirected: when this lane
+# fails, the drift itself is what the failure tail has to show.
+run_lane "contract" "${PY_ROOT}/${COVERAGE_PYTHON}/bin/python" \
+  .env-manager/manage.py contract-lint --format json
 
 for version in "${PYTHON_VERSIONS[@]}"; do
   if [[ "${version}" == "${COVERAGE_PYTHON}" ]]; then
@@ -467,13 +541,17 @@ with open(os.environ["ST_LANE_TSV"], encoding="utf-8") as handle:
         line = line.rstrip("\n")
         if not line:
             continue
-        lane_id, status, code, seconds, command = line.split("\t", 4)
+        lane_id, status, code, seconds, reaped, command = line.split("\t", 5)
         lanes.append(
             {
                 "id": lane_id,
                 "status": status,
                 "exit_code": int(code),
                 "duration_s": int(seconds),
+                # True when the lane left processes running and the gate had to
+                # sweep its process group. A durable signal that some suite is
+                # starting services it never stops.
+                "reaped_stray_processes": reaped == "true",
                 "command": redact(command),
             }
         )

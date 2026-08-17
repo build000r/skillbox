@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
+import sys
+import tempfile
+import textwrap
+import time
 import unittest
 from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
@@ -296,8 +301,13 @@ class BoxLifecycleTests(unittest.TestCase):
 
         def fake_enroll_box_tailscale(context: BOX_MODULE.BoxUpContext, *, ts_authkey: str) -> str:
             del ts_authkey
-            BOX_MODULE.update_box(context.box, tailscale_ip="100.100.0.8", state="deploying")
+            # Enrollment stops at `lockdown`; reaching `deploying` is lockdown's job.
+            BOX_MODULE.update_box(context.box, tailscale_ip="100.100.0.8", state="lockdown")
             return "tailscale skillbox-box-1 at 100.100.0.8"
+
+        def fake_lock_down_box_network(context: BOX_MODULE.BoxUpContext) -> str:
+            BOX_MODULE.update_box(context.box, state="deploying")
+            return "tailnet_only lockdown locked-down at 100.100.0.8"
 
         def fake_mark_box_ssh_ready(context: BOX_MODULE.BoxUpContext) -> str:
             context.ssh_target = "1.2.3.4"
@@ -320,6 +330,7 @@ class BoxLifecycleTests(unittest.TestCase):
             mock.patch.object(BOX_MODULE, "_bootstrap_box_host", return_value="bootstrap ok"),
             mock.patch.object(BOX_MODULE, "_mark_box_ssh_ready", side_effect=fake_mark_box_ssh_ready),
             mock.patch.object(BOX_MODULE, "_enroll_box_tailscale", side_effect=fake_enroll_box_tailscale),
+            mock.patch.object(BOX_MODULE, "_lock_down_box_network", side_effect=fake_lock_down_box_network),
             mock.patch.object(BOX_MODULE, "_deploy_box_runtime", side_effect=fake_deploy_box_runtime),
             mock.patch.object(BOX_MODULE, "_patch_remote_runtime_contract", return_value={"env_updates": ["SKILLBOX_STATE_ROOT"]}),
             mock.patch.object(BOX_MODULE, "_launch_remote_workspace", return_value={"targets": ["build", "up"]}),
@@ -349,7 +360,7 @@ class BoxLifecycleTests(unittest.TestCase):
         self.assertEqual(payload["box_id"], "box-1")
         self.assertEqual(
             [step["step"] for step in payload["steps"]],
-            ["create", "storage", "bootstrap", "ssh-ready", "enroll", "deploy", "contract", "launch", "first-box", "verify"],
+            ["create", "storage", "bootstrap", "ssh-ready", "enroll", "lockdown", "deploy", "contract", "launch", "first-box", "verify"],
         )
         self.assertTrue(all(step["status"] == "ok" for step in payload["steps"]))
         self.assertEqual(payload["droplet_ip"], "1.2.3.4")
@@ -453,11 +464,16 @@ class BoxLifecycleTests(unittest.TestCase):
             context.ssh_target = "100.100.0.8"
             return "100.100.0.8"
 
+        def fake_lock_down_box_network(context: BOX_MODULE.BoxUpContext) -> str:
+            BOX_MODULE.update_box(context.box, state="deploying")
+            return "tailnet_only lockdown locked-down at 100.100.0.8"
+
         with (
             mock.patch.object(BOX_MODULE, "load_profile", return_value=profile),
             mock.patch.object(BOX_MODULE, "load_inventory", return_value=[box]),
             mock.patch.object(BOX_MODULE, "load_deploy_manifest", return_value=release),
             mock.patch.object(BOX_MODULE, "_resolve_deploy_target", side_effect=fake_resolve),
+            mock.patch.object(BOX_MODULE, "_lock_down_box_network", side_effect=fake_lock_down_box_network),
             mock.patch.object(BOX_MODULE, "_deploy_box_runtime", return_value="installed release abc123def456"),
             mock.patch.object(BOX_MODULE, "_patch_remote_runtime_contract", return_value={"env_updates": ["SKILLBOX_STATE_ROOT"]}),
             mock.patch.object(BOX_MODULE, "_launch_remote_workspace", return_value={"targets": ["build", "up"]}),
@@ -486,9 +502,15 @@ class BoxLifecycleTests(unittest.TestCase):
         self.assertTrue(payloads[0]["resumed"])
         self.assertEqual(
             [step["step"] for step in payloads[0]["steps"]],
-            ["create", "storage", "bootstrap", "ssh-ready", "enroll", "deploy", "contract", "launch", "first-box", "verify"],
+            ["create", "storage", "bootstrap", "ssh-ready", "enroll", "lockdown", "deploy", "contract", "launch", "first-box", "verify"],
         )
-        self.assertEqual([step["status"] for step in payloads[0]["steps"]], ["skip", "skip", "skip", "ok", "skip", "ok", "ok", "ok", "ok", "ok"])
+        # enroll is "ok", not "skip": a stored Tailnet IP on an ssh-ready box is
+        # accepted as enrollment evidence, but only by walking into `lockdown`,
+        # which then runs. The old code skipped enroll AND lockdown here.
+        self.assertEqual(
+            [step["status"] for step in payloads[0]["steps"]],
+            ["skip", "skip", "skip", "ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok"],
+        )
         run_first_box.assert_called_once_with(
             mock.ANY,
             blueprint=BOX_MODULE.DEFAULT_FIRST_BOX_BLUEPRINT,
@@ -845,7 +867,8 @@ class BoxDownTeardownTruthTests(unittest.TestCase):
         do_delete_volume.assert_not_called()
         payload = payloads[-1]
         self.assertEqual(payload["error"]["type"], "volume_cleanup_failed")
-        self.assertIn("box down teardown", payload["next_actions"])
+        # Identity-bound: the hint must be runnable, not just present.
+        self.assertIn("box down teardown --confirm teardown", payload["next_actions"])
 
     def test_tailscale_removal_failure_never_blocks_destroy_but_is_reported(self) -> None:
         """Scenario 4: tailnet removal fails -> reported in steps but never
@@ -1187,14 +1210,14 @@ class BoxTeardownPendingVisibilityTests(unittest.TestCase):
         resolve_ssh.assert_not_called()
         self.assertEqual(status["state"], "destroy-pending")
         self.assertTrue(status["teardown_pending"]["billing_risk"])
-        self.assertIn("box down teardown", status["next_actions"])
+        self.assertIn("box down teardown --confirm teardown", status["next_actions"])
 
     def test_box_health_surfaces_volume_cleanup_failed_without_billing_risk(self) -> None:
         box = BOX_MODULE.Box(id="teardown", profile="dev-small", state="volume-cleanup-failed", droplet_id="77")
         status = BOX_MODULE.box_health(box)
         self.assertEqual(status["state"], "volume-cleanup-failed")
         self.assertFalse(status["teardown_pending"]["billing_risk"])
-        self.assertIn("box down teardown", status["next_actions"])
+        self.assertIn("box down teardown --confirm teardown", status["next_actions"])
 
     def test_box_list_surfaces_teardown_pending_hint(self) -> None:
         boxes = [
@@ -1215,8 +1238,196 @@ class BoxTeardownPendingVisibilityTests(unittest.TestCase):
         self.assertEqual(set(by_id), {"pending", "volpend"})
         self.assertTrue(by_id["pending"]["billing_risk"])
         self.assertFalse(by_id["volpend"]["billing_risk"])
-        self.assertEqual(by_id["pending"]["next_action"], "box down pending")
+        self.assertEqual(by_id["pending"]["next_action"], "box down pending --confirm pending")
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+HOLDER_SOURCE = textwrap.dedent(
+    """
+    import sys, time
+    sys.path.insert(0, {scripts!r})
+    from lib import opslib
+    boundary, repo, ready, release = sys.argv[1:5]
+    with opslib.state_root_lease(boundary, repo_root=repo):
+        open(ready, "w").close()
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                open(release).close()
+                break
+            except OSError:
+                time.sleep(0.02)
+    """
+)
+
+
+class BoxLeaseBoundarySelectionTests(unittest.TestCase):
+    """Exactly one place answers "does this command line mutate?"."""
+
+    def _args(self, command: str, **fields: object) -> argparse.Namespace:
+        base = {"command": command, "dry_run": False, "write_cache": False}
+        base.update(fields)
+        return argparse.Namespace(**base)
+
+    def test_every_mutating_command_selects_its_manifest_boundary(self) -> None:
+        expected = {
+            "up": "box.up",
+            "down": "box.down",
+            "upgrade": "box.upgrade",
+            "inventory-rebuild": "box.inventory-rebuild",
+            "ssh": "box.ssh",
+            "exec": "box.exec",
+            "compose-up": "box.compose-up",
+            "compose-down": "box.compose-down",
+            "register": "box.register",
+            "import": "box.register",
+            "unregister": "box.unregister",
+        }
+        for command, boundary in expected.items():
+            with self.subTest(command=command):
+                self.assertEqual(
+                    BOX_MODULE.box_lease_boundary(
+                        self._args(command), down_confirmed=True
+                    ),
+                    boundary,
+                )
+
+    def test_every_selected_boundary_is_a_declared_mutation(self) -> None:
+        """A boundary the manifest calls a read would be refused by the lease."""
+        sys.path.insert(0, str(ROOT_DIR / ".env-manager"))
+        from runtime_manager import state_mutation as SM
+
+        for boundary in set(BOX_MODULE.BOX_COMMAND_BOUNDARIES.values()):
+            with self.subTest(boundary=boundary):
+                self.assertTrue(SM.boundary(boundary).is_mutation)
+
+    def test_reads_select_no_boundary(self) -> None:
+        for command in ("list", "profiles", "place", "posture-proof", "capabilities"):
+            with self.subTest(command=command):
+                self.assertIsNone(BOX_MODULE.box_lease_boundary(self._args(command)))
+
+    def test_a_true_dry_run_selects_no_boundary(self) -> None:
+        """Required by the contract: a dry run stays available under a writer."""
+        for command in ("up", "down", "upgrade", "exec", "compose-up", "compose-down"):
+            with self.subTest(command=command):
+                self.assertIsNone(
+                    BOX_MODULE.box_lease_boundary(
+                        self._args(command, dry_run=True), down_confirmed=True
+                    )
+                )
+
+    def test_plain_status_is_a_read_and_cache_writing_status_is_not(self) -> None:
+        self.assertIsNone(BOX_MODULE.box_lease_boundary(self._args("status")))
+        self.assertEqual(
+            BOX_MODULE.box_lease_boundary(self._args("status", write_cache=True)),
+            "box.status",
+        )
+
+    def test_an_unconfirmed_teardown_writes_nothing_and_takes_no_lease(self) -> None:
+        self.assertIsNone(
+            BOX_MODULE.box_lease_boundary(self._args("down"), down_confirmed=False)
+        )
+        self.assertEqual(
+            BOX_MODULE.box_lease_boundary(self._args("down"), down_confirmed=True),
+            "box.down",
+        )
+
+
+class BoxStateRootLeaseContentionTests(unittest.TestCase):
+    """Cross-PROCESS exclusion: flock is per open file description, so a second
+    process is the only honest way to prove the single-writer property."""
+
+    def setUp(self) -> None:
+        sys.path.insert(0, str(ROOT_DIR / "scripts"))
+        from lib import opslib
+
+        self.opslib = opslib
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name).resolve()
+        self.repo = self.base / "repo"
+        (self.repo / ".skillbox-state").mkdir(parents=True)
+        self.addCleanup(setattr, self.opslib, "_ACTIVE_STATE_LEASE", None)
+
+    def _holder(self, repo: Path, boundary: str = "box.register"):
+        ready = self.base / f"ready-{repo.name}"
+        release = self.base / f"release-{repo.name}"
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                HOLDER_SOURCE.format(scripts=str(ROOT_DIR / "scripts")),
+                boundary,
+                str(repo),
+                str(ready),
+                str(release),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.time() + 30
+        while time.time() < deadline and not ready.exists():
+            if proc.poll() is not None:
+                self.fail(f"holder exited early: {proc.communicate()[1]}")
+            time.sleep(0.02)
+        self.assertTrue(ready.exists(), "holder never acquired the lease")
+
+        def stop() -> None:
+            release.touch()
+            try:
+                proc.communicate(timeout=30)
+            except subprocess.TimeoutExpired:  # pragma: no cover - defensive
+                proc.kill()
+                proc.communicate()
+
+        self.addCleanup(stop)
+        return stop
+
+    def test_a_second_process_cannot_hold_the_same_root(self) -> None:
+        env = {"SKILLBOX_STATE_ROOT": ""}
+        self._holder(self.repo)
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("SKILLBOX_STATE_ROOT", None)
+            with self.assertRaises(Exception) as caught:
+                with self.opslib.state_root_lease(
+                    "box.register", repo_root=self.repo, timeout=0.75
+                ):
+                    pass
+        self.assertEqual(type(caught.exception).__name__, "StateMutationLeaseTimeout")
+
+    def test_a_symlink_alias_of_the_root_collides_with_it(self) -> None:
+        """Two spellings of one root must not be two locks."""
+        alias = self.base / "alias-repo"
+        alias.symlink_to(self.repo, target_is_directory=True)
+        self.assertEqual(
+            self.opslib.resolve_state_root(alias),
+            self.opslib.resolve_state_root(self.repo),
+        )
+        self._holder(self.repo)
+        with self.assertRaises(Exception) as caught:
+            with self.opslib.state_root_lease(
+                "box.register", repo_root=alias, timeout=0.75
+            ):
+                pass
+        self.assertEqual(type(caught.exception).__name__, "StateMutationLeaseTimeout")
+
+    def test_two_distinct_roots_proceed_independently(self) -> None:
+        other = self.base / "other-repo"
+        (other / ".skillbox-state").mkdir(parents=True)
+        self._holder(self.repo)
+        with self.opslib.state_root_lease(
+            "box.register", repo_root=other, timeout=5
+        ) as held:
+            self.assertTrue(held.held)
+
+    def test_a_read_and_a_true_dry_run_stay_available_while_a_writer_holds(self) -> None:
+        """They select no boundary, so they never reach the lock at all."""
+        self._holder(self.repo)
+        reader = argparse.Namespace(command="status", dry_run=False, write_cache=False)
+        preview = argparse.Namespace(command="up", dry_run=True, write_cache=False)
+        self.assertIsNone(BOX_MODULE.box_lease_boundary(reader))
+        self.assertIsNone(BOX_MODULE.box_lease_boundary(preview))

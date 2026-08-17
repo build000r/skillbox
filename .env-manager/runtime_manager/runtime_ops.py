@@ -1944,8 +1944,26 @@ def _doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
         + validate_mcp_healthchecks(model)
         + validate_port_registry(model)
         + validate_port_contracts(model)
+        + dcg_doctor_results(model, root_dir)
         + parity_results
     )
+
+
+def dcg_doctor_results(model: dict[str, Any], root_dir: Path) -> list[CheckResult]:
+    """Fail-closed DCG health, or nothing when the runtime declares no DCG.
+
+    Imported at call time for the same reason the lifecycle wiring is: a
+    module-level import would drag ``dcg_distribution`` -> ``cryptography``
+    into the CLI import graph, which ``tests/test_cli_units`` forbids.
+    """
+    if not any(
+        str(artifact.get("id") or "") == DCG_ARTIFACT_ID
+        for artifact in model.get("artifacts") or []
+    ):
+        return []
+    from . import dcg_doctor
+
+    return [dcg_doctor.check_result(model, root_dir)]
 
 
 def sync_artifact(artifact: dict[str, Any], dry_run: bool) -> list[str]:
@@ -2299,6 +2317,121 @@ def _dcg_config_current(dcg_config_path: Path, content: str) -> bool:
     return dcg_config_path.exists() and dcg_config_path.read_text() == content
 
 
+# ---------------------------------------------------------------------------
+# DCG hook/binary convergence during runtime-sync
+#
+# The dcg-bin artifact is declared ``sync.mode: manual`` because the generic URL
+# downloader cannot check a minisign signature. "Manual" used to mean the sync
+# emitted ``skip: <path> (sync mode manual)`` -- an optional-binary line in an
+# otherwise healthy run. It is not optional: convergence is owned by the
+# lifecycle contract below, which fails closed instead of skipping.
+
+DCG_ARTIFACT_ID = "dcg-bin"
+
+
+def _dcg_modules() -> tuple[Any, Any]:
+    """``(dcg_lifecycle, dcg_reconcile)``, imported at call time.
+
+    ``runtime_manager.__init__`` materializes its eager facade on the first
+    package attribute access, so a module-level ``from . import dcg_lifecycle``
+    here would re-enter that loader while ``runtime_ops`` is still initializing.
+    Importing at call time keeps the dependency one-directional.
+    """
+    from . import dcg_lifecycle, dcg_reconcile
+
+    return dcg_lifecycle, dcg_reconcile
+
+
+def _dcg_artifact_is_reconciler_owned(artifact: dict[str, Any]) -> bool:
+    """True when dcg-bin installation belongs to the verified DCG resolver.
+
+    ``sync.mode: manual`` is how ``workspace/runtime.yaml`` says "the generic
+    URL downloader cannot check this artifact's minisign signature, so do not
+    try". That is exactly the declaration whose generic output is an optional
+    skip line.
+    """
+    if str(artifact.get("id") or "") != DCG_ARTIFACT_ID:
+        return False
+    sync = artifact.get("sync")
+    mode = str(sync.get("mode") or "") if isinstance(sync, dict) else ""
+    return mode == "manual"
+
+
+def _dcg_home_for_binary(binary: Path) -> Path | None:
+    """The managed home that owns *binary*, or None if it is not a managed path.
+
+    Derived by stripping the reconciler's own ``.local/bin/dcg`` relpath rather
+    than counting parents, so the two modules cannot drift apart on where a
+    managed home starts.
+    """
+    _, reconcile = _dcg_modules()
+    relative_parts = Path(reconcile.DEFAULT_BINARY_RELPATH).parts
+    if binary.parts[-len(relative_parts):] != relative_parts:
+        return None
+    return Path(*binary.parts[: -len(relative_parts)])
+
+
+def dcg_lifecycle_target(model: dict[str, Any]) -> tuple[Path, Path] | None:
+    """``(home, binary)`` for the host-scope DCG target declared by the model.
+
+    Returns ``None`` when the model declares no ``dcg-bin`` artifact at all --
+    a runtime that genuinely does not ship DCG, as opposed to one that ships it
+    and cannot converge it.
+    """
+    for artifact in model.get("artifacts") or []:
+        if str(artifact.get("id") or "") != DCG_ARTIFACT_ID:
+            continue
+        host_path = str(artifact.get("host_path") or "").strip()
+        if not host_path:
+            return None
+        binary = Path(host_path)
+        home = _dcg_home_for_binary(binary)
+        if home is None:
+            return None
+        return home, binary
+    return None
+
+
+def sync_dcg_reconcile(model: dict[str, Any], dry_run: bool) -> list[str]:
+    """Converge host-scope DCG through the shared lifecycle contract.
+
+    A reconciler failure raises so ``manage.py sync`` exits nonzero; a
+    ``needs-operator-action`` verdict is reported as a visible action naming the
+    operator step, never as a silent skip.
+    """
+    target = dcg_lifecycle_target(model)
+    if target is None:
+        return []
+    home, binary = target
+
+    lifecycle, reconcile = _dcg_modules()
+    payload = lifecycle.converge(
+        entrypoint=lifecycle.ENTRYPOINT_RUNTIME_SYNC,
+        scope=lifecycle.SCOPE_HOST,
+        home=home,
+        binary=binary,
+        action=lifecycle.ACTION_APPLY,
+        dry_run=dry_run,
+    )
+    if payload.get("status") == reconcile.STATE_FAILED:
+        raise RuntimeLifecycleError(
+            "runtime_error",
+            f"DCG reconcile failed for {home}: {payload.get('message') or payload.get('code')}",
+            context={
+                "home": str(home),
+                "binary": str(binary),
+                "marker": payload.get("marker"),
+                "code": payload.get("code"),
+            },
+            next_actions=list(payload.get("operator_actions") or []),
+        )
+
+    lines = [lifecycle.action_text(payload)]
+    for operator_action in payload.get("operator_actions") or []:
+        lines.append(f"operator-action: {operator_action}")
+    return lines
+
+
 def runtime_repo_reference_id(entry: dict[str, Any]) -> str:
     return str(entry.get("repo_id") or entry.get("repo") or "").strip()
 
@@ -2620,6 +2753,14 @@ def sync_runtime_records(model: dict[str, Any], dry_run: bool) -> list[dict[str,
             )
         )
     for artifact in model["artifacts"]:
+        # A manual-mode dcg-bin is converged by the lifecycle contract below,
+        # not by the generic artifact syncer: letting it fall through would
+        # re-emit the "sync mode manual" optional-binary skip that the DCG
+        # setup contract forbids on the healthy path. A dcg-bin that declares a
+        # real syncable source still goes through the normal syncer -- there is
+        # no optional skip to suppress in that case.
+        if _dcg_artifact_is_reconciler_owned(artifact):
+            continue
         records.extend(
             action_records(
                 sync_artifact(artifact, dry_run=dry_run),
@@ -2653,6 +2794,13 @@ def sync_runtime_records(model: dict[str, Any], dry_run: bool) -> list[dict[str,
         action_records(
             sync_dcg_config(model, Path(str(model["root_dir"])), dry_run=dry_run),
             action_id="dcg-config",
+            kind="dcg",
+        )
+    )
+    records.extend(
+        action_records(
+            sync_dcg_reconcile(model, dry_run=dry_run),
+            action_id="dcg-reconcile",
             kind="dcg",
         )
     )

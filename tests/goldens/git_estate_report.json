@@ -23,12 +23,24 @@
     "mid_op": null,
     "unpushed_branches": [],
     "branch_scan_note": null,
+    "remotes": [
+      {
+        "name": "origin",
+        "url": "file:///GOLDEN_TMP/origins/b-dirty-origin"
+      }
+    ],
+    "upstream_mismatch": null,
     "bare": false,
     "git_dir": "/GOLDEN_TMP/estate/b-dirty/.git",
     "common_dir": "/GOLDEN_TMP/estate/b-dirty/.git",
     "error": null,
     "risk_band": "dirty",
     "registration": "registered",
+    "ownership": "unknown",
+    "ownership_source": "remote-heuristic",
+    "push_policy": "ask",
+    "push_policy_reason": "ownership could not be established from registry or remote",
+    "remote_url": "file:///GOLDEN_TMP/origins/b-dirty-origin",
     "fix": [
       "git -C /GOLDEN_TMP/estate/b-dirty add -p && git -C /GOLDEN_TMP/estate/b-dirty commit"
     ],
@@ -65,12 +77,18 @@
         }
       ],
       "branch_scan_note": null,
+      "remotes": [],
+      "upstream_mismatch": null,
       "bare": false,
       "git_dir": "/GOLDEN_TMP/estate/e-midop/.git",
       "common_dir": "/GOLDEN_TMP/estate/e-midop/.git",
       "error": null,
       "risk_band": "mid-op",
       "registration": "registered",
+      "ownership": "owned-local",
+      "ownership_source": "registry",
+      "push_policy": "no-push",
+      "push_policy_reason": "no remote configured; nothing to push to",
       "fix": [
         "git -C /GOLDEN_TMP/estate/e-midop status  # finish or abort the merge",
         "git -C /GOLDEN_TMP/estate/e-midop add -p && git -C /GOLDEN_TMP/estate/e-midop commit",
@@ -98,12 +116,24 @@
       "mid_op": null,
       "unpushed_branches": [],
       "branch_scan_note": null,
+      "remotes": [
+        {
+          "name": "origin",
+          "url": "file:///GOLDEN_TMP/origins/b-dirty-origin"
+        }
+      ],
+      "upstream_mismatch": null,
       "bare": false,
       "git_dir": "/GOLDEN_TMP/estate/b-dirty/.git",
       "common_dir": "/GOLDEN_TMP/estate/b-dirty/.git",
       "error": null,
       "risk_band": "dirty",
       "registration": "registered",
+      "ownership": "unknown",
+      "ownership_source": "remote-heuristic",
+      "push_policy": "ask",
+      "push_policy_reason": "ownership could not be established from registry or remote",
+      "remote_url": "file:///GOLDEN_TMP/origins/b-dirty-origin",
       "fix": [
         "git -C /GOLDEN_TMP/estate/b-dirty add -p && git -C /GOLDEN_TMP/estate/b-dirty commit"
       ],
@@ -128,14 +158,26 @@
       "mid_op": null,
       "unpushed_branches": [],
       "branch_scan_note": null,
+      "remotes": [
+        {
+          "name": "origin",
+          "url": "file:///GOLDEN_TMP/origins/c-ahead-origin"
+        }
+      ],
+      "upstream_mismatch": null,
       "bare": false,
       "git_dir": "/GOLDEN_TMP/estate/c-ahead/.git",
       "common_dir": "/GOLDEN_TMP/estate/c-ahead/.git",
       "error": null,
       "risk_band": "ahead",
       "registration": "registered",
+      "ownership": "unknown",
+      "ownership_source": "remote-heuristic",
+      "push_policy": "ask",
+      "push_policy_reason": "ownership could not be established from registry or remote",
+      "remote_url": "file:///GOLDEN_TMP/origins/c-ahead-origin",
       "fix": [
-        "git -C /GOLDEN_TMP/estate/c-ahead push"
+        "git -C /GOLDEN_TMP/estate/c-ahead log --oneline @{u}..HEAD  # 1 unpublished commit; ownership unconfirmed \u2014 establish intent before publishing"
       ],
       "stash_attributed": 0
     },
@@ -158,12 +200,18 @@
       "mid_op": null,
       "unpushed_branches": [],
       "branch_scan_note": null,
+      "remotes": [],
+      "upstream_mismatch": null,
       "bare": false,
       "git_dir": "/GOLDEN_TMP/estate/g-unregistered/.git",
       "common_dir": "/GOLDEN_TMP/estate/g-unregistered/.git",
       "error": null,
       "risk_band": "no-remote",
       "registration": "unregistered",
+      "ownership": "unknown",
+      "ownership_source": "none",
+      "push_policy": "ask",
+      "push_policy_reason": "no remote and no registry entry; confirm intent",
       "fix": [
         "add a remote or register intent",
         "register in /GOLDEN_TMP/config/registry/repos.yaml or add an ignore rule there"
@@ -189,12 +237,18 @@
       "mid_op": null,
       "unpushed_branches": [],
       "branch_scan_note": null,
+      "remotes": [],
+      "upstream_mismatch": null,
       "bare": false,
       "git_dir": "/GOLDEN_TMP/estate/f-noremote/.git",
       "common_dir": "/GOLDEN_TMP/estate/f-noremote/.git",
       "error": null,
       "risk_band": "no-remote",
       "registration": "registered",
+      "ownership": "owned-local",
+      "ownership_source": "registry",
+      "push_policy": "no-push",
+      "push_policy_reason": "no remote configured; nothing to push to",
       "fix": [
         "add a remote or register intent"
       ],
@@ -219,12 +273,24 @@
       "mid_op": null,
       "unpushed_branches": [],
       "branch_scan_note": null,
+      "remotes": [
+        {
+          "name": "origin",
+          "url": "file:///GOLDEN_TMP/origins/d-stash-origin"
+        }
+      ],
+      "upstream_mismatch": null,
       "bare": false,
       "git_dir": "/GOLDEN_TMP/estate/d-stash/.git",
       "common_dir": "/GOLDEN_TMP/estate/d-stash/.git",
       "error": null,
       "risk_band": "stash-only",
       "registration": "registered",
+      "ownership": "unknown",
+      "ownership_source": "remote-heuristic",
+      "push_policy": "ask",
+      "push_policy_reason": "ownership could not be established from registry or remote",
+      "remote_url": "file:///GOLDEN_TMP/origins/d-stash-origin",
       "fix": [
         "git -C /GOLDEN_TMP/estate/d-stash stash list  # git-stash-janitor pass"
       ],
@@ -249,12 +315,24 @@
       "mid_op": null,
       "unpushed_branches": [],
       "branch_scan_note": null,
+      "remotes": [
+        {
+          "name": "origin",
+          "url": "file:///GOLDEN_TMP/origins/a-clean-origin"
+        }
+      ],
+      "upstream_mismatch": null,
       "bare": false,
       "git_dir": "/GOLDEN_TMP/estate/a-clean/.git",
       "common_dir": "/GOLDEN_TMP/estate/a-clean/.git",
       "error": null,
       "risk_band": "clean",
       "registration": "registered",
+      "ownership": "unknown",
+      "ownership_source": "remote-heuristic",
+      "push_policy": "ask",
+      "push_policy_reason": "ownership could not be established from registry or remote",
+      "remote_url": "file:///GOLDEN_TMP/origins/a-clean-origin",
       "fix": [],
       "stash_attributed": 0
     },
@@ -282,12 +360,24 @@
         }
       ],
       "branch_scan_note": null,
+      "remotes": [
+        {
+          "name": "origin",
+          "url": "file:///GOLDEN_TMP/origins/i-unpushed-origin"
+        }
+      ],
+      "upstream_mismatch": null,
       "bare": false,
       "git_dir": "/GOLDEN_TMP/estate/i-unpushed/.git",
       "common_dir": "/GOLDEN_TMP/estate/i-unpushed/.git",
       "error": null,
       "risk_band": "clean",
       "registration": "registered",
+      "ownership": "unknown",
+      "ownership_source": "remote-heuristic",
+      "push_policy": "ask",
+      "push_policy_reason": "ownership could not be established from registry or remote",
+      "remote_url": "file:///GOLDEN_TMP/origins/i-unpushed-origin",
       "fix": [
         "git -C /GOLDEN_TMP/estate/i-unpushed branch -vv  # 1 unpushed branch: parked-work(+1)"
       ],
@@ -325,5 +415,73 @@
     }
   ],
   "repo_count": 8,
-  "elapsed_seconds": 0.0
+  "elapsed_seconds": 0.0,
+  "lanes": [
+    {
+      "id": "L1",
+      "kind": "withheld",
+      "repos": [
+        "/GOLDEN_TMP/estate/c-ahead",
+        "/GOLDEN_TMP/estate/e-midop",
+        "/GOLDEN_TMP/estate/f-noremote",
+        "/GOLDEN_TMP/estate/g-unregistered",
+        "/GOLDEN_TMP/estate/i-unpushed"
+      ],
+      "write_scope": [
+        "/GOLDEN_TMP/estate/c-ahead",
+        "/GOLDEN_TMP/estate/e-midop",
+        "/GOLDEN_TMP/estate/f-noremote",
+        "/GOLDEN_TMP/estate/g-unregistered",
+        "/GOLDEN_TMP/estate/i-unpushed"
+      ],
+      "rationale": "cannot reach origin parity from here \u2014 each row carries its reason; these are the judgment blocks, not work to dispatch",
+      "suggested_concurrency": 0,
+      "withheld": [
+        {
+          "path": "/GOLDEN_TMP/estate/c-ahead",
+          "reason": "ownership unconfirmed \u2014 ownership could not be established from registry or remote"
+        },
+        {
+          "path": "/GOLDEN_TMP/estate/e-midop",
+          "reason": "merge in flight \u2014 finish or abort before any lane runs"
+        },
+        {
+          "path": "/GOLDEN_TMP/estate/f-noremote",
+          "reason": "remoteless by declaration (registry: owned-local) \u2014 no origin to converge to"
+        },
+        {
+          "path": "/GOLDEN_TMP/estate/g-unregistered",
+          "reason": "no remote configured \u2014 declare intent before any lane can converge it"
+        },
+        {
+          "path": "/GOLDEN_TMP/estate/i-unpushed",
+          "reason": "ownership unconfirmed \u2014 ownership could not be established from registry or remote"
+        }
+      ]
+    },
+    {
+      "id": "L2",
+      "kind": "small-dirty",
+      "repos": [
+        "/GOLDEN_TMP/estate/b-dirty"
+      ],
+      "write_scope": [
+        "/GOLDEN_TMP/estate/b-dirty"
+      ],
+      "rationale": "small working trees: one commit each",
+      "suggested_concurrency": 1
+    },
+    {
+      "id": "L3",
+      "kind": "mechanical-cluster",
+      "repos": [
+        "/GOLDEN_TMP/estate/d-stash"
+      ],
+      "write_scope": [
+        "/GOLDEN_TMP/estate/d-stash"
+      ],
+      "rationale": "bounded per-repo handoffs, no cross-repo coordination: forgotten branches to publish, upstream re-pointing, stash review",
+      "suggested_concurrency": 1
+    }
+  ]
 }

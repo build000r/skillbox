@@ -1,0 +1,21 @@
+{
+  "findings": [
+    {
+      "code": "dependency_cycle",
+      "location": "depends_on",
+      "message": "dependency cycle: a -> b -> c -> a",
+      "unit": "a"
+    }
+  ],
+  "groups": {
+    "default": [
+      "a"
+    ]
+  },
+  "manifest_parsed": true,
+  "unit_ids": [
+    "a",
+    "b",
+    "c"
+  ]
+}
