@@ -71,7 +71,9 @@ class SkillRepoValidationTests(unittest.TestCase):
             self.assertEqual(sync.returncode, 0, sync.stderr)
 
             doctor = helpers._run(repo, "doctor", "--client", "personal", "--format", "json")
-            self.assertEqual(doctor.returncode, 2, doctor.stderr)
+            # EXIT_DRIFT=4: doctor ran and found a FAIL gate. Exit 2 is a
+            # usage/parse miss, not a structure verdict.
+            self.assertEqual(doctor.returncode, 4, doctor.stderr)
             payload = json.loads(doctor.stdout)
             failure_codes = {item["code"] for item in payload["checks"] if item["status"] == "fail"}
             self.assertIn("skill-repo-shared-source", failure_codes, payload["checks"])

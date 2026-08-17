@@ -43,6 +43,9 @@ if str(ENV_MANAGER_DIR) not in sys.path:
 
 from runtime_manager import state_mutation as SM  # noqa: E402
 
+HAS_PROC_LOCKS = Path("/proc/locks").is_file()
+HAS_PROC_FD = Path("/proc/self/fd").is_dir()
+
 
 #: A real mutating boundary from the inventory. The lease refuses anything else.
 BOUNDARY = "manage.snap.create"
@@ -102,6 +105,13 @@ class LeaseTestCase(unittest.TestCase):
         path = self.base / name
         path.mkdir()
         return path
+
+    def assertKernelHolders(self, root: Path, pids: list[int]) -> None:
+        holders = SM.read_lease_metadata(root).get("kernel_holders") or []
+        if HAS_PROC_LOCKS:
+            self.assertEqual(holders, pids)
+        else:
+            self.assertEqual(holders, [])
 
 
 # ==========================================================================
@@ -268,8 +278,8 @@ class CrossProcessMutualExclusionTests(LeaseTestCase):
             self.assertNotEqual(info_a["lock"], info_b["lock"])
             self.assertNotEqual(info_a["pid"], info_b["pid"])
             # Both are genuinely held at the same instant.
-            self.assertEqual(SM.read_lease_metadata(root_a)["kernel_holders"], [info_a["pid"]])
-            self.assertEqual(SM.read_lease_metadata(root_b)["kernel_holders"], [info_b["pid"]])
+            self.assertKernelHolders(root_a, [info_a["pid"]])
+            self.assertKernelHolders(root_b, [info_b["pid"]])
         finally:
             release.touch()
             child_a.communicate(timeout=60)
@@ -333,12 +343,16 @@ class TimeoutPayloadTests(LeaseTestCase):
 
             holder = payload["holder"]
             self.assertEqual(holder["pid"], holder_info["pid"])
-            self.assertTrue(holder["verified"], "holder was not confirmed against /proc/locks")
-            self.assertEqual(holder["source"], "proc_locks")
-            self.assertIsInstance(holder["start_ticks"], int)
-            self.assertTrue(holder["command"], "no holder command recorded")
-            self.assertTrue(holder["alive"])
-            self.assertTrue(holder["advisory_matches_kernel"])
+            if HAS_PROC_LOCKS:
+                self.assertTrue(holder["verified"], "holder was not confirmed against /proc/locks")
+                self.assertEqual(holder["source"], "proc_locks")
+                self.assertIsInstance(holder["start_ticks"], int)
+                self.assertTrue(holder["command"], "no holder command recorded")
+                self.assertTrue(holder["alive"])
+                self.assertTrue(holder["advisory_matches_kernel"])
+            else:
+                self.assertFalse(holder["verified"])
+                self.assertEqual(holder["source"], "advisory_metadata")
         finally:
             release.touch()
             child.communicate(timeout=60)
@@ -399,7 +413,7 @@ class CrashReleaseTests(LeaseTestCase):
         before = SM.read_lease_metadata(self.root)
         self.assertEqual(before["state"], "held")
         self.assertEqual(before["metadata"]["pid"], holder["pid"])
-        self.assertEqual(before["kernel_holders"], [], "kernel did not reclaim the flock")
+        self.assertEqual(before["kernel_holders"] or [], [], "kernel did not reclaim the flock")
         self.assertTrue(before["stale"])
         self.assertFalse(before["metadata_matches_kernel"])
 
@@ -409,8 +423,9 @@ class CrashReleaseTests(LeaseTestCase):
             self.assertLess(time.monotonic() - started, 1.0)
             during = SM.read_lease_metadata(self.root)
             self.assertEqual(during["metadata"]["pid"], os.getpid())
-            self.assertEqual(during["kernel_holders"], [os.getpid()])
-            self.assertTrue(during["metadata_matches_kernel"])
+            self.assertKernelHolders(self.root, [os.getpid()])
+            if HAS_PROC_LOCKS:
+                self.assertTrue(during["metadata_matches_kernel"])
             self.assertTrue(lease.held)
 
     def test_stale_metadata_is_replaced_only_after_acquisition(self) -> None:
@@ -475,13 +490,11 @@ class NestingTests(LeaseTestCase):
                 self.assertEqual(len(SM.held_lease_roots()), 1)
                 owners = [owner["boundary_id"] for owner in inner.owners]
                 self.assertEqual(owners, [BOUNDARY, OTHER_BOUNDARY])
-                self.assertEqual(
-                    SM.read_lease_metadata(self.root)["kernel_holders"], [os.getpid()]
-                )
+                self.assertKernelHolders(self.root, [os.getpid()])
             self.assertEqual(outer.depth, 1)
             self.assertEqual(outer.boundary_id, BOUNDARY)
             self.assertTrue(outer.held, "the inner owner released the outer lease")
-            self.assertEqual(SM.read_lease_metadata(self.root)["kernel_holders"], [os.getpid()])
+            self.assertKernelHolders(self.root, [os.getpid()])
         self.assertEqual(SM.read_lease_metadata(lock.parent / self.root.name)["state"], "released")
         self.assertEqual(SM.held_lease_roots(), ())
 
@@ -538,12 +551,8 @@ class NestingTests(LeaseTestCase):
                 self.assertIsNot(lease_a, lease_b)
                 self.assertNotEqual(lease_a.lock_path, lease_b.lock_path)
                 self.assertEqual(len(SM.held_lease_roots()), 2)
-                self.assertEqual(
-                    SM.read_lease_metadata(root_a)["kernel_holders"], [os.getpid()]
-                )
-                self.assertEqual(
-                    SM.read_lease_metadata(root_b)["kernel_holders"], [os.getpid()]
-                )
+                self.assertKernelHolders(root_a, [os.getpid()])
+                self.assertKernelHolders(root_b, [os.getpid()])
         self.assertEqual(SM.held_lease_roots(), ())
 
     def test_cross_root_nesting_out_of_order_is_refused(self) -> None:
@@ -587,6 +596,7 @@ print(json.dumps(found))
 
 
 class DescriptorHygieneTests(LeaseTestCase):
+    @unittest.skipUnless(HAS_PROC_FD, "CLOEXEC leak scan needs /proc/self/fd")
     def test_the_lock_descriptor_does_not_survive_exec(self) -> None:
         lock = str(SM.lease_lock_path(self.root))
         with SM.state_mutation_lease(self.root, BOUNDARY) as lease:
@@ -690,7 +700,10 @@ class AdvisoryMetadataTests(LeaseTestCase):
             elapsed = time.monotonic() - started
             self.assertLess(elapsed, 2.0, "reads appear to be taking a lock")
             self.assertEqual(snapshot["state"], "held")
-            self.assertEqual(snapshot["kernel_holders"], [holder["pid"]])
+            if HAS_PROC_LOCKS:
+                self.assertEqual(snapshot["kernel_holders"], [holder["pid"]])
+            else:
+                self.assertEqual(snapshot.get("kernel_holders") or [], [])
             self.assertTrue(snapshot["advisory"])
             self.assertIn("ADVISORY ONLY", snapshot["authority"])
         finally:

@@ -161,6 +161,22 @@ require_value() {
   [[ "$count" -ge 2 ]] || die "$flag requires a value"
 }
 
+# Exclusive non-blocking lock on fd 9. GNU flock on Linux; fcntl via Python
+# on macOS (the Python process inherits fd 9, flocks the shared OFD, then
+# exits — bash still holds fd 9 so the lock remains until this job returns).
+try_lock_fd9() {
+  if command -v flock >/dev/null 2>&1; then
+    flock -n 9
+    return $?
+  fi
+  python3 -c 'import fcntl, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(1)
+'
+}
+
 validate_key_delay() {
   local delay="$1"
   [[ "$delay" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "--key-delay must be a non-negative number"
@@ -176,9 +192,25 @@ unb64() {
 
 # Format an epoch as UTC ISO-8601 / local wall clock. Used everywhere we show a
 # time so humans see local AND the canonical UTC the job stores.
+# GNU: date -u -d @EPOCH. BSD/macOS: date -u -r EPOCH. Never call GNU
+# `date -d` under `set -e` — BSD date treats `-d` as illegal and aborts
+# schedule before the job file is written.
+epoch_iso_utc() {
+  local e="$1" out
+  if out="$(date -u -d "@$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" && [[ "$out" == 20* ]]; then
+    printf '%s' "$out"
+    return 0
+  fi
+  if out="$(date -u -r "$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" && [[ "$out" == 20* ]]; then
+    printf '%s' "$out"
+    return 0
+  fi
+  return 1
+}
+
 fmt_utc() {
   [[ "${1:-0}" -gt 0 ]] || { printf '?'; return 0; }
-  date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '?'
+  epoch_iso_utc "$1" || printf '?'
 }
 fmt_local() {
   [[ "${1:-0}" -gt 0 ]] || { printf 'never'; return 0; }
@@ -226,9 +258,23 @@ eta_label() {
 resolve_at_epoch() {
   local spec="$1" tz="${2:-}" e
   if [[ -n "$tz" ]]; then
-    e="$(TZ="$tz" date -d "$spec" +%s 2>/dev/null)" || return 1
+    e="$(TZ="$tz" date -d "$spec" +%s 2>/dev/null)" || e=""
   else
-    e="$(date -d "$spec" +%s 2>/dev/null)" || return 1
+    e="$(date -d "$spec" +%s 2>/dev/null)" || e=""
+  fi
+  if [[ -z "$e" ]]; then
+    e="$(TZ="${tz}" python3 -c '
+import sys
+from datetime import datetime
+spec = sys.argv[1]
+for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+    try:
+        print(int(datetime.strptime(spec, fmt).timestamp()))
+        raise SystemExit(0)
+    except ValueError:
+        pass
+raise SystemExit(1)
+' "$spec")" || return 1
   fi
   [[ -n "$e" ]] || return 1
   printf '%s' "$e"
@@ -508,7 +554,7 @@ schedule_job() {
   else
     due=$now
   fi
-  due_utc="$(date -u -d "@$due" +%Y-%m-%dT%H:%M:%SZ)"
+  due_utc="$(epoch_iso_utc "$due")" || die "cannot format due epoch $due as UTC"
 
   # ---- resolve --until (deadline for recurring/long jobs) ------------------
   local expire_epoch="0" expire_utc=""
@@ -517,7 +563,7 @@ schedule_job() {
       || die "could not parse --until '$until_spec' (try '5h', '2026-06-25 09:00')"
     (( expire_epoch > now )) || die "--until '$until_spec' is in the past"
     (( expire_epoch >= due )) || die "--until is before the first fire time"
-    expire_utc="$(date -u -d "@$expire_epoch" +%Y-%m-%dT%H:%M:%SZ)"
+    expire_utc="$(epoch_iso_utc "$expire_epoch")" || die "cannot format --until epoch $expire_epoch as UTC"
   fi
 
   # ---- auto-generate id when not supplied ----------------------------------
@@ -735,7 +781,7 @@ run_job() {
   fi
 
   exec 9>"$lock_file"
-  if ! flock -n 9; then
+  if ! try_lock_fd9; then
     echo "$(date -u +%FT%TZ) id=$ID already_running" >> "$log_file"
     return 0
   fi
