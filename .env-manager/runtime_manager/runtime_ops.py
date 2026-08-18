@@ -3983,24 +3983,49 @@ def _parse_proc_stat_ppid(stat_text: str) -> int | None:
 
 
 def _proc_pid_ppid_map() -> dict[int, int]:
-    """Snapshot /proc once as a pid -> ppid map."""
+    """Snapshot pid -> ppid. Prefer /proc; fall back to ``ps`` on Darwin."""
     pid_map: dict[int, int] = {}
     proc_root = Path("/proc")
-    if not proc_root.is_dir():
+    if proc_root.is_dir():
+        for child in proc_root.iterdir():
+            if not child.name.isdigit():
+                continue
+            try:
+                pid = int(child.name)
+            except ValueError:
+                continue
+            try:
+                ppid = _parse_proc_stat_ppid((child / "stat").read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+            if ppid is not None:
+                pid_map[pid] = ppid
         return pid_map
-    for child in proc_root.iterdir():
-        if not child.name.isdigit():
+    return _ps_pid_ppid_map()
+
+
+def _ps_pid_ppid_map() -> dict[int, int]:
+    """Best-effort pid -> ppid via POSIX ``ps`` when /proc is absent."""
+    pid_map: dict[int, int] = {}
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return pid_map
+    if completed.returncode != 0:
+        return pid_map
+    for line in completed.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
             continue
         try:
-            pid = int(child.name)
+            pid_map[int(parts[0])] = int(parts[1])
         except ValueError:
             continue
-        try:
-            ppid = _parse_proc_stat_ppid((child / "stat").read_text(encoding="utf-8", errors="replace"))
-        except OSError:
-            continue
-        if ppid is not None:
-            pid_map[pid] = ppid
     return pid_map
 
 

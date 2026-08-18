@@ -47,8 +47,15 @@ class Palette:
     def header(self, t: str) -> str: return self._wrap("1;36", t)
 
 
+def _env_truthy(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
 def color_enabled() -> bool:
-    if os.environ.get("FORCE_COLOR") or os.environ.get("CLICOLOR_FORCE"):
+    if _env_truthy("FORCE_COLOR") or _env_truthy("CLICOLOR_FORCE"):
         return True
     if os.environ.get("NO_COLOR"):
         return False

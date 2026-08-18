@@ -5793,10 +5793,14 @@ class ProcScanHotspotTests(unittest.TestCase):
         self.assertEqual(runtime_ops_module.process_forest_pids([]), set())
 
     def test_process_tree_pids_matches_forest_for_single_root(self) -> None:
-        self.assertEqual(
-            runtime_ops_module.process_tree_pids(os.getpid()),
-            runtime_ops_module.process_forest_pids([os.getpid()]),
-        )
+        # Freeze the snapshot: two live walks (especially via `ps` on Darwin)
+        # can observe different short-lived children.
+        frozen = runtime_ops_module._proc_pid_ppid_map()
+        with mock.patch.object(runtime_ops_module, "_proc_pid_ppid_map", return_value=frozen):
+            self.assertEqual(
+                runtime_ops_module.process_tree_pids(os.getpid()),
+                runtime_ops_module.process_forest_pids([os.getpid()]),
+            )
 
     def test_all_process_listeners_skips_fd_walk_when_listen_inodes_unchanged(self) -> None:
         cache: dict = {}

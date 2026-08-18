@@ -2665,6 +2665,11 @@ LEASE_SCHEMA_VERSION = "2026-07-25+state-mutation-lease.v1"
 #: Appended to the canonical root's *name*, inside the root's parent directory.
 LEASE_LOCK_SUFFIX = ".mutation-lease.lock"
 
+#: Inherited by ``manage.py`` children of a coordinator (first-box, acceptance)
+#: that already holds the kernel flock. Those children cannot inherit the fd
+#: (``O_CLOEXEC`` + ``start_new_session``) and must not take a second flock.
+PARENT_LEASE_ROOT_ENV = "SKILLBOX_STATE_LEASE_ROOT"
+
 DEFAULT_LEASE_TIMEOUT_SECONDS = 30.0
 
 LEASE_AUTHORITY_NOTE = (
@@ -3657,6 +3662,27 @@ def active_runtime_lease() -> Any:
     return _ACTIVE_RUNTIME_LEASE
 
 
+def _borrow_parent_runtime_lease(state_root: Path, boundary_id: str) -> StateMutationLease:
+    """In-process handle for a child covered by a parent coordinator's flock.
+
+    No kernel lock is taken or released. The parent process still holds the
+    exclusive flock; this object only lets nested in-process reuse work.
+    """
+    borrowed = StateMutationLease(
+        state_root,
+        state_root.with_name(state_root.name + LEASE_LOCK_SUFFIX),
+        boundary_id,
+        _next_operation_id(boundary_id),
+    )
+    borrowed._state = "held"
+    borrowed._depth = 1
+    borrowed._acquired_at = _utc_now()
+    borrowed._acquired_monotonic = time.monotonic()
+    with _LEASE_REGISTRY_GUARD:
+        _LEASE_REGISTRY[str(state_root)] = borrowed
+    return borrowed
+
+
 @contextlib.contextmanager
 def runtime_mutation_lease(
     boundary_id: str,
@@ -3674,6 +3700,11 @@ def runtime_mutation_lease(
     one. That is the whole nested-work story from the design: ``focus`` calling
     ``sync`` inside one dispatch would otherwise either self-deadlock on the
     flock or be refused outright by the lease's anti-ambient-reuse check.
+
+    Coordinators that re-enter ``manage.py`` as a subprocess (first-box,
+    acceptance) export :data:`PARENT_LEASE_ROOT_ENV` while they hold the
+    kernel flock. The child cannot inherit the lock fd, so it borrows the
+    parent coverage instead of taking a second flock that would time out.
     """
     global _ACTIVE_RUNTIME_LEASE
     state_root = canonical_runtime_state_root(root_dir)
@@ -3686,13 +3717,30 @@ def runtime_mutation_lease(
         ) as nested:
             yield nested
         return
+    if os.environ.get(PARENT_LEASE_ROOT_ENV) == str(state_root):
+        borrowed = _borrow_parent_runtime_lease(state_root, boundary_id)
+        _ACTIVE_RUNTIME_LEASE = borrowed
+        try:
+            yield borrowed
+        finally:
+            _ACTIVE_RUNTIME_LEASE = None
+            with _LEASE_REGISTRY_GUARD:
+                if _LEASE_REGISTRY.get(str(state_root)) is borrowed:
+                    del _LEASE_REGISTRY[str(state_root)]
+        return
     with state_mutation_lease(
         state_root, boundary_id, annotations=payload, **lease_kwargs
     ) as fresh:
         _ACTIVE_RUNTIME_LEASE = fresh
+        previous = os.environ.get(PARENT_LEASE_ROOT_ENV)
+        os.environ[PARENT_LEASE_ROOT_ENV] = str(state_root)
         try:
             yield fresh
         finally:
+            if previous is None:
+                os.environ.pop(PARENT_LEASE_ROOT_ENV, None)
+            else:
+                os.environ[PARENT_LEASE_ROOT_ENV] = previous
             _ACTIVE_RUNTIME_LEASE = None
 
 
@@ -3768,6 +3816,7 @@ __all__ = [
     # There is deliberately no clear/steal/break/force/unlink entry point.
     "CANONICAL_ROOT_CONTRACT",
     "DEFAULT_LEASE_TIMEOUT_SECONDS",
+    "PARENT_LEASE_ROOT_ENV",
     "LEASE_AUTHORITY_NOTE",
     "LEASE_LOCK_ORDER_RULE",
     "LEASE_LOCK_SUFFIX",

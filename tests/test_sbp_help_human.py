@@ -11,18 +11,24 @@ SBP = ROOT_DIR / "scripts" / "sbp"
 
 
 def _run_sbp(*args: str) -> subprocess.CompletedProcess[str]:
+    env = {
+        **os.environ,
+        "SKILLBOX_ROOT": str(ROOT_DIR),
+        "SKILLBOX_INVOKE_CWD": str(ROOT_DIR),
+        "PYTHONPATH": str(ROOT_DIR / ".env-manager"),
+        "NO_COLOR": "1",
+    }
+    # Piped help must stay plain. Operator FORCE_COLOR=0 is a non-empty string
+    # and used to leak ANSI into capture_output tests.
+    env.pop("FORCE_COLOR", None)
+    env.pop("CLICOLOR_FORCE", None)
     return subprocess.run(
         [str(SBP), *args],
         cwd=ROOT_DIR,
         capture_output=True,
         text=True,
         check=False,
-        env={
-            **os.environ,
-            "SKILLBOX_ROOT": str(ROOT_DIR),
-            "SKILLBOX_INVOKE_CWD": str(ROOT_DIR),
-            "PYTHONPATH": str(ROOT_DIR / ".env-manager"),
-        },
+        env=env,
     )
 
 
