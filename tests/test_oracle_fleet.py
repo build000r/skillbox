@@ -82,7 +82,7 @@ FIXTURE_MACHINE_IDS = ("box-alpha", "box-bravo", "box-charlie", "box-delta")
 RESULT_BYTES = b"# Oracle result\n\nfindings\n"
 RESULT_SHA = hashlib.sha256(RESULT_BYTES).hexdigest()
 
-TAILNET_ENDPOINT = ("100.64.0.9", 8443)
+TAILNET_ENDPOINT = ("100.100.0.9", 8443)
 LOOPBACK_ENDPOINT = ("127.0.0.1", 8443)
 
 
@@ -123,7 +123,7 @@ def broker_receipt(document: dict, *, auth_method: str = broker.AUTH_METHOD_WHOI
         "caller_id": "devbox-1",
         "auth_method": auth_method,
         "node": "client.tailnet-example.ts.net.",
-        "endpoint": "100.64.0.9:8443",
+        "endpoint": "100.100.0.9:8443",
         "scope": broker.SCOPE_TAILNET,
         "mode": request.mode,
         "reservation_id": "0" * 32,

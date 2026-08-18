@@ -306,7 +306,10 @@ What the inventory established, and what a future single-writer lease has to fix
   design, but it is a write.
 - **Make and the MCP dry-run gate are not the same control surface.**
   `make box-down BOX=id` reaches `scripts/box.py down` directly and never
-  consults the operator-MCP marker. Make gates nothing.
+  consults the operator-MCP marker. Make gates nothing. The CLI still
+  refuses a real teardown unless `CONFIRM` equals the box id and the tree
+  is clean (`dirty_tree_refused`); see
+  [docs/tailnet-only-lifecycle.md#real-teardown-is-identity-bound](tailnet-only-lifecycle.md#real-teardown-is-identity-bound).
 - **`operator_compose_up` is the one mutating operator-MCP tool with no
   `dry_run` parameter and no marker requirement**, asymmetric with
   `operator_compose_down`.
